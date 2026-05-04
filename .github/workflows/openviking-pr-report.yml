@@ -43,7 +43,7 @@ jobs:
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
         run: |
-          args=(--output openviking-pr-report.md)
+          args=(--output openviking-pr-report.md --no-comment)
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             args+=(--dry-run)
           fi
