@@ -35,7 +35,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_REPOSITORY: NousResearch/hermes-agent
           REPORT_REPOSITORY: ${{ github.repository }}
-          RECENT_DAYS: "14"
+          RECENT_HOURS: "24"
+          MAX_OPEN_PRS: "100"
+          FILE_PROBE_LIMIT: "25"
           UPSTREAM_GITHUB_TOKEN: ${{ secrets.UPSTREAM_GITHUB_TOKEN }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}

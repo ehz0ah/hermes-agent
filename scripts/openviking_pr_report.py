@@ -34,10 +34,10 @@ SEARCH_TERMS = (
     "viking://",
     "temp_upload",
 )
-OPENVIKING_PATH_MARKERS = (
+OPENVIKING_PATH_PREFIXES = (
+    "benchmarks/backends/openviking",
     "plugins/memory/openviking",
     "tests/plugins/memory/test_openviking",
-    "openviking",
 )
 STOPWORDS = {
     "a",
@@ -63,6 +63,22 @@ STOPWORDS = {
     "to",
     "with",
 }
+STRONG_SIGNATURE_TERMS = {
+    "auto_commit",
+    "fallback_recall",
+    "local_resource_upload",
+    "temp_upload",
+}
+TOPIC_ORDER = (
+    "Local resource upload / temp_upload",
+    "Read/file URI routing",
+    "Explicit fallback / remember recall",
+    "Tool surface expansion",
+    "Provider lifecycle and configuration",
+    "API endpoint migration",
+    "Auto-commit / searchability",
+    "Other OpenViking overlap",
+)
 
 
 @dataclass
@@ -227,7 +243,7 @@ def text_has_openviking_signal(text: str) -> bool:
 
 def paths_have_openviking_signal(files: list[str]) -> bool:
     lowered = [path.lower() for path in files]
-    return any(any(marker in path for marker in OPENVIKING_PATH_MARKERS) for path in lowered)
+    return any(any(path.startswith(prefix) for prefix in OPENVIKING_PATH_PREFIXES) for path in lowered)
 
 
 def raw_pr_metadata_has_signal(raw: dict[str, Any]) -> bool:
@@ -245,7 +261,7 @@ def raw_pr_metadata_has_signal(raw: dict[str, Any]) -> bool:
 
 
 def pr_has_openviking_signal(pr: PullRequest) -> bool:
-    text = "\n".join([pr.title, pr.body, pr.head_ref, " ".join(pr.labels), *pr.comments])
+    text = "\n".join([pr.title, pr.body, pr.head_ref, " ".join(pr.labels)])
     return text_has_openviking_signal(text) or paths_have_openviking_signal(pr.files)
 
 
@@ -286,6 +302,7 @@ def jaccard(left: set[str], right: set[str]) -> float:
 
 def duplicate_reasons(left: PullRequest, right: PullRequest) -> DuplicateEdge | None:
     reasons: list[str] = []
+    supporting_reasons: list[str] = []
     score = 0
 
     left_refs = left.linked_issues - {right.number}
@@ -304,18 +321,21 @@ def duplicate_reasons(left: PullRequest, right: PullRequest) -> DuplicateEdge | 
 
     shared_files = set(left.files) & set(right.files)
     if shared_files:
-        score += min(2, len(shared_files))
         examples = ", ".join(sorted(shared_files)[:3])
-        reasons.append(f"overlapping changed files: {examples}")
+        supporting_reasons.append(f"overlapping changed files: {examples}")
 
     shared_signatures = signature_terms(left) & signature_terms(right)
     if shared_signatures:
-        score += min(4, 1 + len(shared_signatures))
+        strong_signatures = shared_signatures & STRONG_SIGNATURE_TERMS
+        if strong_signatures:
+            score += 4
+        else:
+            score += min(3, len(shared_signatures))
         examples = ", ".join(sorted(shared_signatures)[:4])
         reasons.append(f"shared OpenViking surface: {examples}")
 
     title_similarity = jaccard(token_set(left.title), token_set(right.title))
-    if title_similarity >= 0.42:
+    if title_similarity >= 0.50:
         score += 3
         reasons.append(f"similar titles ({title_similarity:.0%} token overlap)")
 
@@ -323,11 +343,12 @@ def duplicate_reasons(left: PullRequest, right: PullRequest) -> DuplicateEdge | 
         token_set(f"{left.title}\n{left.body[:1200]}"),
         token_set(f"{right.title}\n{right.body[:1200]}"),
     )
-    if combined_similarity >= 0.32:
+    if combined_similarity >= 0.40:
         score += 2
         reasons.append(f"similar descriptions ({combined_similarity:.0%} token overlap)")
 
     if score >= 4:
+        reasons.extend(reason for reason in supporting_reasons if reason not in reasons)
         return DuplicateEdge(left.number, right.number, score, reasons)
     return None
 
@@ -345,7 +366,91 @@ def cluster_topic(prs: list[PullRequest], reasons: list[str]) -> str:
     return "OpenViking overlap"
 
 
+def topic_tags(pr: PullRequest) -> set[str]:
+    text = "\n".join([pr.title, pr.body, *pr.comments]).lower()
+    signatures = signature_terms(pr)
+    tags: set[str] = set()
+    if {"temp_upload", "local_resource_upload"} & signatures:
+        tags.add("Local resource upload / temp_upload")
+    if "viking_read" in text or "file uri" in text or "content/read" in text or "overview.md" in text:
+        tags.add("Read/file URI routing")
+    if "fallback" in text or "explicit remember" in text or "prefetch" in text:
+        tags.add("Explicit fallback / remember recall")
+    if any(term in text for term in ("viking_delete", "viking_write", "viking_link", "viking_grep", "viking_glob", "viking_extract")):
+        tags.add("Tool surface expansion")
+    if any(term in text for term in ("toolset", "reconnect", "reachability", "identity headers", "user api key", "startup warning")):
+        tags.add("Provider lifecycle and configuration")
+    if "endpoint" in text or "v0.2" in text or "v0.3" in text:
+        tags.add("API endpoint migration")
+    if "auto-commit" in text or "auto commit" in text:
+        tags.add("Auto-commit / searchability")
+    return tags or {"Other OpenViking overlap"}
+
+
+def primary_topic(pr: PullRequest) -> str:
+    title = pr.title.lower()
+    if "fallback" in title or "explicit remember" in title:
+        return "Explicit fallback / remember recall"
+    if "local" in title and ("upload" in title or "resource" in title):
+        return "Local resource upload / temp_upload"
+    if "temp_upload" in title:
+        return "Local resource upload / temp_upload"
+    if "viking_read" in title or "file uri" in title or "content/read" in title:
+        return "Read/file URI routing"
+    if "endpoint" in title or "v0.2" in title or "v0.3" in title:
+        return "API endpoint migration"
+    if "delete" in title or "expand openviking" in title or "memory tools" in title:
+        return "Tool surface expansion"
+    if "toolset" in title or "reconnect" in title or "warning" in title or "headers" in title:
+        return "Provider lifecycle and configuration"
+    if "auto-commit" in title or "auto commit" in title:
+        return "Auto-commit / searchability"
+
+    tags = topic_tags(pr)
+    for topic in TOPIC_ORDER:
+        if topic in tags:
+            return topic
+    return "Other OpenViking overlap"
+
+
+def cluster_reasons(topic: str, prs: list[PullRequest]) -> list[str]:
+    reasons = [f"shared topic: {topic}"]
+    ref_counts: dict[int, int] = {}
+    signature_counts: dict[str, int] = {}
+    for pr in prs:
+        for ref in pr.linked_issues:
+            ref_counts[ref] = ref_counts.get(ref, 0) + 1
+        for signature in signature_terms(pr):
+            signature_counts[signature] = signature_counts.get(signature, 0) + 1
+
+    common_refs = sorted(ref for ref, count in ref_counts.items() if count >= 2)
+    if common_refs:
+        reasons.append("shared linked issues/references: " + ", ".join(f"#{ref}" for ref in common_refs[:5]))
+
+    common_signatures = sorted(signature for signature, count in signature_counts.items() if count >= 2)
+    if common_signatures:
+        reasons.append("common OpenViking terms: " + ", ".join(common_signatures[:5]))
+    return reasons
+
+
 def build_duplicate_clusters(prs: list[PullRequest]) -> list[DuplicateCluster]:
+    grouped: dict[str, list[PullRequest]] = {}
+    for pr in prs:
+        grouped.setdefault(primary_topic(pr), []).append(pr)
+
+    clusters = [
+        DuplicateCluster(
+            prs=sorted(topic_prs, key=sort_prs),
+            reasons=cluster_reasons(topic, topic_prs),
+            topic=topic,
+        )
+        for topic, topic_prs in grouped.items()
+        if len(topic_prs) > 1 and topic != "Other OpenViking overlap"
+    ]
+    return sorted(clusters, key=lambda cluster: TOPIC_ORDER.index(cluster.topic))
+
+
+def build_duplicate_clusters_by_edges(prs: list[PullRequest]) -> list[DuplicateCluster]:
     by_number = {pr.number: pr for pr in prs}
     edges: list[DuplicateEdge] = []
     numbers = sorted(by_number)
@@ -416,26 +521,20 @@ def render_deterministic_report(
     clusters: list[DuplicateCluster],
     *,
     upstream_repo: str,
-    recent_days: int,
+    recent_hours: int,
     generated_at: datetime,
     llm_status: str,
 ) -> str:
-    active = [pr for pr in prs if pr.lifecycle_state == "open"]
-    recent_context = [pr for pr in prs if pr.lifecycle_state != "open"]
+    active = prs
     clustered = {pr.number for cluster in clusters for pr in cluster.prs}
     unclustered_active = [pr for pr in active if pr.number not in clustered]
-    stale = [
-        pr
-        for pr in active
-        if (generated_at - (parse_github_time(pr.updated_at) or generated_at)) >= timedelta(days=21)
-    ]
 
     lines = [
         "# OpenViking PR Report",
         "",
         f"Generated: {generated_at.strftime('%Y-%m-%d %H:%M UTC')}",
         f"Upstream: `{upstream_repo}`",
-        f"Scope: open PRs plus closed/merged PRs updated in the last {recent_days} days.",
+        f"Scope: open OpenViking-related PRs updated in the last {recent_hours} hours.",
         f"LLM: {llm_status}",
         "",
     ]
@@ -467,24 +566,10 @@ def render_deterministic_report(
         lines.append("No active OpenViking PRs found.")
     lines.append("")
 
-    lines.extend(["## Stale Or Needs Attention", ""])
-    if stale:
-        lines.extend(pr_line(pr) for pr in sorted(stale, key=sort_prs))
-    else:
-        lines.append("No matched open PRs have gone 21+ days without updates.")
-    lines.append("")
-
-    lines.extend(["## Recent Merged Or Closed Context", ""])
-    if recent_context:
-        lines.extend(pr_line(pr) for pr in sorted(recent_context, key=sort_prs)[:20])
-    else:
-        lines.append("No recent merged or closed OpenViking PRs found.")
-    lines.append("")
-
     lines.extend(
         [
             "---",
-            "Duplicate detection is deterministic: shared linked issues, direct PR references, changed-file overlap, OpenViking tool/API terms, and title/body similarity.",
+            "Duplicate grouping is deterministic and based on shared OpenViking topics and references.",
             "",
         ]
     )
@@ -587,7 +672,7 @@ def fetch_issue_comments(client: GitHubClient, repo: str, number: int) -> list[s
     owner, name = split_repo(repo)
     comments = client.paginate_list(f"/repos/{owner}/{name}/issues/{number}/comments", limit=50)
     bodies = [str(comment.get("body") or "") for comment in comments]
-    return [body for body in bodies if text_has_openviking_signal(body) or re.search(r"#\d+", body)]
+    return [body for body in bodies if text_has_openviking_signal(body)]
 
 
 def make_pull_request(
@@ -640,48 +725,45 @@ def collect_candidate_numbers(
     client: GitHubClient,
     repo: str,
     *,
-    recent_days: int,
+    recent_hours: int,
     max_open_prs: int,
-    max_closed_prs: int,
     file_probe_limit: int,
 ) -> tuple[set[int], dict[int, list[str]]]:
     owner, name = split_repo(repo)
-    cutoff = datetime.now(UTC) - timedelta(days=recent_days)
+    cutoff = datetime.now(UTC) - timedelta(hours=recent_hours)
     numbers: set[int] = set()
     preloaded_files: dict[int, list[str]] = {}
 
     for term in SEARCH_TERMS:
         quoted = f'"{term}"' if " " in term or "://" in term else term
-        for state_query in ("is:open", f"is:closed updated:>={cutoff.date()}"):
-            query = f"repo:{repo} is:pr {state_query} {quoted}"
-            for item in client.search_issues(query):
-                if item.get("number"):
-                    numbers.add(int(item["number"]))
+        query = f"repo:{repo} is:pr is:open updated:>={cutoff.isoformat(timespec='seconds')} {quoted}"
+        for item in client.search_issues(query):
+            if item.get("number"):
+                numbers.add(int(item["number"]))
 
     scanned = 0
     file_probes = 0
-    for state, limit in (("open", max_open_prs), ("closed", max_closed_prs)):
-        pulls = client.paginate_list(
-            f"/repos/{owner}/{name}/pulls",
-            params={"state": state, "sort": "updated", "direction": "desc"},
-            limit=limit,
-        )
-        for raw in pulls:
-            updated_at = parse_github_time(raw.get("updated_at"))
-            if state == "closed" and updated_at and updated_at < cutoff:
-                continue
-            number = int(raw["number"])
-            scanned += 1
-            if raw_pr_metadata_has_signal(raw):
-                numbers.add(number)
-                continue
-            if file_probes >= file_probe_limit:
-                continue
-            files = fetch_pull_files(client, repo, number)
-            file_probes += 1
-            if paths_have_openviking_signal(files):
-                numbers.add(number)
-                preloaded_files[number] = files
+    pulls = client.paginate_list(
+        f"/repos/{owner}/{name}/pulls",
+        params={"state": "open", "sort": "updated", "direction": "desc"},
+        limit=max_open_prs,
+    )
+    for raw in pulls:
+        updated_at = parse_github_time(raw.get("updated_at"))
+        if updated_at and updated_at < cutoff:
+            continue
+        number = int(raw["number"])
+        scanned += 1
+        if raw_pr_metadata_has_signal(raw):
+            numbers.add(number)
+            continue
+        if file_probes >= file_probe_limit:
+            continue
+        files = fetch_pull_files(client, repo, number)
+        file_probes += 1
+        if paths_have_openviking_signal(files):
+            numbers.add(number)
+            preloaded_files[number] = files
 
     print(
         f"Discovered {len(numbers)} candidate PRs after scanning {scanned} PR records "
@@ -695,25 +777,25 @@ def collect_pull_requests(
     client: GitHubClient,
     repo: str,
     *,
-    recent_days: int,
+    recent_hours: int,
     max_open_prs: int,
-    max_closed_prs: int,
     file_probe_limit: int,
 ) -> list[PullRequest]:
     numbers, preloaded_files = collect_candidate_numbers(
         client,
         repo,
-        recent_days=recent_days,
+        recent_hours=recent_hours,
         max_open_prs=max_open_prs,
-        max_closed_prs=max_closed_prs,
         file_probe_limit=file_probe_limit,
     )
-    cutoff = datetime.now(UTC) - timedelta(days=recent_days)
+    cutoff = datetime.now(UTC) - timedelta(hours=recent_hours)
     prs: list[PullRequest] = []
     for number in sorted(numbers, reverse=True):
         pr = fetch_pull_request(client, repo, number, preloaded_files=preloaded_files.get(number))
         updated_at = parse_github_time(pr.updated_at)
-        if pr.lifecycle_state != "open" and updated_at and updated_at < cutoff:
+        if pr.lifecycle_state != "open":
+            continue
+        if updated_at and updated_at < cutoff:
             continue
         if pr_has_openviking_signal(pr):
             prs.append(pr)
@@ -781,7 +863,7 @@ def build_report(
     prs: list[PullRequest],
     *,
     upstream_repo: str,
-    recent_days: int,
+    recent_hours: int,
     generated_at: datetime,
 ) -> tuple[str, str]:
     clusters = build_duplicate_clusters(prs)
@@ -790,7 +872,7 @@ def build_report(
         prs,
         clusters,
         upstream_repo=upstream_repo,
-        recent_days=recent_days,
+        recent_hours=recent_hours,
         generated_at=generated_at,
         llm_status=llm_status,
     )
@@ -815,7 +897,7 @@ def build_report(
             prs,
             clusters,
             upstream_repo=upstream_repo,
-            recent_days=recent_days,
+            recent_hours=recent_hours,
             generated_at=generated_at,
             llm_status=llm_status,
         ), llm_status
@@ -832,10 +914,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--upstream-repo", default=os.getenv("UPSTREAM_REPOSITORY", DEFAULT_UPSTREAM_REPO))
     parser.add_argument("--report-repo", default=os.getenv("REPORT_REPOSITORY") or os.getenv("GITHUB_REPOSITORY"))
     parser.add_argument("--report-title", default=os.getenv("REPORT_ISSUE_TITLE", DEFAULT_REPORT_TITLE))
-    parser.add_argument("--recent-days", type=int, default=int(os.getenv("RECENT_DAYS", "14")))
-    parser.add_argument("--max-open-prs", type=int, default=int(os.getenv("MAX_OPEN_PRS", "300")))
-    parser.add_argument("--max-closed-prs", type=int, default=int(os.getenv("MAX_CLOSED_PRS", "300")))
-    parser.add_argument("--file-probe-limit", type=int, default=int(os.getenv("FILE_PROBE_LIMIT", "150")))
+    parser.add_argument("--recent-hours", type=int, default=int(os.getenv("RECENT_HOURS", "24")))
+    parser.add_argument("--max-open-prs", type=int, default=int(os.getenv("MAX_OPEN_PRS", "100")))
+    parser.add_argument("--file-probe-limit", type=int, default=int(os.getenv("FILE_PROBE_LIMIT", "25")))
     parser.add_argument("--output", default=os.getenv("REPORT_OUTPUT", "openviking-pr-report.md"))
     parser.add_argument("--dry-run", action="store_true", help="Print and write the report without updating GitHub issues")
     parser.add_argument("--no-comment", action="store_true", help="Update the tracking issue body without posting a comment")
@@ -868,15 +949,14 @@ def main(argv: list[str] | None = None) -> int:
     prs = collect_pull_requests(
         read_client,
         args.upstream_repo,
-        recent_days=args.recent_days,
+        recent_hours=args.recent_hours,
         max_open_prs=args.max_open_prs,
-        max_closed_prs=args.max_closed_prs,
         file_probe_limit=args.file_probe_limit,
     )
     report, llm_status = build_report(
         prs,
         upstream_repo=args.upstream_repo,
-        recent_days=args.recent_days,
+        recent_hours=args.recent_hours,
         generated_at=generated_at,
     )
     with open(args.output, "w", encoding="utf-8") as handle:

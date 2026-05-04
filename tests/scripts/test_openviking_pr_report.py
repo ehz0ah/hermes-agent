@@ -77,7 +77,34 @@ def test_duplicate_clusters_group_local_upload_prs() -> None:
     ]
     assert local_upload_clusters
     assert local_upload_clusters[0].topic == "Local resource upload / temp_upload"
-    assert any("directly references" in reason for reason in local_upload_clusters[0].reasons)
+    assert {pr.number for pr in local_upload_clusters[0].prs} == {10360, 19569}
+    assert any("shared topic" in reason for reason in local_upload_clusters[0].reasons)
+
+
+def test_file_overlap_alone_does_not_create_duplicate_cluster() -> None:
+    prs = [
+        make_pr(
+            1,
+            "fix(openviking): improve fallback recall",
+            "Ensure fallback memories show up in prefetch and search.",
+            ["plugins/memory/openviking/__init__.py"],
+        ),
+        make_pr(
+            2,
+            "fix(openviking): reconnect after health check failure",
+            "Lazily reconnect OpenViking after startup health checks fail.",
+            ["plugins/memory/openviking/__init__.py"],
+        ),
+    ]
+
+    assert report.build_duplicate_clusters(prs) == []
+
+
+def test_non_openviking_reference_comment_is_not_relevance_signal() -> None:
+    pr = make_pr(3, "fix: unrelated gateway command", "Fixes #1234", ["gateway/run.py"])
+    pr.comments = ["Related to #10360"]
+
+    assert not report.pr_has_openviking_signal(pr)
 
 
 def test_render_report_includes_duplicate_and_recent_sections() -> None:
@@ -100,14 +127,14 @@ def test_render_report_includes_duplicate_and_recent_sections() -> None:
         prs,
         clusters,
         upstream_repo="NousResearch/hermes-agent",
-        recent_days=14,
+        recent_hours=24,
         generated_at=datetime(2026, 5, 4, tzinfo=UTC),
         llm_status="not configured",
     )
 
     assert "## Likely Duplicate Groups" in markdown
     assert "Local resource upload / temp_upload" in markdown
-    assert "## Recent Merged Or Closed Context" in markdown
+    assert "Scope: open OpenViking-related PRs updated in the last 24 hours." in markdown
     assert "[#19569]" in markdown
 
 
