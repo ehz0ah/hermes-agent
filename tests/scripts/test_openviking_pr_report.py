@@ -226,6 +226,39 @@ def test_render_llm_report_includes_table_summaries_and_duplicate_groups() -> No
     assert "### Local resource upload" in markdown
 
 
+def test_classify_with_llm_batches_candidates(monkeypatch) -> None:
+    prs = [make_pr(number, f"fix(openviking): change {number}") for number in (1, 2, 3)]
+    calls: list[list[int]] = []
+
+    def fake_classify_batch(batch, **kwargs):
+        calls.append([pr.number for pr in batch])
+        return [
+            report.LlmPrAssessment(
+                pr=pr,
+                is_openviking_related=True,
+                confidence="high",
+                summary=pr.title,
+                why="OpenViking title.",
+            )
+            for pr in batch
+        ]
+
+    monkeypatch.setattr(report, "classify_llm_batch", fake_classify_batch)
+    monkeypatch.setenv("LLM_BATCH_SIZE", "2")
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "30")
+
+    assessments = report.classify_with_llm(
+        prs,
+        api_key="key",
+        base_url="https://api.example.com/v1",
+        model="model",
+        upstream_repo="NousResearch/hermes-agent",
+    )
+
+    assert calls == [[1, 2], [3]]
+    assert [assessment.pr.number for assessment in assessments] == [3, 2, 1]
+
+
 def test_chat_completions_url_accepts_base_or_full_endpoint() -> None:
     assert report.chat_completions_url("https://api.example.com/v1") == "https://api.example.com/v1/chat/completions"
     assert (

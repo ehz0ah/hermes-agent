@@ -603,12 +603,12 @@ def build_llm_payload(prs: list[PullRequest]) -> dict[str, Any]:
                 "labels": pr.labels[:8],
                 "head_ref": pr.head_ref,
                 "linked_issues": sorted(pr.linked_issues)[:10],
-                "files": pr.files[:40],
-                "body_excerpt": textwrap.shorten(" ".join(pr.body.split()), width=700, placeholder="..."),
+                "files": pr.files[:25],
+                "body_excerpt": textwrap.shorten(" ".join(pr.body.split()), width=450, placeholder="..."),
                 "openviking_signal": pr_has_openviking_signal(pr),
                 "comments": [
-                    textwrap.shorten(" ".join(comment.split()), width=300, placeholder="...")
-                    for comment in pr.comments[:3]
+                    textwrap.shorten(" ".join(comment.split()), width=220, placeholder="...")
+                    for comment in pr.comments[:2]
                 ],
             }
             for pr in prs
@@ -768,13 +768,14 @@ def render_llm_report(
     return "\n".join(lines)
 
 
-def classify_with_llm(
+def classify_llm_batch(
     prs: list[PullRequest],
     *,
     api_key: str,
     base_url: str,
     model: str,
     upstream_repo: str,
+    timeout_seconds: int,
 ) -> list[LlmPrAssessment]:
     payload = build_llm_payload(prs)
     messages = [
@@ -833,13 +834,53 @@ def classify_with_llm(
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as response:
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
         raw = response.read().decode("utf-8")
     data = json.loads(raw)
     content = data["choices"][0]["message"]["content"]
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("LLM response did not include JSON content")
     return parse_llm_assessments(extract_json_object(content), prs)
+
+
+def int_from_env(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def classify_with_llm(
+    prs: list[PullRequest],
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    upstream_repo: str,
+) -> list[LlmPrAssessment]:
+    batch_size = int_from_env("LLM_BATCH_SIZE", 25)
+    timeout_seconds = int_from_env("LLM_TIMEOUT_SECONDS", 120, minimum=30)
+    assessments: list[LlmPrAssessment] = []
+    for start in range(0, len(prs), batch_size):
+        batch = prs[start : start + batch_size]
+        assessments.extend(
+            classify_llm_batch(
+                batch,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                upstream_repo=upstream_repo,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+
+    by_number: dict[int, LlmPrAssessment] = {}
+    for assessment in assessments:
+        current = by_number.get(assessment.pr.number)
+        if current is None or confidence_rank(assessment.confidence) < confidence_rank(current.confidence):
+            by_number[assessment.pr.number] = assessment
+    return sorted(by_number.values(), key=sort_assessments)
 
 
 def fetch_pull_files(client: GitHubClient, repo: str, number: int) -> list[str]:
