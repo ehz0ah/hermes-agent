@@ -113,6 +113,17 @@ class DuplicateCluster:
     topic: str
 
 
+@dataclass
+class LlmPrAssessment:
+    pr: PullRequest
+    is_openviking_related: bool
+    confidence: str
+    summary: str
+    why: str
+    duplicate_group: str = ""
+    topic: str = ""
+
+
 class GitHubApiError(RuntimeError):
     pass
 
@@ -499,6 +510,26 @@ def pr_line(pr: PullRequest) -> str:
     return f"- [#{pr.number}]({pr.html_url}) `{state}{draft}` @{pr.author} updated {updated} - {pr.title}{labels}"
 
 
+def table_cell(text: str, *, width: int = 220) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) > width:
+        compact = textwrap.shorten(compact, width=width, placeholder="...")
+    return compact.replace("|", "\\|")
+
+
+def confidence_rank(confidence: str) -> int:
+    normalized = confidence.lower()
+    if normalized == "high":
+        return 0
+    if normalized == "medium":
+        return 1
+    return 2
+
+
+def sort_assessments(assessment: LlmPrAssessment) -> tuple[int, tuple[int, float, int]]:
+    return (confidence_rank(assessment.confidence), sort_prs(assessment.pr))
+
+
 def render_deterministic_report(
     prs: list[PullRequest],
     clusters: list[DuplicateCluster],
@@ -559,9 +590,9 @@ def render_deterministic_report(
     return "\n".join(lines)
 
 
-def build_llm_payload(prs: list[PullRequest], clusters: list[DuplicateCluster]) -> dict[str, Any]:
+def build_llm_payload(prs: list[PullRequest]) -> dict[str, Any]:
     return {
-        "pull_requests": [
+        "candidate_pull_requests": [
             {
                 "number": pr.number,
                 "title": pr.title,
@@ -572,18 +603,15 @@ def build_llm_payload(prs: list[PullRequest], clusters: list[DuplicateCluster]) 
                 "labels": pr.labels[:8],
                 "head_ref": pr.head_ref,
                 "linked_issues": sorted(pr.linked_issues)[:10],
-                "files": pr.files[:20],
-                "body_excerpt": textwrap.shorten(" ".join(pr.body.split()), width=900, placeholder="..."),
+                "files": pr.files[:40],
+                "body_excerpt": textwrap.shorten(" ".join(pr.body.split()), width=700, placeholder="..."),
+                "openviking_signal": pr_has_openviking_signal(pr),
+                "comments": [
+                    textwrap.shorten(" ".join(comment.split()), width=300, placeholder="...")
+                    for comment in pr.comments[:3]
+                ],
             }
             for pr in prs
-        ],
-        "duplicate_groups": [
-            {
-                "topic": cluster.topic,
-                "prs": [pr.number for pr in cluster.prs],
-                "reasons": cluster.reasons,
-            }
-            for cluster in clusters
         ],
     }
 
@@ -595,29 +623,198 @@ def chat_completions_url(base_url: str) -> str:
     return f"{trimmed}/chat/completions"
 
 
-def enhance_with_llm(
-    deterministic_report: str,
-    payload: dict[str, Any],
+def extract_json_object(content: str) -> dict[str, Any]:
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        parsed = json.loads(stripped[start : end + 1])
+    if not isinstance(parsed, dict):
+        raise RuntimeError("LLM response must be a JSON object")
+    return parsed
+
+
+def normalize_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "y", "1"}
+    return bool(value)
+
+
+def normalize_confidence(value: Any) -> str:
+    lowered = str(value or "").strip().lower()
+    if lowered in {"high", "medium", "low"}:
+        return lowered
+    return "medium"
+
+
+def parse_llm_assessments(data: dict[str, Any], prs: list[PullRequest]) -> list[LlmPrAssessment]:
+    by_number = {pr.number: pr for pr in prs}
+    raw_items = data.get("pull_requests")
+    force_related = False
+    if not isinstance(raw_items, list):
+        raw_items = data.get("related_prs")
+        force_related = isinstance(raw_items, list)
+    if not isinstance(raw_items, list):
+        raise RuntimeError("LLM response missing pull_requests list")
+
+    assessments: list[LlmPrAssessment] = []
+    seen: set[int] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            number = int(item.get("number"))
+        except (TypeError, ValueError):
+            continue
+        if number not in by_number or number in seen:
+            continue
+        seen.add(number)
+        is_related = True if force_related else normalize_bool(item.get("is_openviking_related"))
+        if not is_related:
+            continue
+        summary = str(item.get("summary") or by_number[number].title).strip()
+        why = str(item.get("why") or item.get("reason") or "Classified as OpenViking-related by the LLM.").strip()
+        assessments.append(
+            LlmPrAssessment(
+                pr=by_number[number],
+                is_openviking_related=True,
+                confidence=normalize_confidence(item.get("confidence")),
+                summary=summary,
+                why=why,
+                duplicate_group=str(item.get("duplicate_group") or "").strip(),
+                topic=str(item.get("topic") or "").strip(),
+            )
+        )
+    return sorted(assessments, key=sort_assessments)
+
+
+def render_llm_report(
+    assessments: list[LlmPrAssessment],
+    *,
+    reviewed_count: int,
+    upstream_repo: str,
+    recent_hours: int,
+    generated_at: datetime,
+    llm_status: str,
+) -> str:
+    lines = [
+        "# OpenViking PR Report",
+        "",
+        f"Generated: {generated_at.strftime('%Y-%m-%d %H:%M UTC')}",
+        f"Upstream: `{upstream_repo}`",
+        f"Scope: open PRs updated in the last {recent_hours} hours, classified for OpenViking relevance.",
+        f"Reviewed: {reviewed_count} open PRs",
+        f"LLM: {llm_status}",
+        "",
+    ]
+
+    if not assessments:
+        lines.extend(["No OpenViking-related PRs found.", ""])
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "## OpenViking Matches",
+            "",
+            "| PR | Confidence | Topic / duplicate group | Summary | Why included |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+    for assessment in assessments:
+        pr = assessment.pr
+        topic = assessment.duplicate_group or assessment.topic or primary_topic(pr)
+        lines.append(
+            "| "
+            f"[#{pr.number}]({pr.html_url}) "
+            f"| {table_cell(assessment.confidence.title(), width=20)} "
+            f"| {table_cell(topic, width=90)} "
+            f"| {table_cell(assessment.summary)} "
+            f"| {table_cell(assessment.why)} |"
+        )
+    lines.append("")
+
+    groups: dict[str, list[LlmPrAssessment]] = {}
+    for assessment in assessments:
+        group_name = assessment.duplicate_group.strip()
+        if group_name:
+            groups.setdefault(group_name, []).append(assessment)
+
+    duplicate_groups = [(name, items) for name, items in groups.items() if len(items) > 1]
+    lines.extend(["## Likely Duplicate Groups", ""])
+    if duplicate_groups:
+        for name, items in sorted(duplicate_groups, key=lambda entry: (-len(entry[1]), entry[0].lower())):
+            links = ", ".join(f"[#{item.pr.number}]({item.pr.html_url})" for item in sorted(items, key=sort_assessments))
+            reasons = "; ".join(table_cell(item.why, width=140) for item in items[:3])
+            lines.extend([f"### {name}", "", f"- PRs: {links}", f"- Why: {reasons}", ""])
+    else:
+        lines.extend(["No likely duplicate groups found.", ""])
+
+    lines.extend(
+        [
+            "---",
+            "GitHub API supplied the candidate PRs; the LLM classified OpenViking relevance and wrote per-PR summaries.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def classify_with_llm(
+    prs: list[PullRequest],
     *,
     api_key: str,
     base_url: str,
     model: str,
-) -> str:
+    upstream_repo: str,
+) -> list[LlmPrAssessment]:
+    payload = build_llm_payload(prs)
     messages = [
         {
             "role": "system",
             "content": (
-                "You write concise GitHub PR triage reports. Preserve PR numbers, links, "
-                "states, and duplicate reasoning. Do not invent facts. Return markdown only."
+                "You classify GitHub pull requests for a maintainer. Return JSON only. "
+                "Only use PR numbers present in the provided candidate_pull_requests list. "
+                "Do not invent PRs, file paths, labels, or facts."
             ),
         },
         {
             "role": "user",
             "content": (
-                "Rewrite this deterministic OpenViking PR report for a maintainer. Keep the "
-                "same sections, mention likely duplicates clearly, and keep it concise.\n\n"
-                f"Structured data:\n{json.dumps(payload, sort_keys=True)}\n\n"
-                f"Deterministic report:\n{deterministic_report}"
+                "OpenViking is the Hermes memory/context database plugin, centered on "
+                "`plugins/memory/openviking`. It may expose or change `viking_*` tools, "
+                "`viking://` resources, OpenViking provider setup, OpenViking API endpoints, "
+                "memory recall/search behavior, local resource handling for OpenViking, or tests "
+                "under `tests/plugins/memory/test_openviking`. Generic memory, provider, upload, "
+                "or CLI changes are not OpenViking-related unless they explicitly touch this plugin, "
+                "its paths, APIs, tools, resources, or integration behavior.\n\n"
+                f"Classify open PRs from `{upstream_repo}`. For every candidate, decide whether it "
+                "is OpenViking-related. Return a JSON object with this exact shape:\n"
+                "{\n"
+                '  "pull_requests": [\n'
+                "    {\n"
+                '      "number": 123,\n'
+                '      "is_openviking_related": true,\n'
+                '      "confidence": "high|medium|low",\n'
+                '      "topic": "short topic",\n'
+                '      "summary": "one sentence maintainer-facing summary",\n'
+                '      "why": "brief evidence from title/body/files/labels",\n'
+                '      "duplicate_group": "shared group name or empty string"\n'
+                "    }\n"
+                "  ]\n"
+                "}\n\n"
+                "Use duplicate_group only when two or more included PRs appear to solve or modify "
+                "the same OpenViking behavior. Include false entries for candidates you reviewed "
+                "but rejected. Keep summaries concise.\n\n"
+                f"Candidate data:\n{json.dumps(payload, sort_keys=True)}"
             ),
         },
     ]
@@ -641,8 +838,8 @@ def enhance_with_llm(
     data = json.loads(raw)
     content = data["choices"][0]["message"]["content"]
     if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("LLM response did not include markdown content")
-    return content.strip() + "\n"
+        raise RuntimeError("LLM response did not include JSON content")
+    return parse_llm_assessments(extract_json_object(content), prs)
 
 
 def fetch_pull_files(client: GitHubClient, repo: str, number: int) -> list[str]:
@@ -764,24 +961,38 @@ def collect_pull_requests(
     max_open_prs: int,
     file_probe_limit: int,
 ) -> list[PullRequest]:
-    numbers, preloaded_files = collect_candidate_numbers(
-        client,
-        repo,
-        recent_hours=recent_hours,
-        max_open_prs=max_open_prs,
-        file_probe_limit=file_probe_limit,
-    )
+    owner, name = split_repo(repo)
     cutoff = datetime.now(UTC) - timedelta(hours=recent_hours)
+    pulls = client.paginate_list(
+        f"/repos/{owner}/{name}/pulls",
+        params={"state": "open", "sort": "updated", "direction": "desc"},
+        limit=max_open_prs,
+    )
+
     prs: list[PullRequest] = []
-    for number in sorted(numbers, reverse=True):
-        pr = fetch_pull_request(client, repo, number, preloaded_files=preloaded_files.get(number))
-        updated_at = parse_github_time(pr.updated_at)
-        if pr.lifecycle_state != "open":
-            continue
+    scanned = 0
+    file_probes = 0
+    for raw in pulls:
+        updated_at = parse_github_time(raw.get("updated_at"))
         if updated_at and updated_at < cutoff:
             continue
-        if pr_has_openviking_signal(pr):
+        scanned += 1
+        number = int(raw["number"])
+        files: list[str] = []
+        if file_probes < file_probe_limit:
+            files = fetch_pull_files(client, repo, number)
+            file_probes += 1
+        issue = client.request("GET", f"/repos/{owner}/{name}/issues/{number}")
+        comments = fetch_issue_comments(client, repo, number)
+        pr = make_pull_request(raw, issue, files, comments)
+        if pr.lifecycle_state == "open":
             prs.append(pr)
+
+    print(
+        f"Collected {len(prs)} recent open PRs after scanning {scanned} PR records "
+        f"and probing files for {file_probes} PRs.",
+        file=sys.stderr,
+    )
     return sorted(prs, key=sort_prs)
 
 
@@ -858,47 +1069,48 @@ def build_report(
     recent_hours: int,
     generated_at: datetime,
 ) -> tuple[str, str]:
-    clusters = build_duplicate_clusters(prs)
     llm_status = "not configured"
-    deterministic = render_deterministic_report(
-        prs,
-        clusters,
-        upstream_repo=upstream_repo,
-        recent_hours=recent_hours,
-        generated_at=generated_at,
-        llm_status=llm_status,
-    )
-
     api_key = os.getenv("LLM_API_KEY", "")
     base_url = os.getenv("LLM_BASE_URL", "")
     model = os.getenv("LLM_MODEL", "")
-    if not (api_key and base_url and model):
-        return deterministic, llm_status
+    if api_key and base_url and model:
+        try:
+            assessments = classify_with_llm(
+                prs,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                upstream_repo=upstream_repo,
+            )
+        except Exception as exc:  # noqa: BLE001 - report generation should survive LLM outages.
+            llm_status = f"configured but skipped after error: {exc}"
+        else:
+            llm_status = f"classified with `{model}`"
+            return (
+                render_llm_report(
+                    assessments,
+                    reviewed_count=len(prs),
+                    upstream_repo=upstream_repo,
+                    recent_hours=recent_hours,
+                    generated_at=generated_at,
+                    llm_status=llm_status,
+                ),
+                llm_status,
+            )
 
-    try:
-        enhanced = enhance_with_llm(
-            deterministic,
-            build_llm_payload(prs, clusters),
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-        )
-    except Exception as exc:  # noqa: BLE001 - report generation should survive LLM outages.
-        llm_status = f"configured but skipped after error: {exc}"
-        return render_deterministic_report(
-            prs,
+    deterministic_prs = [pr for pr in prs if pr_has_openviking_signal(pr)]
+    clusters = build_duplicate_clusters(deterministic_prs)
+    return (
+        render_deterministic_report(
+            deterministic_prs,
             clusters,
             upstream_repo=upstream_repo,
             recent_hours=recent_hours,
             generated_at=generated_at,
             llm_status=llm_status,
-        ), llm_status
-
-    llm_status = f"enhanced with `{model}`"
-    enhanced = re.sub(r"^LLM: .*$", f"LLM: {llm_status}", enhanced, flags=re.MULTILINE)
-    if "LLM:" not in enhanced:
-        enhanced = enhanced.rstrip() + f"\n\nLLM: {llm_status}\n"
-    return enhanced, llm_status
+        ),
+        llm_status,
+    )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

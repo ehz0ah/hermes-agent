@@ -138,6 +138,94 @@ def test_render_report_includes_duplicate_and_recent_sections() -> None:
     assert "[#19569]" in markdown
 
 
+def test_llm_assessments_accept_real_related_prs_only() -> None:
+    prs = [
+        make_pr(10, "fix(openviking): update resource reads"),
+        make_pr(11, "fix: unrelated gateway cleanup"),
+    ]
+    data = {
+        "pull_requests": [
+            {
+                "number": 10,
+                "is_openviking_related": True,
+                "confidence": "high",
+                "topic": "Read routing",
+                "summary": "Updates OpenViking resource read behavior.",
+                "why": "Title explicitly names OpenViking.",
+                "duplicate_group": "",
+            },
+            {
+                "number": 11,
+                "is_openviking_related": False,
+                "confidence": "low",
+                "summary": "Rejected.",
+                "why": "No OpenViking signal.",
+            },
+            {
+                "number": 999,
+                "is_openviking_related": True,
+                "confidence": "high",
+                "summary": "Invented.",
+                "why": "Should be ignored.",
+            },
+        ]
+    }
+
+    assessments = report.parse_llm_assessments(data, prs)
+
+    assert [assessment.pr.number for assessment in assessments] == [10]
+    assert assessments[0].summary == "Updates OpenViking resource read behavior."
+
+
+def test_extract_json_object_accepts_fenced_json() -> None:
+    parsed = report.extract_json_object(
+        """```json
+{"pull_requests": []}
+```"""
+    )
+
+    assert parsed == {"pull_requests": []}
+
+
+def test_render_llm_report_includes_table_summaries_and_duplicate_groups() -> None:
+    first = make_pr(10, "fix(openviking): local upload")
+    second = make_pr(11, "feat(openviking): upload local resources")
+    assessments = [
+        report.LlmPrAssessment(
+            pr=first,
+            is_openviking_related=True,
+            confidence="high",
+            summary="Hardens local uploads before resource creation.",
+            why="Touches OpenViking local resource upload behavior.",
+            duplicate_group="Local resource upload",
+            topic="Local resource upload",
+        ),
+        report.LlmPrAssessment(
+            pr=second,
+            is_openviking_related=True,
+            confidence="medium",
+            summary="Adds another local resource upload path.",
+            why="Changes the same OpenViking upload flow.",
+            duplicate_group="Local resource upload",
+            topic="Local resource upload",
+        ),
+    ]
+
+    markdown = report.render_llm_report(
+        assessments,
+        reviewed_count=20,
+        upstream_repo="NousResearch/hermes-agent",
+        recent_hours=24,
+        generated_at=datetime(2026, 5, 4, tzinfo=UTC),
+        llm_status="classified with `model`",
+    )
+
+    assert "| PR | Confidence | Topic / duplicate group | Summary | Why included |" in markdown
+    assert "Hardens local uploads before resource creation." in markdown
+    assert "Reviewed: 20 open PRs" in markdown
+    assert "### Local resource upload" in markdown
+
+
 def test_chat_completions_url_accepts_base_or_full_endpoint() -> None:
     assert report.chat_completions_url("https://api.example.com/v1") == "https://api.example.com/v1/chat/completions"
     assert (

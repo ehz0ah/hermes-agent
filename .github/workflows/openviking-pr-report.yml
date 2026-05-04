@@ -37,7 +37,7 @@ jobs:
           REPORT_REPOSITORY: ${{ github.repository }}
           RECENT_HOURS: "24"
           MAX_OPEN_PRS: "100"
-          FILE_PROBE_LIMIT: "25"
+          FILE_PROBE_LIMIT: "100"
           UPSTREAM_GITHUB_TOKEN: ${{ secrets.UPSTREAM_GITHUB_TOKEN }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
