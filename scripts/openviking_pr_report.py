@@ -603,11 +603,11 @@ def build_llm_payload(prs: list[PullRequest]) -> dict[str, Any]:
                 "labels": pr.labels[:8],
                 "head_ref": pr.head_ref,
                 "linked_issues": sorted(pr.linked_issues)[:10],
-                "files": pr.files[:25],
-                "body_excerpt": textwrap.shorten(" ".join(pr.body.split()), width=450, placeholder="..."),
+                "files": pr.files[:15],
+                "body_excerpt": textwrap.shorten(" ".join(pr.body.split()), width=320, placeholder="..."),
                 "openviking_signal": pr_has_openviking_signal(pr),
                 "comments": [
-                    textwrap.shorten(" ".join(comment.split()), width=220, placeholder="...")
+                    textwrap.shorten(" ".join(comment.split()), width=160, placeholder="...")
                     for comment in pr.comments[:2]
                 ],
             }
@@ -797,8 +797,8 @@ def classify_llm_batch(
                 "under `tests/plugins/memory/test_openviking`. Generic memory, provider, upload, "
                 "or CLI changes are not OpenViking-related unless they explicitly touch this plugin, "
                 "its paths, APIs, tools, resources, or integration behavior.\n\n"
-                f"Classify open PRs from `{upstream_repo}`. For every candidate, decide whether it "
-                "is OpenViking-related. Return a JSON object with this exact shape:\n"
+                f"Classify open PRs from `{upstream_repo}`. Review every candidate, but return only "
+                "PRs that are OpenViking-related. Return a JSON object with this exact shape:\n"
                 "{\n"
                 '  "pull_requests": [\n'
                 "    {\n"
@@ -813,8 +813,7 @@ def classify_llm_batch(
                 "  ]\n"
                 "}\n\n"
                 "Use duplicate_group only when two or more included PRs appear to solve or modify "
-                "the same OpenViking behavior. Include false entries for candidates you reviewed "
-                "but rejected. Keep summaries concise.\n\n"
+                "the same OpenViking behavior. Omit rejected PRs entirely. Keep summaries concise.\n\n"
                 f"Candidate data:\n{json.dumps(payload, sort_keys=True)}"
             ),
         },
