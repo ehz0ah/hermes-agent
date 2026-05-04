@@ -1205,7 +1205,6 @@ def collect_pull_requests(
     max_open_prs: int,
     file_probe_limit: int,
 ) -> list[PullRequest]:
-    owner, name = split_repo(repo)
     cutoff = datetime.now(UTC) - timedelta(hours=recent_hours)
     pulls = fetch_recent_open_pull_records(
         client,
@@ -1215,31 +1214,26 @@ def collect_pull_requests(
     )
 
     prs_by_number: dict[int, PullRequest] = {}
-    preloaded_files: dict[int, list[str]] = {}
-    file_probes = 0
     for raw in pulls:
         number = int(raw["number"])
-        files: list[str] = []
-        if file_probes < file_probe_limit:
-            files = fetch_pull_files(client, repo, number)
-            file_probes += 1
-            preloaded_files[number] = files
-        issue = client.request("GET", f"/repos/{owner}/{name}/issues/{number}")
-        comments = fetch_issue_comments(client, repo, number)
-        pr = make_pull_request(raw, issue, files, comments)
+        pr = make_pull_request(raw, raw, [], [])
         if pr.lifecycle_state == "open":
             prs_by_number[pr.number] = pr
 
     search_numbers = collect_search_candidate_numbers(client, repo, recent_hours=recent_hours)
-    for number in sorted(search_numbers - set(prs_by_number), reverse=True):
-        pr = fetch_pull_request(client, repo, number, preloaded_files=preloaded_files.get(number))
+    enriched = 0
+    for number in sorted(search_numbers, reverse=True):
+        if enriched >= file_probe_limit:
+            break
+        pr = fetch_pull_request(client, repo, number)
+        enriched += 1
         updated_at = parse_github_time(pr.updated_at)
         if pr.lifecycle_state == "open" and (not updated_at or updated_at >= cutoff):
             prs_by_number[pr.number] = pr
 
     print(
-        f"Collected {len(prs_by_number)} recent open PRs after scanning {len(pulls)} PR records, "
-        f"probing files for {file_probes} PRs, and unioning {len(search_numbers)} OpenViking search hits.",
+        f"Collected {len(prs_by_number)} recent open PRs after scanning {len(pulls)} lightweight PR records "
+        f"and enriching {enriched} OpenViking search hit(s).",
         file=sys.stderr,
     )
     return sorted(prs_by_number.values(), key=sort_prs)
