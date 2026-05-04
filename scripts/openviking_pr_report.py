@@ -13,12 +13,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 
 DEFAULT_UPSTREAM_REPO = "NousResearch/hermes-agent"
 DEFAULT_REPORT_TITLE = "OpenViking PR Report"
+SINGAPORE_TZ = timezone(timedelta(hours=8))
 OPENVIKING_TERMS = (
     "openviking",
     "open viking",
@@ -841,6 +842,15 @@ def github_run_url() -> str | None:
     return None
 
 
+def dated_report_title(base_title: str, generated_at: datetime) -> str:
+    local_date = generated_at.astimezone(SINGAPORE_TZ).strftime("%Y-%m-%d")
+    if "%Y" in base_title:
+        return generated_at.astimezone(SINGAPORE_TZ).strftime(base_title)
+    if re.search(r"\d{4}-\d{2}-\d{2}$", base_title):
+        return base_title
+    return f"{base_title} - {local_date}"
+
+
 def build_report(
     prs: list[PullRequest],
     *,
@@ -949,10 +959,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return 0
     write_client = GitHubClient(write_token)
+    issue_title = dated_report_title(args.report_title, generated_at)
     issue_url = publish_report(
         write_client,
         report_repo=args.report_repo,
-        title=args.report_title,
+        title=issue_title,
         body=report,
         post_comment=not args.no_comment,
     )

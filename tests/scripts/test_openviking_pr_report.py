@@ -144,3 +144,11 @@ def test_chat_completions_url_accepts_base_or_full_endpoint() -> None:
         report.chat_completions_url("https://api.example.com/v1/chat/completions")
         == "https://api.example.com/v1/chat/completions"
     )
+
+
+def test_dated_report_title_uses_singapore_date() -> None:
+    generated_at = datetime(2026, 5, 3, 18, 30, tzinfo=UTC)
+
+    assert report.dated_report_title("OpenViking PR Report", generated_at) == "OpenViking PR Report - 2026-05-04"
+    assert report.dated_report_title("OpenViking %Y-%m-%d", generated_at) == "OpenViking 2026-05-04"
+    assert report.dated_report_title("OpenViking PR Report - 2026-05-04", generated_at) == "OpenViking PR Report - 2026-05-04"
