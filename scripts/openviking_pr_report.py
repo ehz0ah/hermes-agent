@@ -24,18 +24,14 @@ OPENVIKING_TERMS = (
     "open viking",
     "viking_",
     "viking://",
-    "temp_upload",
-    "temp upload",
 )
 SEARCH_TERMS = (
     "openviking",
-    "viking_add_resource",
-    "viking_delete_resource",
+    "open viking",
+    "viking_",
     "viking://",
-    "temp_upload",
 )
 OPENVIKING_PATH_PREFIXES = (
-    "benchmarks/backends/openviking",
     "plugins/memory/openviking",
     "tests/plugins/memory/test_openviking",
 )
@@ -63,14 +59,8 @@ STOPWORDS = {
     "to",
     "with",
 }
-STRONG_SIGNATURE_TERMS = {
-    "auto_commit",
-    "fallback_recall",
-    "local_resource_upload",
-    "temp_upload",
-}
 TOPIC_ORDER = (
-    "Local resource upload / temp_upload",
+    "Local resource upload",
     "Read/file URI routing",
     "Explicit fallback / remember recall",
     "Tool surface expansion",
@@ -283,8 +273,6 @@ def signature_terms(pr: PullRequest) -> set[str]:
     signatures: set[str] = set(re.findall(r"viking_[a-z0-9_]+", text))
     endpoint_matches = re.findall(r"/api/v1/[a-z0-9_/{}/-]+", text)
     signatures.update(endpoint_matches)
-    if re.search(r"temp[_ -]?upload", text):
-        signatures.add("temp_upload")
     if re.search(r"local (?:file|files|path|paths|resource|resources|director(?:y|ies))", text) and "upload" in text:
         signatures.add("local_resource_upload")
     if "fallback" in text and ("recall" in text or "prefetch" in text or "search" in text):
@@ -326,11 +314,7 @@ def duplicate_reasons(left: PullRequest, right: PullRequest) -> DuplicateEdge | 
 
     shared_signatures = signature_terms(left) & signature_terms(right)
     if shared_signatures:
-        strong_signatures = shared_signatures & STRONG_SIGNATURE_TERMS
-        if strong_signatures:
-            score += 4
-        else:
-            score += min(3, len(shared_signatures))
+        score += min(3, len(shared_signatures))
         examples = ", ".join(sorted(shared_signatures)[:4])
         reasons.append(f"shared OpenViking surface: {examples}")
 
@@ -355,8 +339,8 @@ def duplicate_reasons(left: PullRequest, right: PullRequest) -> DuplicateEdge | 
 
 def cluster_topic(prs: list[PullRequest], reasons: list[str]) -> str:
     text = "\n".join([pr.title + "\n" + pr.body for pr in prs] + reasons).lower()
-    if "temp_upload" in text or "local_resource_upload" in text or "local resource upload" in text:
-        return "Local resource upload / temp_upload"
+    if "local_resource_upload" in text or "local resource upload" in text:
+        return "Local resource upload"
     if "fallback" in text or "prefetch" in text:
         return "Fallback recall"
     if "auto" in text and "commit" in text:
@@ -370,8 +354,8 @@ def topic_tags(pr: PullRequest) -> set[str]:
     text = "\n".join([pr.title, pr.body, *pr.comments]).lower()
     signatures = signature_terms(pr)
     tags: set[str] = set()
-    if {"temp_upload", "local_resource_upload"} & signatures:
-        tags.add("Local resource upload / temp_upload")
+    if "local_resource_upload" in signatures:
+        tags.add("Local resource upload")
     if "viking_read" in text or "file uri" in text or "content/read" in text or "overview.md" in text:
         tags.add("Read/file URI routing")
     if "fallback" in text or "explicit remember" in text or "prefetch" in text:
@@ -392,9 +376,7 @@ def primary_topic(pr: PullRequest) -> str:
     if "fallback" in title or "explicit remember" in title:
         return "Explicit fallback / remember recall"
     if "local" in title and ("upload" in title or "resource" in title):
-        return "Local resource upload / temp_upload"
-    if "temp_upload" in title:
-        return "Local resource upload / temp_upload"
+        return "Local resource upload"
     if "viking_read" in title or "file uri" in title or "content/read" in title:
         return "Read/file URI routing"
     if "endpoint" in title or "v0.2" in title or "v0.3" in title:

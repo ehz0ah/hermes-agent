@@ -53,13 +53,13 @@ def test_duplicate_clusters_group_local_upload_prs() -> None:
         make_pr(
             10360,
             "fix(memory): support OpenViking local resource uploads",
-            "Fixes #10350. Uploads local files via /api/v1/resources/temp_upload before add_resource.",
+            "Fixes #10350. Uploads local files before add_resource.",
             ["plugins/memory/openviking/__init__.py", "tests/plugins/memory/test_openviking_provider.py"],
         ),
         make_pr(
             19569,
             "fix(memory): harden OpenViking local resource uploads",
-            "Builds on #10360 and follows temp_upload for local files/directories.",
+            "Builds on #10360 and follows local upload handling for files/directories.",
             ["plugins/memory/openviking/__init__.py", "tests/plugins/memory/test_openviking_provider.py"],
         ),
         make_pr(
@@ -76,7 +76,7 @@ def test_duplicate_clusters_group_local_upload_prs() -> None:
         cluster for cluster in clusters if {10360, 19569} <= {pr.number for pr in cluster.prs}
     ]
     assert local_upload_clusters
-    assert local_upload_clusters[0].topic == "Local resource upload / temp_upload"
+    assert local_upload_clusters[0].topic == "Local resource upload"
     assert {pr.number for pr in local_upload_clusters[0].prs} == {10360, 19569}
     assert any("shared topic" in reason for reason in local_upload_clusters[0].reasons)
 
@@ -111,12 +111,12 @@ def test_render_report_includes_duplicate_and_recent_sections() -> None:
     open_pr = make_pr(
         10360,
         "fix(memory): support OpenViking local resource uploads",
-        "Upload local files via temp_upload.",
+        "Upload local files.",
     )
     merged_pr = make_pr(
         19569,
         "fix(memory): harden OpenViking local resource uploads",
-        "Builds on #10360 and preserves temp_upload behavior.",
+        "Builds on #10360 and preserves local upload behavior.",
         state="closed",
         merged_at="2026-04-21T00:00:00Z",
     )
@@ -133,7 +133,7 @@ def test_render_report_includes_duplicate_and_recent_sections() -> None:
     )
 
     assert "## Likely Duplicate Groups" in markdown
-    assert "Local resource upload / temp_upload" in markdown
+    assert "Local resource upload" in markdown
     assert "Scope: open OpenViking-related PRs updated in the last 24 hours." in markdown
     assert "[#19569]" in markdown
 
