@@ -245,6 +245,7 @@ def test_classify_with_llm_batches_candidates(monkeypatch) -> None:
 
     monkeypatch.setattr(report, "classify_llm_batch", fake_classify_batch)
     monkeypatch.setenv("LLM_BATCH_SIZE", "2")
+    monkeypatch.setenv("LLM_CONCURRENCY", "20")
     monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "30")
 
     assessments = report.classify_with_llm(
@@ -255,8 +256,66 @@ def test_classify_with_llm_batches_candidates(monkeypatch) -> None:
         upstream_repo="NousResearch/hermes-agent",
     )
 
-    assert calls == [[1, 2], [3]]
+    assert sorted(calls) == [[1, 2], [3]]
     assert [assessment.pr.number for assessment in assessments] == [3, 2, 1]
+
+
+def test_deterministic_guardrail_adds_llm_misses() -> None:
+    llm_match = report.LlmPrAssessment(
+        pr=make_pr(1, "fix(openviking): reconnect provider"),
+        is_openviking_related=True,
+        confidence="high",
+        summary="Reconnects the provider.",
+        why="LLM included it.",
+    )
+    deterministic_only = make_pr(
+        2,
+        "fix: memory provider cleanup",
+        files=["plugins/memory/openviking/__init__.py"],
+    )
+    unrelated = make_pr(3, "fix: gateway cleanup", files=["gateway/run.py"])
+
+    merged, added = report.merge_with_deterministic_matches(
+        [llm_match],
+        [llm_match.pr, deterministic_only, unrelated],
+    )
+
+    assert added == 1
+    assert {assessment.pr.number for assessment in merged} == {1, 2}
+    assert any("Deterministic guardrail" in assessment.why for assessment in merged if assessment.pr.number == 2)
+
+
+def test_fetch_recent_open_pull_records_paginates_until_cutoff(monkeypatch) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.pages = {
+                1: [{"number": number, "updated_at": "2026-05-04T12:00:00Z"} for number in range(1, 101)],
+                2: [
+                    {"number": 101, "updated_at": "2026-05-03T13:00:00Z"},
+                    {"number": 102, "updated_at": "2026-05-03T10:00:00Z"},
+                ],
+            }
+
+        def request(self, method, path, *, params=None, data=None):
+            assert method == "GET"
+            assert path == "/repos/NousResearch/hermes-agent/pulls"
+            return self.pages.get(params["page"], [])
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 5, 4, 12, 0, tzinfo=tz)
+
+    monkeypatch.setattr(report, "datetime", FixedDatetime)
+
+    pulls = report.fetch_recent_open_pull_records(
+        FakeClient(),
+        "NousResearch/hermes-agent",
+        recent_hours=24,
+        max_open_prs=1000,
+    )
+
+    assert [pull["number"] for pull in pulls][-2:] == [100, 101]
 
 
 def test_chat_completions_url_accepts_base_or_full_endpoint() -> None:

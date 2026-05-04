@@ -12,6 +12,7 @@ import textwrap
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
@@ -530,6 +531,50 @@ def sort_assessments(assessment: LlmPrAssessment) -> tuple[int, tuple[int, float
     return (confidence_rank(assessment.confidence), sort_prs(assessment.pr))
 
 
+def deterministic_openviking_reason(pr: PullRequest) -> str:
+    text = "\n".join([pr.title, pr.body, pr.head_ref, " ".join(pr.labels)]).lower()
+    matched_terms = [term for term in OPENVIKING_TERMS if term in text]
+    matched_paths = [
+        path
+        for path in pr.files
+        if any(path.lower().startswith(prefix) for prefix in OPENVIKING_PATH_PREFIXES)
+    ]
+    reasons: list[str] = []
+    if matched_terms:
+        reasons.append("matched OpenViking terms: " + ", ".join(matched_terms[:4]))
+    if matched_paths:
+        reasons.append("touched OpenViking plugin/test paths: " + ", ".join(matched_paths[:3]))
+    return "; ".join(reasons) or "matched deterministic OpenViking signal"
+
+
+def deterministic_assessment(pr: PullRequest) -> LlmPrAssessment:
+    topic = primary_topic(pr)
+    duplicate_group = "" if topic == "Other OpenViking overlap" else topic
+    return LlmPrAssessment(
+        pr=pr,
+        is_openviking_related=True,
+        confidence="high",
+        summary=pr.title,
+        why="Deterministic guardrail: " + deterministic_openviking_reason(pr),
+        duplicate_group=duplicate_group,
+        topic=topic,
+    )
+
+
+def merge_with_deterministic_matches(
+    assessments: list[LlmPrAssessment],
+    prs: list[PullRequest],
+) -> tuple[list[LlmPrAssessment], int]:
+    by_number = {assessment.pr.number: assessment for assessment in assessments}
+    added = 0
+    for pr in prs:
+        if pr.number in by_number or not pr_has_openviking_signal(pr):
+            continue
+        by_number[pr.number] = deterministic_assessment(pr)
+        added += 1
+    return sorted(by_number.values(), key=sort_assessments), added
+
+
 def render_deterministic_report(
     prs: list[PullRequest],
     clusters: list[DuplicateCluster],
@@ -842,6 +887,94 @@ def classify_llm_batch(
     return parse_llm_assessments(extract_json_object(content), prs)
 
 
+def llm_chat_content(
+    messages: list[dict[str, str]],
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout_seconds: int,
+) -> str:
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+    }
+    req = urllib.request.Request(
+        chat_completions_url(base_url),
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "openviking-pr-report",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+        raw = response.read().decode("utf-8")
+    data = json.loads(raw)
+    content = data["choices"][0]["message"]["content"]
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("LLM response did not include content")
+    return content.strip() + "\n"
+
+
+def format_report_with_llm(
+    report: str,
+    assessments: list[LlmPrAssessment],
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout_seconds: int,
+) -> str:
+    payload = {
+        "openviking_matches": [
+            {
+                "number": assessment.pr.number,
+                "url": assessment.pr.html_url,
+                "title": assessment.pr.title,
+                "confidence": assessment.confidence,
+                "topic": assessment.topic,
+                "duplicate_group": assessment.duplicate_group,
+                "summary": assessment.summary,
+                "why": assessment.why,
+            }
+            for assessment in assessments
+        ],
+        "draft_report": report,
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You format concise GitHub PR triage reports in Markdown. Preserve every PR number, "
+                "link, confidence, and factual summary from the input. Do not invent PRs or omit PRs."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Format this OpenViking PR report for a maintainer. Keep the table. Improve wording "
+                "and duplicate-group explanations if useful, but include every PR in openviking_matches "
+                "exactly once in the main table.\n\n"
+                f"Input JSON:\n{json.dumps(payload, sort_keys=True)}"
+            ),
+        },
+    ]
+    formatted = llm_chat_content(
+        messages,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        timeout_seconds=timeout_seconds,
+    )
+    missing = [assessment.pr.number for assessment in assessments if f"#{assessment.pr.number}" not in formatted]
+    if missing:
+        raise RuntimeError("LLM formatted report omitted PRs: " + ", ".join(f"#{number}" for number in missing))
+    return formatted
+
+
 def int_from_env(name: str, default: int, *, minimum: int = 1) -> int:
     try:
         value = int(os.getenv(name, str(default)))
@@ -858,13 +991,19 @@ def classify_with_llm(
     model: str,
     upstream_repo: str,
 ) -> list[LlmPrAssessment]:
-    batch_size = int_from_env("LLM_BATCH_SIZE", 25)
+    batch_size = int_from_env("LLM_BATCH_SIZE", 20)
+    concurrency = int_from_env("LLM_CONCURRENCY", 20)
     timeout_seconds = int_from_env("LLM_TIMEOUT_SECONDS", 120, minimum=30)
+    batches = [prs[start : start + batch_size] for start in range(0, len(prs), batch_size)]
     assessments: list[LlmPrAssessment] = []
-    for start in range(0, len(prs), batch_size):
-        batch = prs[start : start + batch_size]
-        assessments.extend(
-            classify_llm_batch(
+    errors: list[Exception] = []
+    if not batches:
+        return []
+
+    with ThreadPoolExecutor(max_workers=min(concurrency, len(batches))) as executor:
+        futures = [
+            executor.submit(
+                classify_llm_batch,
                 batch,
                 api_key=api_key,
                 base_url=base_url,
@@ -872,7 +1011,18 @@ def classify_with_llm(
                 upstream_repo=upstream_repo,
                 timeout_seconds=timeout_seconds,
             )
-        )
+            for batch in batches
+        ]
+        for future in as_completed(futures):
+            try:
+                assessments.extend(future.result())
+            except Exception as exc:  # noqa: BLE001 - one LLM batch should not discard successful batches.
+                errors.append(exc)
+
+    if errors:
+        print(f"{len(errors)} LLM classification batch(es) failed.", file=sys.stderr)
+        if not assessments:
+            raise errors[0]
 
     by_number: dict[int, LlmPrAssessment] = {}
     for assessment in assessments:
@@ -993,6 +1143,60 @@ def collect_candidate_numbers(
     return numbers, preloaded_files
 
 
+def collect_search_candidate_numbers(client: GitHubClient, repo: str, *, recent_hours: int) -> set[int]:
+    cutoff = datetime.now(UTC) - timedelta(hours=recent_hours)
+    numbers: set[int] = set()
+    for term in SEARCH_TERMS:
+        quoted = f'"{term}"' if " " in term or "://" in term else term
+        query = f"repo:{repo} is:pr is:open updated:>={cutoff.isoformat(timespec='seconds')} {quoted}"
+        for item in client.search_issues(query):
+            if item.get("number"):
+                numbers.add(int(item["number"]))
+    return numbers
+
+
+def fetch_recent_open_pull_records(
+    client: GitHubClient,
+    repo: str,
+    *,
+    recent_hours: int,
+    max_open_prs: int,
+) -> list[dict[str, Any]]:
+    owner, name = split_repo(repo)
+    cutoff = datetime.now(UTC) - timedelta(hours=recent_hours)
+    pulls: list[dict[str, Any]] = []
+    page = 1
+    reached_cutoff = False
+
+    while len(pulls) < max_open_prs and not reached_cutoff:
+        items = client.request(
+            "GET",
+            f"/repos/{owner}/{name}/pulls",
+            params={"state": "open", "sort": "updated", "direction": "desc", "per_page": 100, "page": page},
+        )
+        if not isinstance(items, list):
+            raise GitHubApiError(f"Expected list response from /repos/{owner}/{name}/pulls")
+        if not items:
+            break
+
+        for raw in items:
+            updated_at = parse_github_time(raw.get("updated_at"))
+            if updated_at and updated_at < cutoff:
+                reached_cutoff = True
+                break
+            pulls.append(raw)
+            if len(pulls) >= max_open_prs:
+                break
+
+        if len(items) < 100:
+            break
+        page += 1
+
+    if len(pulls) >= max_open_prs:
+        print(f"Stopped recent PR scan after safety cap of {max_open_prs} open PRs.", file=sys.stderr)
+    return pulls
+
+
 def collect_pull_requests(
     client: GitHubClient,
     repo: str,
@@ -1003,37 +1207,42 @@ def collect_pull_requests(
 ) -> list[PullRequest]:
     owner, name = split_repo(repo)
     cutoff = datetime.now(UTC) - timedelta(hours=recent_hours)
-    pulls = client.paginate_list(
-        f"/repos/{owner}/{name}/pulls",
-        params={"state": "open", "sort": "updated", "direction": "desc"},
-        limit=max_open_prs,
+    pulls = fetch_recent_open_pull_records(
+        client,
+        repo,
+        recent_hours=recent_hours,
+        max_open_prs=max_open_prs,
     )
 
-    prs: list[PullRequest] = []
-    scanned = 0
+    prs_by_number: dict[int, PullRequest] = {}
+    preloaded_files: dict[int, list[str]] = {}
     file_probes = 0
     for raw in pulls:
-        updated_at = parse_github_time(raw.get("updated_at"))
-        if updated_at and updated_at < cutoff:
-            continue
-        scanned += 1
         number = int(raw["number"])
         files: list[str] = []
         if file_probes < file_probe_limit:
             files = fetch_pull_files(client, repo, number)
             file_probes += 1
+            preloaded_files[number] = files
         issue = client.request("GET", f"/repos/{owner}/{name}/issues/{number}")
         comments = fetch_issue_comments(client, repo, number)
         pr = make_pull_request(raw, issue, files, comments)
         if pr.lifecycle_state == "open":
-            prs.append(pr)
+            prs_by_number[pr.number] = pr
+
+    search_numbers = collect_search_candidate_numbers(client, repo, recent_hours=recent_hours)
+    for number in sorted(search_numbers - set(prs_by_number), reverse=True):
+        pr = fetch_pull_request(client, repo, number, preloaded_files=preloaded_files.get(number))
+        updated_at = parse_github_time(pr.updated_at)
+        if pr.lifecycle_state == "open" and (not updated_at or updated_at >= cutoff):
+            prs_by_number[pr.number] = pr
 
     print(
-        f"Collected {len(prs)} recent open PRs after scanning {scanned} PR records "
-        f"and probing files for {file_probes} PRs.",
+        f"Collected {len(prs_by_number)} recent open PRs after scanning {len(pulls)} PR records, "
+        f"probing files for {file_probes} PRs, and unioning {len(search_numbers)} OpenViking search hits.",
         file=sys.stderr,
     )
-    return sorted(prs, key=sort_prs)
+    return sorted(prs_by_number.values(), key=sort_prs)
 
 
 def find_report_issue(client: GitHubClient, report_repo: str, title: str) -> dict[str, Any] | None:
@@ -1125,18 +1334,35 @@ def build_report(
         except Exception as exc:  # noqa: BLE001 - report generation should survive LLM outages.
             llm_status = f"configured but skipped after error: {exc}"
         else:
+            assessments, deterministic_added = merge_with_deterministic_matches(assessments, prs)
             llm_status = f"classified with `{model}`"
-            return (
-                render_llm_report(
-                    assessments,
-                    reviewed_count=len(prs),
-                    upstream_repo=upstream_repo,
-                    recent_hours=recent_hours,
-                    generated_at=generated_at,
-                    llm_status=llm_status,
-                ),
-                llm_status,
+            if deterministic_added:
+                llm_status += f"; deterministic guardrail added {deterministic_added} match(es)"
+            report = render_llm_report(
+                assessments,
+                reviewed_count=len(prs),
+                upstream_repo=upstream_repo,
+                recent_hours=recent_hours,
+                generated_at=generated_at,
+                llm_status=llm_status,
             )
+            try:
+                report = format_report_with_llm(
+                    report,
+                    assessments,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    timeout_seconds=int_from_env("LLM_TIMEOUT_SECONDS", 120, minimum=30),
+                )
+            except Exception as exc:  # noqa: BLE001 - the rendered table is a valid fallback.
+                print(f"Final LLM formatting skipped: {exc}", file=sys.stderr)
+            else:
+                llm_status += "; final report formatted with LLM"
+                report = re.sub(r"^LLM: .*$", f"LLM: {llm_status}", report, flags=re.MULTILINE)
+                if "LLM:" not in report:
+                    report = report.rstrip() + f"\n\nLLM: {llm_status}\n"
+            return (report, llm_status)
 
     deterministic_prs = [pr for pr in prs if pr_has_openviking_signal(pr)]
     clusters = build_duplicate_clusters(deterministic_prs)
