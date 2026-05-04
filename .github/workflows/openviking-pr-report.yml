@@ -1,0 +1,57 @@
+name: OpenViking PR Report
+
+on:
+  schedule:
+    # 9 AM Singapore time.
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Generate the report without updating the tracking issue"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: openviking-pr-report
+  cancel-in-progress: true
+
+jobs:
+  report:
+    if: github.repository == 'ehz0ah/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Generate OpenViking PR report
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPOSITORY: NousResearch/hermes-agent
+          REPORT_REPOSITORY: ${{ github.repository }}
+          RECENT_DAYS: "14"
+          UPSTREAM_GITHUB_TOKEN: ${{ secrets.UPSTREAM_GITHUB_TOKEN }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: |
+          args=(--output openviking-pr-report.md)
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python3 scripts/openviking_pr_report.py "${args[@]}"
+
+      - name: Add report to workflow summary
+        if: always()
+        run: |
+          if [ -f openviking-pr-report.md ]; then
+            cat openviking-pr-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No report file was generated." >> "$GITHUB_STEP_SUMMARY"
+          fi
