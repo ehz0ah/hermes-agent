@@ -174,9 +174,9 @@ def test_report_header_includes_match_count() -> None:
 
 
 def test_strip_generated_preamble_removes_llm_title_and_overview() -> None:
-    markdown = "# OpenViking Open PR Triage Report\n\nOverview: 2 PRs.\n\n---\n### [#2](https://example.test/2) title"
+    markdown = "**OpenViking Open PR Triage Report**\n\nOverview: 2 PRs.\n\n---\n**[#2](https://example.test/2) title**"
 
-    assert report.strip_generated_preamble(markdown).startswith("---\n### [#2]")
+    assert report.strip_generated_preamble(markdown).startswith("---\n**[#2]")
 
 
 def test_attach_file_paths_parallel_adds_filenames() -> None:
@@ -208,10 +208,13 @@ def test_build_llm_prompt_includes_only_matched_pr_facts() -> None:
     assert "plugins/memory/openviking/__init__.py" in user_content
     assert "viking_read behavior" in user_content
     assert "Summary:" in user_content
-    assert "Possible Overlaps" in user_content
+    assert "group related or overlapping work" in user_content
+    assert "Possible Overlaps` field" in user_content
     assert "horizontal divider" in user_content
+    assert "cause-and-effect style" in user_content
+    assert "**[#number](url) title**" in user_content
     assert "Do not include a top-level title or overview" in user_content
-    assert "Expected PR numbers, in this order: #42" in user_content
+    assert "Expected PR numbers: #42" in user_content
     assert "Do not include confidence" in user_content
 
 
@@ -219,20 +222,21 @@ def test_complete_pr_sections_adds_missing_llm_sections() -> None:
     first = make_pr(2, "fix(openviking): first")
     missing = make_pr(1, "fix(openviking): missing")
     llm_markdown = (
-        "# OpenViking Open PR Triage Report\n\n"
+        "**OpenViking Open PR Triage Report**\n\n"
         "Overview: 2 open OpenViking-related PRs found.\n\n"
+        "**Group: Endpoint fixes**\n\n"
         "---\n"
-        "### [#2](https://github.com/NousResearch/hermes-agent/pull/2) fix(openviking): first\n"
-        "**Summary:** Detailed summary.\n"
-        "**Possible Overlaps:** None."
+        "**[#2](https://github.com/NousResearch/hermes-agent/pull/2) fix(openviking): first**\n"
+        "**Summary:** Detailed summary."
     )
 
     markdown, missing_numbers = report.complete_pr_sections(llm_markdown, [first, missing])
 
     assert missing_numbers == [1]
-    assert "### [#2]" in markdown
-    assert "### [#1]" in markdown
-    assert markdown.index("### [#2]") < markdown.index("### [#1]")
+    assert "**[#2]" in markdown
+    assert "**[#1]" in markdown
+    assert "Possible Overlaps" not in markdown
+    assert markdown.index("**[#2]") < markdown.index("**[#1]")
 
 
 def test_lark_card_envelope_uses_interactive_markdown_card() -> None:
@@ -249,8 +253,8 @@ def test_lark_card_splits_large_markdown_by_pr_section() -> None:
     markdown = "\n\n".join(
         [
             "# Report\n\nOverview: 2 open OpenViking-related PRs found.",
-            "---\n### [#2](https://example.test/2) title\n**Summary:** " + ("a" * 80),
-            "---\n### [#1](https://example.test/1) title\n**Summary:** " + ("b" * 80),
+            "---\n**[#2](https://example.test/2) title**\n**Summary:** " + ("a" * 80),
+            "---\n**[#1](https://example.test/1) title**\n**Summary:** " + ("b" * 80),
         ]
     )
 
@@ -259,7 +263,7 @@ def test_lark_card_splits_large_markdown_by_pr_section() -> None:
     elements = card["card"]["body"]["elements"]
     assert len(elements) > 1
     assert all(element["tag"] == "markdown" for element in elements)
-    assert "### [#1]" in elements[-1]["content"]
+    assert "**[#1]" in elements[-1]["content"]
 
 
 def test_no_matches_fallback_report_text() -> None:
@@ -273,13 +277,18 @@ def test_fallback_report_separates_pr_sections() -> None:
     pr = make_pr(
         42,
         "fix(openviking): resource routing",
+        "## Problem\nOpenViking routes the resource incorrectly.\n### Fix\nUse the provider path.",
         files=["plugins/memory/openviking/__init__.py"],
     )
 
     markdown = report.render_fallback_report([pr], llm_status="not configured")
 
     assert "---" in markdown
-    assert "### [#42]" in markdown
+    assert "**Group: OpenViking-related PRs**" in markdown
+    assert "**[#42]" in markdown
     assert "**Summary:**" in markdown
-    assert "**Possible Overlaps:**" in markdown
     assert "plugins/memory/openviking" not in markdown
+    assert "matched the OpenViking report filter" not in markdown
+    assert "Possible Overlaps" not in markdown
+    assert "##" not in markdown
+    assert "Problem OpenViking routes the resource incorrectly." in markdown

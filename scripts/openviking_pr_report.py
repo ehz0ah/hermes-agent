@@ -50,7 +50,7 @@ OPENVIKING_PATH_PREFIXES = (
 )
 
 PR_SECTION_RE = re.compile(
-    r"(?:^|\n)---\s*\n+(?P<section>### \[#(?P<number>\d+)\]\([^)]*\) .+?)(?=\n---\s*\n+### |\Z)",
+    r"(?:^|\n)---\s*\n+(?P<section>(?:### \[#|\*\*\[#)(?P<number>\d+)\]\([^)]*\) .+?)(?=\n---\s*\n+(?:### \[#|\*\*\[#)|\Z)",
     re.DOTALL,
 )
 
@@ -338,13 +338,20 @@ def build_llm_prompt(prs: list[PullRequest], *, body_chars: int) -> list[dict[st
                 "provider setup, endpoint migration, memory recall/search, and resource handling.\n\n"
                 "The input PR JSON is the authoritative filtered list. Include every input PR exactly once, "
                 "even if a PR only looks indirectly related from its title/body. "
-                f"Expected PR numbers, in this order: {expected_numbers}.\n\n"
+                f"Expected PR numbers: {expected_numbers}.\n\n"
                 "Return standard Markdown only. Include:\n"
                 "- Do not include a top-level title or overview; the caller adds those.\n"
-                "- Separate every PR with a visible horizontal divider line `---` before the PR heading.\n"
-                "- One section per PR using `### [#number](url) title`.\n"
-                "- Under each PR, add a bold `Summary:` label followed by a detailed 2-3 sentence summary with useful context.\n"
-                "- Add a `**Possible Overlaps:**` line when this PR likely overlaps or conflicts with another listed PR; otherwise write `**Possible Overlaps:** None.`\n"
+                "- Reorder PRs to physically group related or overlapping work next to each other. "
+                "Use compact group labels like `**Group: Local resource uploads**`; use `**Group: Other**` for unrelated singles.\n"
+                "- Separate every PR with a visible horizontal divider line `---` before the PR title line.\n"
+                "- One compact section per PR using `**[#number](url) title**`; do not use Markdown headings for PR sections.\n"
+                "- Under each PR, add a bold `Summary:` label followed by 2-3 sentences in a clear "
+                "cause-and-effect style: start with the issue, user-visible failure, or capability gap; "
+                "then explain the mechanism or affected code path when the input gives enough detail; "
+                "then state the concrete fix, behavior change, and tests/validation when available. "
+                "For feature PRs, explain the new capability, why it matters, and how it is integrated. "
+                "Avoid vague summaries such as merely saying the PR matched the OpenViking filter.\n"
+                "- Do not include a `Possible Overlaps` field; grouping order replaces that field.\n"
                 "- Do not include confidence, changed paths, or a separate why/context section in the final report.\n"
                 "- Do not use Markdown tables; Lark cards render stacked sections more reliably.\n"
                 "- Keep it compact and maintainer-facing.\n\n"
@@ -358,18 +365,45 @@ def report_header(prs: list[PullRequest]) -> str:
     count = len(prs)
     suffix = "PR" if count == 1 else "PRs"
     return (
-        "# OpenViking Open PR Triage Report\n\n"
+        "**OpenViking Open PR Triage Report**\n\n"
         f"Overview: {count} open OpenViking-related {suffix} found.\n\n"
     )
 
 
 def strip_generated_preamble(markdown: str) -> str:
     lines = markdown.strip().splitlines()
-    while lines and (lines[0].startswith("# ") or lines[0].lower().startswith("overview:")):
+    while lines and (
+        lines[0].startswith("# ")
+        or lines[0].startswith("**OpenViking Open PR Triage Report**")
+        or lines[0].lower().startswith("overview:")
+    ):
         lines.pop(0)
         while lines and not lines[0].strip():
             lines.pop(0)
     return "\n".join(lines).strip()
+
+
+def plain_text_excerpt(value: str, limit: int) -> str:
+    lines: list[str] = []
+    for line in value.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        stripped = re.sub(r"^#{1,6}\s*", "", stripped)
+        stripped = re.sub(r"^[-*]\s+", "", stripped)
+        stripped = re.sub(r"\*\*([^*]+)\*\*", r"\1", stripped)
+        lines.append(stripped)
+    compact = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 20].rstrip() + " ... [truncated]"
+
+
+def fallback_summary(pr: PullRequest) -> str:
+    body = plain_text_excerpt(pr.body, 360)
+    if body:
+        return f"{pr.title}. {truncate_text(body, 360)}"
+    return f"{pr.title}. Review the linked PR for the full implementation details."
 
 
 def render_pr_fallback_section(pr: PullRequest) -> str:
@@ -377,9 +411,8 @@ def render_pr_fallback_section(pr: PullRequest) -> str:
         [
             "---",
             "",
-            f"### [#{pr.number}]({pr.html_url}) {pr.title}",
-            f"**Summary:** {pr.title} matched the OpenViking report filter. Review the linked PR for full context.",
-            "**Possible Overlaps:** Review alongside other PRs touching similar OpenViking files or behavior.",
+            f"**[#{pr.number}]({pr.html_url}) {pr.title}**",
+            f"**Summary:** {fallback_summary(pr)}",
         ]
     )
 
@@ -415,6 +448,7 @@ def render_fallback_report(prs: list[PullRequest], *, llm_status: str) -> str:
         lines.append("No open OpenViking-related PRs found.")
         return "\n".join(lines) + "\n"
 
+    lines.append("**Group: OpenViking-related PRs**")
     lines.extend(render_pr_fallback_section(pr) for pr in prs)
     return "\n\n".join(lines) + "\n"
 
