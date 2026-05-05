@@ -168,15 +168,15 @@ def test_filter_relevant_prs_keeps_github_search_matches() -> None:
 
 
 def test_report_header_includes_match_count() -> None:
-    markdown = report.report_header([make_pr(1, "fix(openviking): one"), make_pr(2, "fix(openviking): two")])
+    markdown = report.report_header(2)
 
     assert "Overview: 2 open OpenViking-related PRs found." in markdown
 
 
-def test_strip_generated_preamble_removes_llm_title_and_overview() -> None:
-    markdown = "**OpenViking Open PR Triage Report**\n\nOverview: 2 PRs.\n\n---\n**[#2](https://example.test/2) title**"
+def test_parse_json_object_accepts_fenced_json() -> None:
+    data = report.parse_json_object('```json\n{"groups": []}\n```')
 
-    assert report.strip_generated_preamble(markdown).startswith("---\n**[#2]")
+    assert data == {"groups": []}
 
 
 def test_attach_file_paths_parallel_adds_filenames() -> None:
@@ -207,91 +207,90 @@ def test_build_llm_prompt_includes_only_matched_pr_facts() -> None:
     assert "fix(openviking): resource routing" in user_content
     assert "plugins/memory/openviking/__init__.py" in user_content
     assert "viking_read behavior" in user_content
-    assert "Summary:" in user_content
+    assert '"groups"' in user_content
+    assert "Return exactly one JSON object" in user_content
     assert "group related or overlapping work" in user_content
-    assert "Possible Overlaps` field" in user_content
-    assert "horizontal divider" in user_content
     assert "cause-and-effect style" in user_content
-    assert "**[#number](url) title**" in user_content
-    assert "Do not include a top-level title or overview" in user_content
     assert "Expected PR numbers: #42" in user_content
-    assert "Do not include confidence" in user_content
+    assert "Do not include Markdown headings" in user_content
 
 
-def test_complete_pr_sections_adds_missing_llm_sections() -> None:
+def test_validate_grouped_report_drops_hallucinations_and_adds_missing_prs() -> None:
     first = make_pr(2, "fix(openviking): first")
     missing = make_pr(1, "fix(openviking): missing")
-    llm_markdown = (
-        "**OpenViking Open PR Triage Report**\n\n"
-        "Overview: 2 open OpenViking-related PRs found.\n\n"
-        "**Group: Endpoint fixes**\n\n"
-        "---\n"
-        "### [#2](https://github.com/NousResearch/hermes-agent/pull/2) fix(openviking): first\n"
-        "Summary: Detailed summary.\n"
-        "**Possible Overlaps:** #1."
-    )
+    data = {
+        "groups": [
+            {
+                "title": "Group: Endpoint fixes",
+                "prs": [
+                    {"number": 2, "summary": "Summary: Detailed summary.\n**Possible Overlaps:** #1."},
+                    {"number": 999, "summary": "Hallucinated PR."},
+                    {"number": 2, "summary": "Duplicate PR."},
+                ],
+            }
+        ]
+    }
 
-    markdown, missing_numbers = report.complete_pr_sections(llm_markdown, [first, missing])
+    groups, missing_numbers = report.validate_grouped_report(data, [first, missing])
 
+    assert [group.title for group in groups] == ["Endpoint fixes", "Other"]
+    assert [item.number for group in groups for item in group.prs] == [2, 1]
     assert missing_numbers == [1]
-    assert "**[#2]" in markdown
-    assert "**[#1]" in markdown
-    assert "###" not in markdown
-    assert "**Summary:** Detailed summary." in markdown
-    assert "Possible Overlaps" not in markdown
-    assert markdown.index("**[#2]") < markdown.index("**[#1]")
+    assert groups[0].prs[0].summary == "Detailed summary."
+    assert "Possible Overlaps" not in groups[0].prs[0].summary
 
 
-def test_lark_card_envelope_uses_interactive_markdown_card() -> None:
-    card = report.build_lark_card("# Report\n\nBody", title="OpenViking PR Report", markdown_limit=1000)
+def test_lark_card_uses_collapsible_pr_panels() -> None:
+    pr = make_pr(42, "fix(openviking): resource routing")
+    groups = [report.ReportGroup("Resource routing", [report.PrSummary(42, "Issue, mechanism, and fix.")])]
+    card = report.build_lark_card(groups, [pr], title="OpenViking PR Report")
 
     assert card["msg_type"] == "interactive"
     assert card["card"]["schema"] == "2.0"
     assert card["card"]["header"]["title"]["content"] == "OpenViking PR Report"
-    assert card["card"]["body"]["elements"][0]["tag"] == "markdown"
-    assert "# Report" in card["card"]["body"]["elements"][0]["content"]
-
-
-def test_lark_card_splits_large_markdown_by_pr_section() -> None:
-    markdown = "\n\n".join(
-        [
-            "# Report\n\nOverview: 2 open OpenViking-related PRs found.",
-            "---\n**[#2](https://example.test/2) title**\n**Summary:** " + ("a" * 80),
-            "---\n**[#1](https://example.test/1) title**\n**Summary:** " + ("b" * 80),
-        ]
-    )
-
-    card = report.build_lark_card(markdown, title="OpenViking PR Report", markdown_limit=150)
-
     elements = card["card"]["body"]["elements"]
-    assert len(elements) > 1
-    assert all(element["tag"] == "markdown" for element in elements)
-    assert "**[#1]" in elements[-1]["content"]
+    assert elements[0]["tag"] == "markdown"
+    assert "Overview: 1 open OpenViking-related PR found." in elements[0]["content"]
+    assert elements[1] == {"tag": "markdown", "content": "**Group: Resource routing**"}
+    assert elements[2]["tag"] == "collapsible_panel"
+    assert elements[2]["expanded"] is False
+    assert elements[2]["header"]["title"]["content"] == (
+        "[#42](https://github.com/NousResearch/hermes-agent/pull/42) fix(openviking): resource routing"
+    )
+    assert elements[2]["elements"][0]["content"] == "**Summary:** Issue, mechanism, and fix."
 
 
-def test_no_matches_fallback_report_text() -> None:
-    markdown = report.render_fallback_report([], llm_status="skipped")
+def test_lark_card_no_matches_text() -> None:
+    card = report.build_lark_card([], [], title="OpenViking PR Report")
+    elements = card["card"]["body"]["elements"]
 
-    assert "Overview: 0 open OpenViking-related PRs found." in markdown
-    assert "No open OpenViking-related PRs found." in markdown
+    assert elements[0]["content"] == "Overview: 0 open OpenViking-related PRs found."
+    assert elements[1]["content"] == "No open OpenViking-related PRs found."
 
 
-def test_fallback_report_separates_pr_sections() -> None:
+def test_markdown_report_renders_grouped_pr_list() -> None:
     pr = make_pr(
         42,
         "fix(openviking): resource routing",
         "## Problem\nOpenViking routes the resource incorrectly.\n### Fix\nUse the provider path.",
         files=["plugins/memory/openviking/__init__.py"],
     )
+    groups = report.fallback_groups([pr])
 
-    markdown = report.render_fallback_report([pr], llm_status="not configured")
+    markdown = report.render_markdown_report(groups, [pr], llm_status="not configured")
 
-    assert "---" in markdown
     assert "**Group: OpenViking-related PRs**" in markdown
-    assert "**[#42]" in markdown
+    assert "- [#42]" in markdown
     assert "**Summary:**" in markdown
     assert "plugins/memory/openviking" not in markdown
     assert "matched the OpenViking report filter" not in markdown
     assert "Possible Overlaps" not in markdown
     assert "##" not in markdown
     assert "Problem OpenViking routes the resource incorrectly." in markdown
+
+
+def test_no_matches_markdown_report_text() -> None:
+    markdown = report.render_markdown_report([], [], llm_status="skipped")
+
+    assert "Overview: 0 open OpenViking-related PRs found." in markdown
+    assert "No open OpenViking-related PRs found." in markdown

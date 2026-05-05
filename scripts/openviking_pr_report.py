@@ -49,12 +49,6 @@ OPENVIKING_PATH_PREFIXES = (
     "tests/plugins/memory/test_openviking",
 )
 
-PR_SECTION_RE = re.compile(
-    r"(?:^|\n)---\s*\n+(?P<section>(?:### \[#|\*\*\[#)(?P<number>\d+)\]\([^)]*\) .+?)(?=\n---\s*\n+(?:### \[#|\*\*\[#)|\Z)",
-    re.DOTALL,
-)
-
-
 @dataclass
 class PullRequest:
     number: int
@@ -90,6 +84,18 @@ class PullRequest:
         if matched_paths:
             reasons.append("changed OpenViking path: " + ", ".join(matched_paths[:3]))
         return "; ".join(reasons) or "GitHub OpenViking search match"
+
+
+@dataclass
+class PrSummary:
+    number: int
+    summary: str
+
+
+@dataclass
+class ReportGroup:
+    title: str
+    prs: list[PrSummary] = field(default_factory=list)
 
 
 class GitHubApiError(RuntimeError):
@@ -325,8 +331,8 @@ def build_llm_prompt(prs: list[PullRequest], *, body_chars: int) -> list[dict[st
         {
             "role": "system",
             "content": (
-                "You write concise GitHub PR triage reports in standard Markdown. "
-                "Use only the PRs and facts in the input. Do not invent PRs or code details."
+                "You group GitHub PRs and write concise maintainer-facing summaries. "
+                "Use only the PRs and facts in the input. Return valid JSON only."
             ),
         },
         {
@@ -339,48 +345,39 @@ def build_llm_prompt(prs: list[PullRequest], *, body_chars: int) -> list[dict[st
                 "The input PR JSON is the authoritative filtered list. Include every input PR exactly once, "
                 "even if a PR only looks indirectly related from its title/body. "
                 f"Expected PR numbers: {expected_numbers}.\n\n"
-                "Return standard Markdown only. Include:\n"
-                "- Do not include a top-level title or overview; the caller adds those.\n"
-                "- Reorder PRs to physically group related or overlapping work next to each other. "
-                "Use compact group labels like `**Group: Local resource uploads**`; use `**Group: Other**` for unrelated singles.\n"
-                "- Separate every PR with a visible horizontal divider line `---` before the PR title line.\n"
-                "- One compact section per PR using `**[#number](url) title**`; do not use Markdown headings for PR sections.\n"
-                "- Under each PR, add a bold `Summary:` label followed by 2-3 sentences in a clear "
-                "cause-and-effect style: start with the issue, user-visible failure, or capability gap; "
+                "Return exactly one JSON object and no Markdown, no code fence, and no prose before or after it.\n"
+                "Use this schema:\n"
+                "{\n"
+                '  "groups": [\n'
+                '    {"title": "Local resource uploads", "prs": [{"number": 123, "summary": "..."}]}\n'
+                "  ]\n"
+                "}\n\n"
+                "Grouping requirements:\n"
+                "- Reorder PRs to group related or overlapping work next to each other.\n"
+                "- Use concise group titles without a `Group:` prefix; the caller adds that label.\n"
+                "- Use `Other` for unrelated singles.\n"
+                "- Include every expected PR number exactly once, and do not include any number not in the input.\n\n"
+                "Summary requirements:\n"
+                "- Write each summary in 2-3 sentences.\n"
+                "- Use cause-and-effect style: start with the issue, user-visible failure, or capability gap; "
                 "then explain the mechanism or affected code path when the input gives enough detail; "
-                "then state the concrete fix, behavior change, and tests/validation when available. "
-                "For feature PRs, explain the new capability, why it matters, and how it is integrated. "
-                "Avoid vague summaries such as merely saying the PR matched the OpenViking filter.\n"
-                "- Do not include a `Possible Overlaps` field; grouping order replaces that field.\n"
-                "- Do not include confidence, changed paths, or a separate why/context section in the final report.\n"
-                "- Do not use Markdown tables; Lark cards render stacked sections more reliably.\n"
-                "- Keep it compact and maintainer-facing.\n\n"
+                "then state the concrete fix, behavior change, and tests/validation when available.\n"
+                "- For feature PRs, explain the new capability, why it matters, and how it is integrated.\n"
+                "- Do not include Markdown headings, bullets, tables, confidence, changed paths, "
+                "`Possible Overlaps`, or a separate why/context field.\n"
+                "- Avoid vague summaries such as merely saying the PR matched the OpenViking filter.\n\n"
                 f"Input PR JSON:\n{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
             ),
         },
     ]
 
 
-def report_header(prs: list[PullRequest]) -> str:
-    count = len(prs)
-    suffix = "PR" if count == 1 else "PRs"
+def report_header(pr_count: int) -> str:
+    suffix = "PR" if pr_count == 1 else "PRs"
     return (
         "**OpenViking Open PR Triage Report**\n\n"
-        f"Overview: {count} open OpenViking-related {suffix} found.\n\n"
+        f"Overview: {pr_count} open OpenViking-related {suffix} found.\n\n"
     )
-
-
-def strip_generated_preamble(markdown: str) -> str:
-    lines = markdown.strip().splitlines()
-    while lines and (
-        lines[0].startswith("# ")
-        or lines[0].startswith("**OpenViking Open PR Triage Report**")
-        or lines[0].lower().startswith("overview:")
-    ):
-        lines.pop(0)
-        while lines and not lines[0].strip():
-            lines.pop(0)
-    return "\n".join(lines).strip()
 
 
 def plain_text_excerpt(value: str, limit: int) -> str:
@@ -388,6 +385,9 @@ def plain_text_excerpt(value: str, limit: int) -> str:
     for line in value.splitlines():
         stripped = line.strip()
         if not stripped:
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith("possible overlaps:") or lowered.startswith("**possible overlaps:**"):
             continue
         stripped = re.sub(r"^#{1,6}\s*", "", stripped)
         stripped = re.sub(r"^[-*]\s+", "", stripped)
@@ -402,69 +402,109 @@ def plain_text_excerpt(value: str, limit: int) -> str:
 def fallback_summary(pr: PullRequest) -> str:
     body = plain_text_excerpt(pr.body, 360)
     if body:
-        return f"{pr.title}. {truncate_text(body, 360)}"
+        return f"{pr.title}. {body}"
     return f"{pr.title}. Review the linked PR for the full implementation details."
 
 
-def render_pr_fallback_section(pr: PullRequest) -> str:
-    return "\n".join(
-        [
-            "---",
-            "",
-            f"**[#{pr.number}]({pr.html_url}) {pr.title}**",
-            f"**Summary:** {fallback_summary(pr)}",
-        ]
-    )
+def fallback_groups(prs: list[PullRequest]) -> list[ReportGroup]:
+    if not prs:
+        return []
+    return [
+        ReportGroup(
+            "OpenViking-related PRs",
+            [PrSummary(pr.number, fallback_summary(pr)) for pr in prs],
+        )
+    ]
 
 
-def extract_pr_sections(markdown: str) -> dict[int, str]:
-    sections: dict[int, str] = {}
-    for match in PR_SECTION_RE.finditer(markdown.strip()):
-        number = int(match.group("number"))
-        sections[number] = match.group("section").strip()
-    return sections
-
-
-def complete_pr_sections(markdown: str, prs: list[PullRequest]) -> tuple[str, list[int]]:
-    body = strip_generated_preamble(markdown)
-    sections = extract_pr_sections(body)
-    missing = [pr.number for pr in prs if pr.number not in sections]
-    if not missing:
-        return normalize_report_markdown(body).strip() + "\n", []
-
-    lines: list[str] = []
-    for pr in prs:
-        section = sections.get(pr.number)
-        if section:
-            lines.extend(["---", section, ""])
+def parse_json_object(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", stripped, re.DOTALL | re.IGNORECASE)
+        if fenced:
+            data = json.loads(fenced.group(1))
         else:
-            lines.extend([render_pr_fallback_section(pr), ""])
-    return normalize_report_markdown("\n".join(lines)).strip() + "\n", missing
+            start = stripped.find("{")
+            end = stripped.rfind("}")
+            if start < 0 or end <= start:
+                raise
+            data = json.loads(stripped[start : end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("LLM response JSON must be an object")
+    return data
 
 
-def normalize_report_markdown(markdown: str) -> str:
-    lines: list[str] = []
-    for line in markdown.splitlines():
-        stripped = line.strip()
-        lowered = stripped.lower()
-        if lowered.startswith("possible overlaps:") or lowered.startswith("**possible overlaps:**"):
+def sanitize_group_title(value: Any) -> str:
+    title = plain_text_excerpt(str(value or ""), 80).strip()
+    title = re.sub(r"^group:\s*", "", title, flags=re.IGNORECASE).strip()
+    return title or "Other"
+
+
+def sanitize_summary(value: Any, *, fallback: str) -> str:
+    summary = plain_text_excerpt(str(value or ""), 900).strip()
+    summary = re.sub(r"^summary:\s*", "", summary, flags=re.IGNORECASE).strip()
+    return summary or fallback
+
+
+def validate_grouped_report(data: dict[str, Any], prs: list[PullRequest]) -> tuple[list[ReportGroup], list[int]]:
+    pr_by_number = {pr.number: pr for pr in prs}
+    seen: set[int] = set()
+    groups: list[ReportGroup] = []
+
+    raw_groups = data.get("groups")
+    if not isinstance(raw_groups, list):
+        raw_groups = []
+
+    for raw_group in raw_groups:
+        if not isinstance(raw_group, dict):
             continue
-        line = re.sub(r"^(?P<indent>\s*)### (?P<title>\[#\d+\]\([^)]*\) .+)$", r"\g<indent>**\g<title>**", line)
-        line = re.sub(r"^(?P<indent>\s*)Summary:\s*", r"\g<indent>**Summary:** ", line)
-        line = re.sub(r"^(?P<indent>\s*)\*\*Summary:\*\*\s*", r"\g<indent>**Summary:** ", line)
-        lines.append(line)
-    return "\n".join(lines)
+        items: list[PrSummary] = []
+        raw_prs = raw_group.get("prs")
+        if not isinstance(raw_prs, list):
+            continue
+        for raw_item in raw_prs:
+            if not isinstance(raw_item, dict):
+                continue
+            number_value = raw_item.get("number", raw_item.get("pr_number"))
+            try:
+                number = int(number_value)
+            except (TypeError, ValueError):
+                continue
+            if number not in pr_by_number or number in seen:
+                continue
+            pr = pr_by_number[number]
+            summary = sanitize_summary(raw_item.get("summary"), fallback=fallback_summary(pr))
+            items.append(PrSummary(number, summary))
+            seen.add(number)
+        if items:
+            groups.append(ReportGroup(sanitize_group_title(raw_group.get("title")), items))
+
+    missing = [pr.number for pr in prs if pr.number not in seen]
+    if missing:
+        groups.append(ReportGroup("Other", [PrSummary(number, fallback_summary(pr_by_number[number])) for number in missing]))
+
+    return groups, missing
 
 
-def render_fallback_report(prs: list[PullRequest], *, llm_status: str) -> str:
-    lines = [report_header(prs).rstrip(), f"LLM: {llm_status}", ""]
+def render_markdown_report(groups: list[ReportGroup], prs: list[PullRequest], *, llm_status: str) -> str:
+    lines = [report_header(len(prs)).rstrip(), f"LLM: {llm_status}", ""]
     if not prs:
         lines.append("No open OpenViking-related PRs found.")
         return "\n".join(lines) + "\n"
 
-    lines.append("**Group: OpenViking-related PRs**")
-    lines.extend(render_pr_fallback_section(pr) for pr in prs)
-    return "\n\n".join(lines) + "\n"
+    pr_by_number = {pr.number: pr for pr in prs}
+    for group in groups:
+        lines.append(f"**Group: {group.title}**")
+        for item in group.prs:
+            pr = pr_by_number.get(item.number)
+            if not pr:
+                continue
+            lines.append(f"- [#{pr.number}]({pr.html_url}) {pr.title}")
+            lines.append(f"  - **Summary:** {item.summary}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def summarize_with_llm(
@@ -472,15 +512,15 @@ def summarize_with_llm(
     *,
     body_chars: int,
     timeout_seconds: int,
-) -> tuple[str, str]:
+) -> tuple[list[ReportGroup], str]:
     api_key = os.getenv("LLM_API_KEY", "")
     base_url = os.getenv("LLM_BASE_URL", "")
     model = os.getenv("LLM_MODEL", "")
     if not (api_key and base_url and model):
-        return render_fallback_report(prs, llm_status="not configured"), "not configured"
+        return fallback_groups(prs), "not configured"
 
     try:
-        markdown = llm_chat_content(
+        content = llm_chat_content(
             build_llm_prompt(prs, body_chars=body_chars),
             api_key=api_key,
             base_url=base_url,
@@ -489,44 +529,76 @@ def summarize_with_llm(
         )
     except Exception as exc:  # noqa: BLE001 - still send a useful report when LLM fails.
         status = f"configured but skipped after error: {exc}"
-        return render_fallback_report(prs, llm_status=status), status
-    body, missing = complete_pr_sections(markdown, prs)
+        return fallback_groups(prs), status
+
+    try:
+        groups, missing = validate_grouped_report(parse_json_object(content), prs)
+    except Exception as exc:  # noqa: BLE001 - malformed LLM output should not block the report.
+        status = f"configured but skipped after invalid JSON: {exc}"
+        return fallback_groups(prs), status
+
     status = f"summarized with `{model}`"
     if missing:
         missing_refs = ", ".join(f"#{number}" for number in missing)
-        status = f"{status}; filled missing sections for {missing_refs}"
-    return report_header(prs) + body, status
+        status = f"{status}; filled missing PRs in Other: {missing_refs}"
+    return groups, status
 
 
-def split_lark_markdown(markdown: str, *, markdown_limit: int) -> list[str]:
-    blocks = re.split(r"(?=^---\s*$)", markdown.strip(), flags=re.MULTILINE)
-    chunks: list[str] = []
-    current = ""
-    for block in (part.strip() for part in blocks if part.strip()):
-        candidate = f"{current}\n\n{block}".strip() if current else block
-        if len(candidate) <= markdown_limit:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-        if len(block) <= markdown_limit:
-            current = block
-        else:
-            chunks.append(block[: markdown_limit - 80].rstrip() + "\n\n_Section truncated; open the workflow summary for full text._")
-            current = ""
-    if current:
-        chunks.append(current)
-    return chunks or [""]
-
-
-def build_lark_card(markdown: str, *, title: str, markdown_limit: int) -> dict[str, Any]:
-    elements = [
+def build_lark_elements(groups: list[ReportGroup], prs: list[PullRequest]) -> list[dict[str, Any]]:
+    pr_by_number = {pr.number: pr for pr in prs}
+    elements: list[dict[str, Any]] = [
         {
             "tag": "markdown",
-            "content": content,
+            "content": f"Overview: {len(prs)} open OpenViking-related {'PR' if len(prs) == 1 else 'PRs'} found.",
         }
-        for content in split_lark_markdown(markdown, markdown_limit=markdown_limit)
     ]
+
+    if not prs:
+        elements.append({"tag": "markdown", "content": "No open OpenViking-related PRs found."})
+        return elements
+
+    for group in groups:
+        elements.append({"tag": "markdown", "content": f"**Group: {group.title}**"})
+        for item in group.prs:
+            pr = pr_by_number.get(item.number)
+            if not pr:
+                continue
+            elements.append(
+                {
+                    "tag": "collapsible_panel",
+                    "expanded": False,
+                    "header": {
+                        "title": {
+                            "tag": "markdown",
+                            "content": f"[#{pr.number}]({pr.html_url}) {pr.title}",
+                        },
+                        "vertical_align": "center",
+                        "icon": {
+                            "tag": "standard_icon",
+                            "token": "down-small-ccm_outlined",
+                            "size": "16px 16px",
+                        },
+                        "icon_position": "right",
+                        "icon_expanded_angle": -180,
+                    },
+                    "border": {
+                        "color": "grey",
+                        "corner_radius": "5px",
+                    },
+                    "vertical_spacing": "4px",
+                    "padding": "6px 8px 6px 8px",
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": f"**Summary:** {item.summary}",
+                        }
+                    ],
+                }
+            )
+    return elements
+
+
+def build_lark_card(groups: list[ReportGroup], prs: list[PullRequest], *, title: str) -> dict[str, Any]:
     return {
         "msg_type": "interactive",
         "card": {
@@ -536,7 +608,7 @@ def build_lark_card(markdown: str, *, title: str, markdown_limit: int) -> dict[s
                 "template": "blue",
                 "title": {"tag": "plain_text", "content": title},
             },
-            "body": {"elements": elements},
+            "body": {"elements": build_lark_elements(groups, prs)},
         },
     }
 
@@ -601,14 +673,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Found {len(relevant_prs)} OpenViking-related PR(s).", file=sys.stderr)
 
     if relevant_prs:
-        markdown, llm_status = summarize_with_llm(
+        groups, llm_status = summarize_with_llm(
             relevant_prs,
             body_chars=args.body_chars,
             timeout_seconds=args.llm_timeout_seconds,
         )
     else:
         llm_status = "skipped because no relevant PRs were found"
-        markdown = report_header([]) + "No open OpenViking-related PRs found.\n"
+        groups = []
+    markdown = render_markdown_report(groups, relevant_prs, llm_status=llm_status)
 
     with open(args.output, "w", encoding="utf-8") as handle:
         handle.write(markdown)
@@ -617,7 +690,7 @@ def main(argv: list[str] | None = None) -> int:
 
     suffix = "PR" if len(relevant_prs) == 1 else "PRs"
     title = f"OpenViking PR Report - {datetime.now(UTC).strftime('%Y-%m-%d')} - {len(relevant_prs)} {suffix}"
-    card = build_lark_card(markdown, title=title, markdown_limit=args.lark_markdown_chars)
+    card = build_lark_card(groups, relevant_prs, title=title)
     if args.dry_run:
         print(json.dumps(card, ensure_ascii=False, indent=2))
         return 0
