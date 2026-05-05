@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -18,13 +19,14 @@ def make_pr(
     title: str,
     body: str = "",
     files: list[str] | None = None,
+    updated_at: str = "2026-05-04T12:00:00Z",
 ) -> report.PullRequest:
     return report.PullRequest(
         number=number,
         title=title,
         body=body,
         html_url=f"https://github.com/NousResearch/hermes-agent/pull/{number}",
-        updated_at="2026-05-04T12:00:00Z",
+        updated_at=updated_at,
         files=files or [],
     )
 
@@ -60,6 +62,17 @@ def test_path_filter_matches_openviking_test_paths() -> None:
 
     assert pr.path_matches
     assert report.openviking_paths(pr.files) == ["tests/plugins/memory/test_openviking_provider.py"]
+
+
+def test_path_filter_matches_openviking_plugin_test_directory() -> None:
+    pr = make_pr(
+        12,
+        "test: openviking uri handling",
+        files=["tests/openviking_plugin/test_openviking.py"],
+    )
+
+    assert pr.path_matches
+    assert report.openviking_paths(pr.files) == ["tests/openviking_plugin/test_openviking.py"]
 
 
 def test_fetch_search_prs_deduplicates_keyword_results() -> None:
@@ -191,9 +204,26 @@ def test_filter_relevant_prs_requires_openviking_plugin_path() -> None:
 
 
 def test_report_header_includes_match_count() -> None:
-    markdown = report.report_header(2)
+    recent = [make_pr(9, "fix(openviking): recent")]
+    markdown = report.report_header(2, recent, recent_hours=24)
 
+    assert "**Updated in last 24 hours**" in markdown
+    assert "- [#9]" in markdown
     assert "Overview: 2 open OpenViking plugin PRs found." in markdown
+
+
+def test_recently_updated_prs_uses_updated_at_cutoff_and_sorts_newest() -> None:
+    old = make_pr(1, "old", updated_at="2026-05-03T11:59:59Z")
+    newest = make_pr(3, "newest", updated_at="2026-05-04T11:30:00Z")
+    cutoff = make_pr(2, "cutoff", updated_at="2026-05-03T12:00:00Z")
+
+    recent = report.recently_updated_prs(
+        [old, newest, cutoff],
+        now=datetime(2026, 5, 4, 12, 0, 0, tzinfo=UTC),
+        hours=24,
+    )
+
+    assert [pr.number for pr in recent] == [3, 2]
 
 
 def test_parse_json_object_accepts_fenced_json() -> None:
@@ -266,29 +296,44 @@ def test_validate_grouped_report_drops_hallucinations_and_adds_missing_prs() -> 
 def test_lark_card_uses_collapsible_pr_panels() -> None:
     pr = make_pr(42, "fix(openviking): resource routing")
     groups = [report.ReportGroup("Resource routing", [report.PrSummary(42, "Issue, mechanism, and fix.")])]
-    card = report.build_lark_card(groups, [pr], title="OpenViking PR Report")
+    card = report.build_lark_card(
+        groups,
+        [pr],
+        recent_prs=[pr],
+        recent_hours=24,
+        title="OpenViking PR Report",
+    )
 
     assert card["msg_type"] == "interactive"
     assert card["card"]["schema"] == "2.0"
     assert card["card"]["header"]["title"]["content"] == "OpenViking PR Report"
     elements = card["card"]["body"]["elements"]
     assert elements[0]["tag"] == "markdown"
-    assert "Overview: 1 open OpenViking plugin PR found." in elements[0]["content"]
-    assert elements[1] == {"tag": "markdown", "content": "**Group: Resource routing**"}
-    assert elements[2]["tag"] == "collapsible_panel"
-    assert elements[2]["expanded"] is False
-    assert elements[2]["header"]["title"]["content"] == (
+    assert "**Updated in last 24 hours**" in elements[0]["content"]
+    assert "[#42]" in elements[0]["content"]
+    assert "Overview: 1 open OpenViking plugin PR found." in elements[1]["content"]
+    assert elements[2] == {"tag": "markdown", "content": "**Group: Resource routing**"}
+    assert elements[3]["tag"] == "collapsible_panel"
+    assert elements[3]["expanded"] is False
+    assert elements[3]["header"]["title"]["content"] == (
         "[#42](https://github.com/NousResearch/hermes-agent/pull/42) fix(openviking): resource routing"
     )
-    assert elements[2]["elements"][0]["content"] == "**Summary:** Issue, mechanism, and fix."
+    assert elements[3]["elements"][0]["content"] == "**Summary:** Issue, mechanism, and fix."
 
 
 def test_lark_card_no_matches_text() -> None:
-    card = report.build_lark_card([], [], title="OpenViking PR Report")
+    card = report.build_lark_card(
+        [],
+        [],
+        recent_prs=[],
+        recent_hours=24,
+        title="OpenViking PR Report",
+    )
     elements = card["card"]["body"]["elements"]
 
-    assert elements[0]["content"] == "Overview: 0 open OpenViking plugin PRs found."
-    assert elements[1]["content"] == "No open OpenViking plugin PRs found."
+    assert "No OpenViking plugin PRs updated in the last 24 hours." in elements[0]["content"]
+    assert elements[1]["content"] == "Overview: 0 open OpenViking plugin PRs found."
+    assert elements[2]["content"] == "No open OpenViking plugin PRs found."
 
 
 def test_markdown_report_renders_grouped_pr_list() -> None:
@@ -300,8 +345,16 @@ def test_markdown_report_renders_grouped_pr_list() -> None:
     )
     groups = report.fallback_groups([pr])
 
-    markdown = report.render_markdown_report(groups, [pr], llm_status="not configured")
+    markdown = report.render_markdown_report(
+        groups,
+        [pr],
+        recent_prs=[pr],
+        recent_hours=24,
+        llm_status="not configured",
+    )
 
+    assert "**Updated in last 24 hours**" in markdown
+    assert "- [#42]" in markdown
     assert "**Group: OpenViking plugin PRs**" in markdown
     assert "- [#42]" in markdown
     assert "**Summary:**" in markdown
@@ -313,7 +366,14 @@ def test_markdown_report_renders_grouped_pr_list() -> None:
 
 
 def test_no_matches_markdown_report_text() -> None:
-    markdown = report.render_markdown_report([], [], llm_status="skipped")
+    markdown = report.render_markdown_report(
+        [],
+        [],
+        recent_prs=[],
+        recent_hours=24,
+        llm_status="skipped",
+    )
 
+    assert "No OpenViking plugin PRs updated in the last 24 hours." in markdown
     assert "Overview: 0 open OpenViking plugin PRs found." in markdown
     assert "No open OpenViking plugin PRs found." in markdown

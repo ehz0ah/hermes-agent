@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 
@@ -24,6 +24,7 @@ DEFAULT_FILE_FETCH_CONCURRENCY = 20
 DEFAULT_LLM_TIMEOUT_SECONDS = 120
 DEFAULT_BODY_CHARS = 4000
 DEFAULT_LARK_MARKDOWN_CHARS = 12000
+DEFAULT_RECENT_HOURS = 24
 
 OPENVIKING_SEARCH_TERMS = (
     "openviking",
@@ -46,6 +47,7 @@ OPENVIKING_KEYWORD_RE = re.compile(
 
 OPENVIKING_PLUGIN_DIR_PREFIXES = (
     "plugins/memory/openviking",
+    "tests/openviking_plugin",
     "tests/plugins/memory/openviking",
 )
 
@@ -280,6 +282,25 @@ def filter_relevant_prs(prs: list[PullRequest]) -> list[PullRequest]:
     return sorted((pr for pr in prs if pr.is_relevant), key=lambda pr: pr.number, reverse=True)
 
 
+def parse_github_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def recently_updated_prs(prs: list[PullRequest], *, now: datetime, hours: int) -> list[PullRequest]:
+    cutoff = now.astimezone(UTC) - timedelta(hours=hours)
+
+    def updated_at(pr: PullRequest) -> datetime:
+        return parse_github_datetime(pr.updated_at) or datetime.min.replace(tzinfo=UTC)
+
+    recent = [pr for pr in prs if updated_at(pr) >= cutoff]
+    return sorted(recent, key=updated_at, reverse=True)
+
+
 def chat_completions_url(base_url: str) -> str:
     trimmed = base_url.rstrip("/")
     if trimmed.endswith("/chat/completions"):
@@ -378,10 +399,20 @@ def build_llm_prompt(prs: list[PullRequest], *, body_chars: int) -> list[dict[st
     ]
 
 
-def report_header(pr_count: int) -> str:
+def recent_updates_section(recent_prs: list[PullRequest], *, hours: int) -> str:
+    lines = [f"**Updated in last {hours} hours**", ""]
+    if recent_prs:
+        lines.extend(f"- [#{pr.number}]({pr.html_url}) {pr.title}" for pr in recent_prs)
+    else:
+        lines.append(f"No OpenViking plugin PRs updated in the last {hours} hours.")
+    return "\n".join(lines) + "\n\n"
+
+
+def report_header(pr_count: int, recent_prs: list[PullRequest], *, recent_hours: int) -> str:
     suffix = "PR" if pr_count == 1 else "PRs"
     return (
         "**OpenViking Open PR Triage Report**\n\n"
+        f"{recent_updates_section(recent_prs, hours=recent_hours)}"
         f"Overview: {pr_count} open OpenViking plugin {suffix} found.\n\n"
     )
 
@@ -494,8 +525,15 @@ def validate_grouped_report(data: dict[str, Any], prs: list[PullRequest]) -> tup
     return groups, missing
 
 
-def render_markdown_report(groups: list[ReportGroup], prs: list[PullRequest], *, llm_status: str) -> str:
-    lines = [report_header(len(prs)).rstrip(), f"LLM: {llm_status}", ""]
+def render_markdown_report(
+    groups: list[ReportGroup],
+    prs: list[PullRequest],
+    *,
+    recent_prs: list[PullRequest],
+    recent_hours: int,
+    llm_status: str,
+) -> str:
+    lines = [report_header(len(prs), recent_prs, recent_hours=recent_hours).rstrip(), f"LLM: {llm_status}", ""]
     if not prs:
         lines.append("No open OpenViking plugin PRs found.")
         return "\n".join(lines) + "\n"
@@ -550,9 +588,19 @@ def summarize_with_llm(
     return groups, status
 
 
-def build_lark_elements(groups: list[ReportGroup], prs: list[PullRequest]) -> list[dict[str, Any]]:
+def build_lark_elements(
+    groups: list[ReportGroup],
+    prs: list[PullRequest],
+    *,
+    recent_prs: list[PullRequest],
+    recent_hours: int,
+) -> list[dict[str, Any]]:
     pr_by_number = {pr.number: pr for pr in prs}
     elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": recent_updates_section(recent_prs, hours=recent_hours).strip(),
+        },
         {
             "tag": "markdown",
             "content": f"Overview: {len(prs)} open OpenViking plugin {'PR' if len(prs) == 1 else 'PRs'} found.",
@@ -604,7 +652,14 @@ def build_lark_elements(groups: list[ReportGroup], prs: list[PullRequest]) -> li
     return elements
 
 
-def build_lark_card(groups: list[ReportGroup], prs: list[PullRequest], *, title: str) -> dict[str, Any]:
+def build_lark_card(
+    groups: list[ReportGroup],
+    prs: list[PullRequest],
+    *,
+    recent_prs: list[PullRequest],
+    recent_hours: int,
+    title: str,
+) -> dict[str, Any]:
     return {
         "msg_type": "interactive",
         "card": {
@@ -614,7 +669,14 @@ def build_lark_card(groups: list[ReportGroup], prs: list[PullRequest], *, title:
                 "template": "blue",
                 "title": {"tag": "plain_text", "content": title},
             },
-            "body": {"elements": build_lark_elements(groups, prs)},
+            "body": {
+                "elements": build_lark_elements(
+                    groups,
+                    prs,
+                    recent_prs=recent_prs,
+                    recent_hours=recent_hours,
+                )
+            },
         },
     }
 
@@ -650,6 +712,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--llm-timeout-seconds", type=int, default=int_from_env("LLM_TIMEOUT_SECONDS", DEFAULT_LLM_TIMEOUT_SECONDS))
     parser.add_argument("--body-chars", type=int, default=int_from_env("PR_BODY_CHARS", DEFAULT_BODY_CHARS))
     parser.add_argument("--lark-markdown-chars", type=int, default=int_from_env("LARK_MARKDOWN_CHARS", DEFAULT_LARK_MARKDOWN_CHARS))
+    parser.add_argument("--recent-hours", type=int, default=int_from_env("RECENT_HOURS", DEFAULT_RECENT_HOURS))
     parser.add_argument("--output", default=os.getenv("REPORT_OUTPUT", DEFAULT_OUTPUT))
     parser.add_argument("--dry-run", action="store_true", help="Generate report without posting to Lark")
     return parser.parse_args(argv)
@@ -677,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     relevant_prs = filter_relevant_prs(candidate_prs)
     print(f"Found {len(relevant_prs)} OpenViking plugin PR(s).", file=sys.stderr)
+    recent_prs = recently_updated_prs(relevant_prs, now=datetime.now(UTC), hours=args.recent_hours)
 
     if relevant_prs:
         groups, llm_status = summarize_with_llm(
@@ -687,7 +751,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         llm_status = "skipped because no relevant PRs were found"
         groups = []
-    markdown = render_markdown_report(groups, relevant_prs, llm_status=llm_status)
+    markdown = render_markdown_report(
+        groups,
+        relevant_prs,
+        recent_prs=recent_prs,
+        recent_hours=args.recent_hours,
+        llm_status=llm_status,
+    )
 
     with open(args.output, "w", encoding="utf-8") as handle:
         handle.write(markdown)
@@ -696,7 +766,13 @@ def main(argv: list[str] | None = None) -> int:
 
     suffix = "PR" if len(relevant_prs) == 1 else "PRs"
     title = f"OpenViking PR Report - {datetime.now(UTC).strftime('%Y-%m-%d')} - {len(relevant_prs)} {suffix}"
-    card = build_lark_card(groups, relevant_prs, title=title)
+    card = build_lark_card(
+        groups,
+        relevant_prs,
+        recent_prs=recent_prs,
+        recent_hours=args.recent_hours,
+        title=title,
+    )
     if args.dry_run:
         print(json.dumps(card, ensure_ascii=False, indent=2))
         return 0
