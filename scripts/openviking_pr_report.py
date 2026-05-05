@@ -334,8 +334,9 @@ def build_llm_prompt(prs: list[PullRequest], *, body_chars: int) -> list[dict[st
                 "provider setup, endpoint migration, memory recall/search, and resource handling.\n\n"
                 "Return standard Markdown only. Include:\n"
                 "- A short one-line overview.\n"
+                "- Separate every PR with a visible horizontal divider line `---` before the PR heading.\n"
                 "- One section per PR using `### [#number](url) title`.\n"
-                "- Under each PR, write a detailed 2-3 sentence summary with useful context.\n"
+                "- Under each PR, add a bold `Summary:` label followed by a detailed 2-3 sentence summary with useful context.\n"
                 "- Add a `**Possible Overlaps:**` line when this PR likely overlaps or conflicts with another listed PR; otherwise write `**Possible Overlaps:** None.`\n"
                 "- Do not include confidence, changed paths, or a separate why/context section in the final report.\n"
                 "- Do not use Markdown tables; Lark cards render stacked sections more reliably.\n"
@@ -364,8 +365,10 @@ def render_fallback_report(prs: list[PullRequest], *, llm_status: str) -> str:
         paths = ", ".join(openviking_paths(pr.files) or pr.files[:5]) or "n/a"
         lines.extend(
             [
+                "---",
+                "",
                 f"### [#{pr.number}]({pr.html_url}) {pr.title}",
-                f"{pr.title} matched the OpenViking report filter. Matched signal: {pr.match_reason}.",
+                f"**Summary:** {pr.title} matched the OpenViking report filter. Matched signal: {pr.match_reason}.",
                 f"**Possible Overlaps:** Review alongside other PRs touching similar OpenViking files or behavior. Key paths: {paths}.",
                 "",
             ]

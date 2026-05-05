@@ -134,7 +134,9 @@ def test_build_llm_prompt_includes_only_matched_pr_facts() -> None:
     assert "fix(openviking): resource routing" in user_content
     assert "plugins/memory/openviking/__init__.py" in user_content
     assert "viking_read behavior" in user_content
+    assert "Summary:" in user_content
     assert "Possible Overlaps" in user_content
+    assert "horizontal divider" in user_content
     assert "Do not include confidence" in user_content
 
 
@@ -152,3 +154,18 @@ def test_no_matches_fallback_report_text() -> None:
     markdown = report.render_fallback_report([], llm_status="skipped")
 
     assert "No open OpenViking-related PRs found." in markdown
+
+
+def test_fallback_report_separates_pr_sections() -> None:
+    pr = make_pr(
+        42,
+        "fix(openviking): resource routing",
+        files=["plugins/memory/openviking/__init__.py"],
+    )
+
+    markdown = report.render_fallback_report([pr], llm_status="not configured")
+
+    assert "---" in markdown
+    assert "### [#42]" in markdown
+    assert "**Summary:**" in markdown
+    assert "**Possible Overlaps:**" in markdown
