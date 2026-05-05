@@ -8,7 +8,6 @@ import json
 import os
 import re
 import sys
-import textwrap
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,11 +19,19 @@ from typing import Any
 
 DEFAULT_UPSTREAM_REPO = "NousResearch/hermes-agent"
 DEFAULT_OUTPUT = "openviking-pr-report.md"
-DEFAULT_MAX_OPEN_PRS = 1000
+DEFAULT_MAX_SEARCH_RESULTS = 1000
 DEFAULT_FILE_FETCH_CONCURRENCY = 20
 DEFAULT_LLM_TIMEOUT_SECONDS = 120
 DEFAULT_BODY_CHARS = 4000
 DEFAULT_LARK_MARKDOWN_CHARS = 12000
+
+OPENVIKING_SEARCH_TERMS = (
+    "openviking",
+    '"open viking"',
+    "viking://",
+    "viking_",
+    "viking",
+)
 
 OPENVIKING_KEYWORD_RE = re.compile(
     r"""
@@ -40,6 +47,11 @@ OPENVIKING_KEYWORD_RE = re.compile(
 OPENVIKING_PATH_PREFIXES = (
     "plugins/memory/openviking",
     "tests/plugins/memory/test_openviking",
+)
+
+PR_SECTION_RE = re.compile(
+    r"(?:^|\n)---\s*\n+(?P<section>### \[#(?P<number>\d+)\]\([^)]*\) .+?)(?=\n---\s*\n+### |\Z)",
+    re.DOTALL,
 )
 
 
@@ -77,7 +89,7 @@ class PullRequest:
         matched_paths = openviking_paths(self.files)
         if matched_paths:
             reasons.append("changed OpenViking path: " + ", ".join(matched_paths[:3]))
-        return "; ".join(reasons) or "matched OpenViking filter"
+        return "; ".join(reasons) or "GitHub OpenViking search match"
 
 
 class GitHubApiError(RuntimeError):
@@ -129,12 +141,6 @@ def split_repo(repo: str) -> tuple[str, str]:
     return owner, name
 
 
-def parse_github_time(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
 def int_from_env(name: str, default: int, *, minimum: int = 1) -> int:
     try:
         value = int(os.getenv(name, str(default)))
@@ -150,57 +156,54 @@ def truncate_text(value: str, limit: int) -> str:
     return compact[: limit - 20].rstrip() + "\n... [truncated]"
 
 
-def make_pull_request(raw: dict[str, Any]) -> PullRequest:
-    head = raw.get("head") or {}
+def make_pull_request_from_issue(raw: dict[str, Any]) -> PullRequest:
     return PullRequest(
         number=int(raw["number"]),
         title=str(raw.get("title") or ""),
         body=str(raw.get("body") or ""),
         html_url=str(raw.get("html_url") or ""),
         updated_at=str(raw.get("updated_at") or ""),
-        head_ref=str(head.get("ref") or ""),
     )
 
 
-def fetch_open_prs(
+def fetch_search_prs(
     client: GitHubClient,
     repo: str,
     *,
-    max_open_prs: int,
+    max_results: int,
 ) -> list[PullRequest]:
-    owner, name = split_repo(repo)
-    prs: list[PullRequest] = []
-    page = 1
-
-    while len(prs) < max_open_prs:
-        items = client.request(
-            "GET",
-            f"/repos/{owner}/{name}/pulls",
-            params={
-                "state": "open",
-                "sort": "updated",
-                "direction": "desc",
-                "per_page": 100,
-                "page": page,
-            },
-        )
-        if not isinstance(items, list):
-            raise GitHubApiError(f"Expected list response from /repos/{owner}/{name}/pulls")
-        if not items:
-            break
-
-        for raw in items:
-            prs.append(make_pull_request(raw))
-            if len(prs) >= max_open_prs:
+    prs_by_number: dict[int, PullRequest] = {}
+    for term in OPENVIKING_SEARCH_TERMS:
+        query = f"repo:{repo} is:pr is:open {term}"
+        page = 1
+        while len(prs_by_number) < max_results:
+            data = client.request(
+                "GET",
+                "/search/issues",
+                params={
+                    "q": query,
+                    "sort": "updated",
+                    "order": "desc",
+                    "per_page": 100,
+                    "page": page,
+                },
+            )
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                raise GitHubApiError("Expected object response from /search/issues")
+            items = data["items"]
+            for raw in items:
+                pr = make_pull_request_from_issue(raw)
+                prs_by_number.setdefault(pr.number, pr)
+                if len(prs_by_number) >= max_results:
+                    break
+            if len(items) < 100:
                 break
+            page += 1
 
-        if len(items) < 100:
-            break
-        page += 1
-
-    if len(prs) >= max_open_prs:
-        print(f"Stopped open PR scan after safety cap of {max_open_prs} PRs.", file=sys.stderr)
-    print(f"Fetched {len(prs)} open PRs.", file=sys.stderr)
+    if len(prs_by_number) >= max_results:
+        print(f"Stopped GitHub search scan after safety cap of {max_results} PRs.", file=sys.stderr)
+    prs = sorted(prs_by_number.values(), key=lambda pr: pr.number, reverse=True)
+    print(f"Fetched {len(prs)} open PR candidate(s) from GitHub search.", file=sys.stderr)
     return prs
 
 
@@ -262,7 +265,7 @@ def paths_have_openviking_signal(files: list[str]) -> bool:
 
 
 def filter_relevant_prs(prs: list[PullRequest]) -> list[PullRequest]:
-    return sorted((pr for pr in prs if pr.is_relevant), key=lambda pr: pr.number, reverse=True)
+    return sorted(prs, key=lambda pr: pr.number, reverse=True)
 
 
 def chat_completions_url(base_url: str) -> str:
@@ -305,6 +308,7 @@ def llm_chat_content(
 
 
 def build_llm_prompt(prs: list[PullRequest], *, body_chars: int) -> list[dict[str, str]]:
+    expected_numbers = ", ".join(f"#{pr.number}" for pr in prs)
     payload = [
         {
             "number": pr.number,
@@ -332,8 +336,11 @@ def build_llm_prompt(prs: list[PullRequest], *, body_chars: int) -> list[dict[st
                 "OpenViking is the Hermes memory/context plugin around "
                 "`plugins/memory/openviking`, `viking_*` tools, `viking://` resources, "
                 "provider setup, endpoint migration, memory recall/search, and resource handling.\n\n"
+                "The input PR JSON is the authoritative filtered list. Include every input PR exactly once, "
+                "even if a PR only looks indirectly related from its title/body. "
+                f"Expected PR numbers, in this order: {expected_numbers}.\n\n"
                 "Return standard Markdown only. Include:\n"
-                "- A short one-line overview.\n"
+                "- Do not include a top-level title or overview; the caller adds those.\n"
                 "- Separate every PR with a visible horizontal divider line `---` before the PR heading.\n"
                 "- One section per PR using `### [#number](url) title`.\n"
                 "- Under each PR, add a bold `Summary:` label followed by a detailed 2-3 sentence summary with useful context.\n"
@@ -347,33 +354,69 @@ def build_llm_prompt(prs: list[PullRequest], *, body_chars: int) -> list[dict[st
     ]
 
 
+def report_header(prs: list[PullRequest]) -> str:
+    count = len(prs)
+    suffix = "PR" if count == 1 else "PRs"
+    return (
+        "# OpenViking Open PR Triage Report\n\n"
+        f"Overview: {count} open OpenViking-related {suffix} found.\n\n"
+    )
+
+
+def strip_generated_preamble(markdown: str) -> str:
+    lines = markdown.strip().splitlines()
+    while lines and (lines[0].startswith("# ") or lines[0].lower().startswith("overview:")):
+        lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def render_pr_fallback_section(pr: PullRequest) -> str:
+    return "\n".join(
+        [
+            "---",
+            "",
+            f"### [#{pr.number}]({pr.html_url}) {pr.title}",
+            f"**Summary:** {pr.title} matched the OpenViking report filter. Review the linked PR for full context.",
+            "**Possible Overlaps:** Review alongside other PRs touching similar OpenViking files or behavior.",
+        ]
+    )
+
+
+def extract_pr_sections(markdown: str) -> dict[int, str]:
+    sections: dict[int, str] = {}
+    for match in PR_SECTION_RE.finditer(markdown.strip()):
+        number = int(match.group("number"))
+        sections[number] = match.group("section").strip()
+    return sections
+
+
+def complete_pr_sections(markdown: str, prs: list[PullRequest]) -> tuple[str, list[int]]:
+    body = strip_generated_preamble(markdown)
+    sections = extract_pr_sections(body)
+    missing = [pr.number for pr in prs if pr.number not in sections]
+    if not missing:
+        return body.strip() + "\n", []
+
+    lines: list[str] = []
+    for pr in prs:
+        section = sections.get(pr.number)
+        if section:
+            lines.extend(["---", section, ""])
+        else:
+            lines.extend([render_pr_fallback_section(pr), ""])
+    return "\n".join(lines).strip() + "\n", missing
+
+
 def render_fallback_report(prs: list[PullRequest], *, llm_status: str) -> str:
-    lines = [
-        "# OpenViking PR Report",
-        "",
-        "Currently open OpenViking-related PRs.",
-        f"LLM: {llm_status}",
-        "",
-    ]
+    lines = [report_header(prs).rstrip(), f"LLM: {llm_status}", ""]
     if not prs:
         lines.append("No open OpenViking-related PRs found.")
         return "\n".join(lines) + "\n"
 
-    lines.append("## Matches")
-    lines.append("")
-    for pr in prs:
-        paths = ", ".join(openviking_paths(pr.files) or pr.files[:5]) or "n/a"
-        lines.extend(
-            [
-                "---",
-                "",
-                f"### [#{pr.number}]({pr.html_url}) {pr.title}",
-                f"**Summary:** {pr.title} matched the OpenViking report filter. Matched signal: {pr.match_reason}.",
-                f"**Possible Overlaps:** Review alongside other PRs touching similar OpenViking files or behavior. Key paths: {paths}.",
-                "",
-            ]
-        )
-    return "\n".join(lines) + "\n"
+    lines.extend(render_pr_fallback_section(pr) for pr in prs)
+    return "\n\n".join(lines) + "\n"
 
 
 def summarize_with_llm(
@@ -399,13 +442,43 @@ def summarize_with_llm(
     except Exception as exc:  # noqa: BLE001 - still send a useful report when LLM fails.
         status = f"configured but skipped after error: {exc}"
         return render_fallback_report(prs, llm_status=status), status
-    return markdown, f"summarized with `{model}`"
+    body, missing = complete_pr_sections(markdown, prs)
+    status = f"summarized with `{model}`"
+    if missing:
+        missing_refs = ", ".join(f"#{number}" for number in missing)
+        status = f"{status}; filled missing sections for {missing_refs}"
+    return report_header(prs) + body, status
+
+
+def split_lark_markdown(markdown: str, *, markdown_limit: int) -> list[str]:
+    blocks = re.split(r"(?=^---\s*$)", markdown.strip(), flags=re.MULTILINE)
+    chunks: list[str] = []
+    current = ""
+    for block in (part.strip() for part in blocks if part.strip()):
+        candidate = f"{current}\n\n{block}".strip() if current else block
+        if len(candidate) <= markdown_limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        if len(block) <= markdown_limit:
+            current = block
+        else:
+            chunks.append(block[: markdown_limit - 80].rstrip() + "\n\n_Section truncated; open the workflow summary for full text._")
+            current = ""
+    if current:
+        chunks.append(current)
+    return chunks or [""]
 
 
 def build_lark_card(markdown: str, *, title: str, markdown_limit: int) -> dict[str, Any]:
-    content = markdown.strip()
-    if len(content) > markdown_limit:
-        content = content[: markdown_limit - 80].rstrip() + "\n\n_Report truncated; open the workflow summary for full text._"
+    elements = [
+        {
+            "tag": "markdown",
+            "content": content,
+        }
+        for content in split_lark_markdown(markdown, markdown_limit=markdown_limit)
+    ]
     return {
         "msg_type": "interactive",
         "card": {
@@ -415,14 +488,7 @@ def build_lark_card(markdown: str, *, title: str, markdown_limit: int) -> dict[s
                 "template": "blue",
                 "title": {"tag": "plain_text", "content": title},
             },
-            "body": {
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": content,
-                    }
-                ],
-            },
+            "body": {"elements": elements},
         },
     }
 
@@ -445,7 +511,11 @@ def post_lark_card(webhook_url: str, card: dict[str, Any]) -> None:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upstream-repo", default=os.getenv("UPSTREAM_REPOSITORY", DEFAULT_UPSTREAM_REPO))
-    parser.add_argument("--max-open-prs", type=int, default=int_from_env("MAX_OPEN_PRS", DEFAULT_MAX_OPEN_PRS))
+    parser.add_argument(
+        "--max-search-results",
+        type=int,
+        default=int_from_env("MAX_SEARCH_RESULTS", DEFAULT_MAX_SEARCH_RESULTS),
+    )
     parser.add_argument(
         "--file-fetch-concurrency",
         type=int,
@@ -468,18 +538,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     client = GitHubClient(github_token)
-    open_prs = fetch_open_prs(
+    candidate_prs = fetch_search_prs(
         client,
         args.upstream_repo,
-        max_open_prs=args.max_open_prs,
+        max_results=args.max_search_results,
     )
     attach_file_paths(
         client,
         args.upstream_repo,
-        open_prs,
+        candidate_prs,
         concurrency=args.file_fetch_concurrency,
     )
-    relevant_prs = filter_relevant_prs(open_prs)
+    relevant_prs = filter_relevant_prs(candidate_prs)
     print(f"Found {len(relevant_prs)} OpenViking-related PR(s).", file=sys.stderr)
 
     if relevant_prs:
@@ -490,14 +560,15 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         llm_status = "skipped because no relevant PRs were found"
-        markdown = "No open OpenViking-related PRs found.\n"
+        markdown = report_header([]) + "No open OpenViking-related PRs found.\n"
 
     with open(args.output, "w", encoding="utf-8") as handle:
         handle.write(markdown)
     print(markdown)
     print(f"LLM status: {llm_status}", file=sys.stderr)
 
-    title = f"OpenViking PR Report - {datetime.now(UTC).strftime('%Y-%m-%d')}"
+    suffix = "PR" if len(relevant_prs) == 1 else "PRs"
+    title = f"OpenViking PR Report - {datetime.now(UTC).strftime('%Y-%m-%d')} - {len(relevant_prs)} {suffix}"
     card = build_lark_card(markdown, title=title, markdown_limit=args.lark_markdown_chars)
     if args.dry_run:
         print(json.dumps(card, ensure_ascii=False, indent=2))

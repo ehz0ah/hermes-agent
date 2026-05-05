@@ -33,7 +33,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_REPOSITORY: NousResearch/hermes-agent
-          MAX_OPEN_PRS: "1000"
+          MAX_SEARCH_RESULTS: "1000"
           FILE_FETCH_CONCURRENCY: "20"
           UPSTREAM_GITHUB_TOKEN: ${{ secrets.UPSTREAM_GITHUB_TOKEN }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
