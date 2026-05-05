@@ -226,8 +226,9 @@ def test_complete_pr_sections_adds_missing_llm_sections() -> None:
         "Overview: 2 open OpenViking-related PRs found.\n\n"
         "**Group: Endpoint fixes**\n\n"
         "---\n"
-        "**[#2](https://github.com/NousResearch/hermes-agent/pull/2) fix(openviking): first**\n"
-        "**Summary:** Detailed summary."
+        "### [#2](https://github.com/NousResearch/hermes-agent/pull/2) fix(openviking): first\n"
+        "Summary: Detailed summary.\n"
+        "**Possible Overlaps:** #1."
     )
 
     markdown, missing_numbers = report.complete_pr_sections(llm_markdown, [first, missing])
@@ -235,6 +236,8 @@ def test_complete_pr_sections_adds_missing_llm_sections() -> None:
     assert missing_numbers == [1]
     assert "**[#2]" in markdown
     assert "**[#1]" in markdown
+    assert "###" not in markdown
+    assert "**Summary:** Detailed summary." in markdown
     assert "Possible Overlaps" not in markdown
     assert markdown.index("**[#2]") < markdown.index("**[#1]")
 

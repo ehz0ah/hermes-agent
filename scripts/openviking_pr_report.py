@@ -430,7 +430,7 @@ def complete_pr_sections(markdown: str, prs: list[PullRequest]) -> tuple[str, li
     sections = extract_pr_sections(body)
     missing = [pr.number for pr in prs if pr.number not in sections]
     if not missing:
-        return body.strip() + "\n", []
+        return normalize_report_markdown(body).strip() + "\n", []
 
     lines: list[str] = []
     for pr in prs:
@@ -439,7 +439,21 @@ def complete_pr_sections(markdown: str, prs: list[PullRequest]) -> tuple[str, li
             lines.extend(["---", section, ""])
         else:
             lines.extend([render_pr_fallback_section(pr), ""])
-    return "\n".join(lines).strip() + "\n", missing
+    return normalize_report_markdown("\n".join(lines)).strip() + "\n", missing
+
+
+def normalize_report_markdown(markdown: str) -> str:
+    lines: list[str] = []
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if lowered.startswith("possible overlaps:") or lowered.startswith("**possible overlaps:**"):
+            continue
+        line = re.sub(r"^(?P<indent>\s*)### (?P<title>\[#\d+\]\([^)]*\) .+)$", r"\g<indent>**\g<title>**", line)
+        line = re.sub(r"^(?P<indent>\s*)Summary:\s*", r"\g<indent>**Summary:** ", line)
+        line = re.sub(r"^(?P<indent>\s*)\*\*Summary:\*\*\s*", r"\g<indent>**Summary:** ", line)
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def render_fallback_report(prs: list[PullRequest], *, llm_status: str) -> str:
