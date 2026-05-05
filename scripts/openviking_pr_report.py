@@ -51,7 +51,6 @@ class PullRequest:
     body: str
     html_url: str
     updated_at: str
-    author: str = "unknown"
     head_ref: str = ""
     files: list[str] = field(default_factory=list)
 
@@ -153,7 +152,6 @@ def truncate_text(value: str, limit: int) -> str:
 
 
 def make_pull_request(raw: dict[str, Any]) -> PullRequest:
-    user = raw.get("user") or {}
     head = raw.get("head") or {}
     return PullRequest(
         number=int(raw["number"]),
@@ -161,7 +159,6 @@ def make_pull_request(raw: dict[str, Any]) -> PullRequest:
         body=str(raw.get("body") or ""),
         html_url=str(raw.get("html_url") or ""),
         updated_at=str(raw.get("updated_at") or ""),
-        author=str(user.get("login") or "unknown"),
         head_ref=str(head.get("ref") or ""),
     )
 
