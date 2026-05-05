@@ -160,17 +160,40 @@ def test_fetch_search_prs_paginates_keyword_results() -> None:
     assert len(prs) == 101
 
 
-def test_filter_relevant_prs_keeps_github_search_matches() -> None:
-    github_search_match = make_pr(10, "fix: cron memory")
-    text_match = make_pr(11, "fix(openviking): reconnect")
+def test_filter_relevant_prs_requires_openviking_plugin_path() -> None:
+    text_only = make_pr(
+        10,
+        "fix(openviking): fallback commit on idle expiry",
+        "Directly calls OpenViking when a gateway agent is evicted.",
+        files=["gateway/run.py", "tests/gateway/test_session_boundary_hooks.py"],
+    )
+    generic_provider = make_pr(
+        11,
+        "fix(memory): persist prefetch cache across gateway recreation",
+        "This helps external memory providers such as OpenViking and mem0.",
+        files=["agent/memory_manager.py", "run_agent.py"],
+    )
+    benchmark_adapter = make_pr(
+        12,
+        "feat(benchmarks): add capability-aware memory benchmark framework",
+        "Adds adapters for mem0, openviking, and retaindb.",
+        files=["benchmarks/backends/openviking_adapter.py"],
+    )
+    plugin_match = make_pr(
+        13,
+        "fix(openviking): migrate endpoints",
+        files=["plugins/memory/openviking/__init__.py"],
+    )
 
-    assert [pr.number for pr in report.filter_relevant_prs([github_search_match, text_match])] == [11, 10]
+    relevant = report.filter_relevant_prs([text_only, generic_provider, benchmark_adapter, plugin_match])
+
+    assert [pr.number for pr in relevant] == [13]
 
 
 def test_report_header_includes_match_count() -> None:
     markdown = report.report_header(2)
 
-    assert "Overview: 2 open OpenViking-related PRs found." in markdown
+    assert "Overview: 2 open OpenViking plugin PRs found." in markdown
 
 
 def test_parse_json_object_accepts_fenced_json() -> None:
@@ -250,7 +273,7 @@ def test_lark_card_uses_collapsible_pr_panels() -> None:
     assert card["card"]["header"]["title"]["content"] == "OpenViking PR Report"
     elements = card["card"]["body"]["elements"]
     assert elements[0]["tag"] == "markdown"
-    assert "Overview: 1 open OpenViking-related PR found." in elements[0]["content"]
+    assert "Overview: 1 open OpenViking plugin PR found." in elements[0]["content"]
     assert elements[1] == {"tag": "markdown", "content": "**Group: Resource routing**"}
     assert elements[2]["tag"] == "collapsible_panel"
     assert elements[2]["expanded"] is False
@@ -264,8 +287,8 @@ def test_lark_card_no_matches_text() -> None:
     card = report.build_lark_card([], [], title="OpenViking PR Report")
     elements = card["card"]["body"]["elements"]
 
-    assert elements[0]["content"] == "Overview: 0 open OpenViking-related PRs found."
-    assert elements[1]["content"] == "No open OpenViking-related PRs found."
+    assert elements[0]["content"] == "Overview: 0 open OpenViking plugin PRs found."
+    assert elements[1]["content"] == "No open OpenViking plugin PRs found."
 
 
 def test_markdown_report_renders_grouped_pr_list() -> None:
@@ -279,7 +302,7 @@ def test_markdown_report_renders_grouped_pr_list() -> None:
 
     markdown = report.render_markdown_report(groups, [pr], llm_status="not configured")
 
-    assert "**Group: OpenViking-related PRs**" in markdown
+    assert "**Group: OpenViking plugin PRs**" in markdown
     assert "- [#42]" in markdown
     assert "**Summary:**" in markdown
     assert "plugins/memory/openviking" not in markdown
@@ -292,5 +315,5 @@ def test_markdown_report_renders_grouped_pr_list() -> None:
 def test_no_matches_markdown_report_text() -> None:
     markdown = report.render_markdown_report([], [], llm_status="skipped")
 
-    assert "Overview: 0 open OpenViking-related PRs found." in markdown
-    assert "No open OpenViking-related PRs found." in markdown
+    assert "Overview: 0 open OpenViking plugin PRs found." in markdown
+    assert "No open OpenViking plugin PRs found." in markdown

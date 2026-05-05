@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send a Lark report for open OpenViking-related Hermes PRs."""
+"""Send a Lark report for open Hermes PRs that touch the OpenViking plugin."""
 
 from __future__ import annotations
 
@@ -44,8 +44,12 @@ OPENVIKING_KEYWORD_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-OPENVIKING_PATH_PREFIXES = (
+OPENVIKING_PLUGIN_DIR_PREFIXES = (
     "plugins/memory/openviking",
+    "tests/plugins/memory/openviking",
+)
+
+OPENVIKING_PLUGIN_FILE_PREFIXES = (
     "tests/plugins/memory/test_openviking",
 )
 
@@ -73,17 +77,14 @@ class PullRequest:
 
     @property
     def is_relevant(self) -> bool:
-        return self.text_matches or self.path_matches
+        return self.path_matches
 
     @property
     def match_reason(self) -> str:
-        reasons: list[str] = []
-        if self.text_matches:
-            reasons.append("title/body keyword match")
         matched_paths = openviking_paths(self.files)
         if matched_paths:
-            reasons.append("changed OpenViking path: " + ", ".join(matched_paths[:3]))
-        return "; ".join(reasons) or "GitHub OpenViking search match"
+            return "changed OpenViking plugin path: " + ", ".join(matched_paths[:3])
+        return "not a direct OpenViking plugin path match"
 
 
 @dataclass
@@ -250,7 +251,7 @@ def attach_file_paths(
             pr = future_to_pr[future]
             try:
                 pr.files = future.result()
-            except Exception as exc:  # noqa: BLE001 - a failed path lookup should not hide text matches.
+            except Exception as exc:  # noqa: BLE001 - one failed path lookup should not abort the report.
                 errors += 1
                 print(f"Failed to fetch changed file paths for PR #{pr.number}: {exc}", file=sys.stderr)
     if errors:
@@ -261,7 +262,12 @@ def openviking_paths(files: list[str]) -> list[str]:
     matched: list[str] = []
     for path in files:
         lowered = path.lower()
-        if any(lowered.startswith(prefix) for prefix in OPENVIKING_PATH_PREFIXES):
+        dir_match = any(
+            lowered == prefix or lowered.startswith(f"{prefix}/")
+            for prefix in OPENVIKING_PLUGIN_DIR_PREFIXES
+        )
+        file_match = any(lowered.startswith(prefix) for prefix in OPENVIKING_PLUGIN_FILE_PREFIXES)
+        if dir_match or file_match:
             matched.append(path)
     return matched
 
@@ -271,7 +277,7 @@ def paths_have_openviking_signal(files: list[str]) -> bool:
 
 
 def filter_relevant_prs(prs: list[PullRequest]) -> list[PullRequest]:
-    return sorted(prs, key=lambda pr: pr.number, reverse=True)
+    return sorted((pr for pr in prs if pr.is_relevant), key=lambda pr: pr.number, reverse=True)
 
 
 def chat_completions_url(base_url: str) -> str:
@@ -338,12 +344,12 @@ def build_llm_prompt(prs: list[PullRequest], *, body_chars: int) -> list[dict[st
         {
             "role": "user",
             "content": (
-                "Summarize the currently open OpenViking-related PRs.\n\n"
-                "OpenViking is the Hermes memory/context plugin around "
-                "`plugins/memory/openviking`, `viking_*` tools, `viking://` resources, "
-                "provider setup, endpoint migration, memory recall/search, and resource handling.\n\n"
-                "The input PR JSON is the authoritative filtered list. Include every input PR exactly once, "
-                "even if a PR only looks indirectly related from its title/body. "
+                "Summarize the currently open PRs that directly change the Hermes OpenViking plugin.\n\n"
+                "OpenViking relevance here means the PR changes `plugins/memory/openviking` or "
+                "OpenViking-scoped plugin tests. Generic memory framework, gateway lifecycle, cron, "
+                "benchmark, or provider infrastructure PRs are intentionally excluded unless they touch "
+                "those OpenViking plugin paths.\n\n"
+                "The input PR JSON is the authoritative filtered list. Include every input PR exactly once. "
                 f"Expected PR numbers: {expected_numbers}.\n\n"
                 "Return exactly one JSON object and no Markdown, no code fence, and no prose before or after it.\n"
                 "Use this schema:\n"
@@ -376,7 +382,7 @@ def report_header(pr_count: int) -> str:
     suffix = "PR" if pr_count == 1 else "PRs"
     return (
         "**OpenViking Open PR Triage Report**\n\n"
-        f"Overview: {pr_count} open OpenViking-related {suffix} found.\n\n"
+        f"Overview: {pr_count} open OpenViking plugin {suffix} found.\n\n"
     )
 
 
@@ -411,7 +417,7 @@ def fallback_groups(prs: list[PullRequest]) -> list[ReportGroup]:
         return []
     return [
         ReportGroup(
-            "OpenViking-related PRs",
+            "OpenViking plugin PRs",
             [PrSummary(pr.number, fallback_summary(pr)) for pr in prs],
         )
     ]
@@ -491,7 +497,7 @@ def validate_grouped_report(data: dict[str, Any], prs: list[PullRequest]) -> tup
 def render_markdown_report(groups: list[ReportGroup], prs: list[PullRequest], *, llm_status: str) -> str:
     lines = [report_header(len(prs)).rstrip(), f"LLM: {llm_status}", ""]
     if not prs:
-        lines.append("No open OpenViking-related PRs found.")
+        lines.append("No open OpenViking plugin PRs found.")
         return "\n".join(lines) + "\n"
 
     pr_by_number = {pr.number: pr for pr in prs}
@@ -549,12 +555,12 @@ def build_lark_elements(groups: list[ReportGroup], prs: list[PullRequest]) -> li
     elements: list[dict[str, Any]] = [
         {
             "tag": "markdown",
-            "content": f"Overview: {len(prs)} open OpenViking-related {'PR' if len(prs) == 1 else 'PRs'} found.",
+            "content": f"Overview: {len(prs)} open OpenViking plugin {'PR' if len(prs) == 1 else 'PRs'} found.",
         }
     ]
 
     if not prs:
-        elements.append({"tag": "markdown", "content": "No open OpenViking-related PRs found."})
+        elements.append({"tag": "markdown", "content": "No open OpenViking plugin PRs found."})
         return elements
 
     for group in groups:
@@ -670,7 +676,7 @@ def main(argv: list[str] | None = None) -> int:
         concurrency=args.file_fetch_concurrency,
     )
     relevant_prs = filter_relevant_prs(candidate_prs)
-    print(f"Found {len(relevant_prs)} OpenViking-related PR(s).", file=sys.stderr)
+    print(f"Found {len(relevant_prs)} OpenViking plugin PR(s).", file=sys.stderr)
 
     if relevant_prs:
         groups, llm_status = summarize_with_llm(
