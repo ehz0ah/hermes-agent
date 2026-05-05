@@ -7,14 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Generate the report without updating the tracking issue"
+        description: "Generate the report without posting to Lark"
         required: false
         default: false
         type: boolean
 
 permissions:
   contents: read
-  issues: write
   pull-requests: read
 
 concurrency:
@@ -34,19 +33,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_REPOSITORY: NousResearch/hermes-agent
-          REPORT_REPOSITORY: ${{ github.repository }}
           RECENT_HOURS: "24"
           MAX_OPEN_PRS: "1000"
-          FILE_PROBE_LIMIT: "1000"
+          FILE_FETCH_CONCURRENCY: "20"
           UPSTREAM_GITHUB_TOKEN: ${{ secrets.UPSTREAM_GITHUB_TOKEN }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
-          LLM_BATCH_SIZE: "20"
-          LLM_CONCURRENCY: "20"
           LLM_TIMEOUT_SECONDS: "120"
+          LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
         run: |
-          args=(--output openviking-pr-report.md --no-comment)
+          args=(--output openviking-pr-report.md)
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             args+=(--dry-run)
           fi

@@ -19,284 +19,90 @@ def make_pr(
     title: str,
     body: str = "",
     files: list[str] | None = None,
-    state: str = "open",
-    merged_at: str | None = None,
 ) -> report.PullRequest:
-    pr = report.PullRequest(
+    return report.PullRequest(
         number=number,
         title=title,
         body=body,
-        state=state,
         html_url=f"https://github.com/NousResearch/hermes-agent/pull/{number}",
-        author="contributor",
-        created_at="2026-04-01T00:00:00Z",
-        updated_at="2026-04-20T00:00:00Z",
-        merged_at=merged_at,
+        updated_at="2026-05-04T12:00:00Z",
         files=files or [],
     )
-    pr.linked_issues = report.extract_issue_refs(body)
-    return pr
 
 
-def test_openviking_path_marks_pr_as_related() -> None:
+def test_keyword_filter_matches_any_keyword_in_title_or_body() -> None:
+    title_match = make_pr(1, "fix(openviking): reconnect provider")
+    body_match = make_pr(2, "fix: memory provider", "This updates viking:// resource handling.")
+    unrelated = make_pr(3, "fix: gateway cleanup", "No memory changes.")
+
+    assert title_match.text_matches
+    assert body_match.text_matches
+    assert not unrelated.text_matches
+    assert [pr.number for pr in report.filter_relevant_prs([title_match, body_match, unrelated])] == [2, 1]
+
+
+def test_path_filter_matches_openviking_plugin_paths() -> None:
     pr = make_pr(
-        101,
+        10,
         "fix: memory provider cleanup",
-        files=["plugins/memory/openviking/__init__.py"],
+        files=["plugins/memory/openviking/__init__.py", "gateway/run.py"],
     )
 
-    assert report.pr_has_openviking_signal(pr)
+    assert pr.path_matches
+    assert pr.is_relevant
+    assert "plugins/memory/openviking/__init__.py" in pr.match_reason
 
 
-def test_duplicate_clusters_group_local_upload_prs() -> None:
-    prs = [
-        make_pr(
-            10360,
-            "fix(memory): support OpenViking local resource uploads",
-            "Fixes #10350. Uploads local files before add_resource.",
-            ["plugins/memory/openviking/__init__.py", "tests/plugins/memory/test_openviking_provider.py"],
-        ),
-        make_pr(
-            19569,
-            "fix(memory): harden OpenViking local resource uploads",
-            "Builds on #10360 and follows local upload handling for files/directories.",
-            ["plugins/memory/openviking/__init__.py", "tests/plugins/memory/test_openviking_provider.py"],
-        ),
-        make_pr(
-            11710,
-            "fix(openviking): improve explicit fallback recall",
-            "Ensure fallback memories show up in prefetch and search.",
-            ["plugins/memory/openviking/__init__.py"],
-        ),
-    ]
-
-    clusters = report.build_duplicate_clusters(prs)
-
-    local_upload_clusters = [
-        cluster for cluster in clusters if {10360, 19569} <= {pr.number for pr in cluster.prs}
-    ]
-    assert local_upload_clusters
-    assert local_upload_clusters[0].topic == "Local resource upload"
-    assert {pr.number for pr in local_upload_clusters[0].prs} == {10360, 19569}
-    assert any("shared topic" in reason for reason in local_upload_clusters[0].reasons)
-
-
-def test_file_overlap_alone_does_not_create_duplicate_cluster() -> None:
-    prs = [
-        make_pr(
-            1,
-            "fix(openviking): improve fallback recall",
-            "Ensure fallback memories show up in prefetch and search.",
-            ["plugins/memory/openviking/__init__.py"],
-        ),
-        make_pr(
-            2,
-            "fix(openviking): reconnect after health check failure",
-            "Lazily reconnect OpenViking after startup health checks fail.",
-            ["plugins/memory/openviking/__init__.py"],
-        ),
-    ]
-
-    assert report.build_duplicate_clusters(prs) == []
-
-
-def test_non_openviking_reference_comment_is_not_relevance_signal() -> None:
-    pr = make_pr(3, "fix: unrelated gateway command", "Fixes #1234", ["gateway/run.py"])
-    pr.comments = ["Related to #10360"]
-
-    assert not report.pr_has_openviking_signal(pr)
-
-
-def test_render_report_includes_duplicate_and_recent_sections() -> None:
-    open_pr = make_pr(
-        10360,
-        "fix(memory): support OpenViking local resource uploads",
-        "Upload local files.",
-    )
-    merged_pr = make_pr(
-        19569,
-        "fix(memory): harden OpenViking local resource uploads",
-        "Builds on #10360 and preserves local upload behavior.",
-        state="closed",
-        merged_at="2026-04-21T00:00:00Z",
-    )
-    prs = [open_pr, merged_pr]
-    clusters = report.build_duplicate_clusters(prs)
-
-    markdown = report.render_deterministic_report(
-        prs,
-        clusters,
-        upstream_repo="NousResearch/hermes-agent",
-        recent_hours=24,
-        generated_at=datetime(2026, 5, 4, tzinfo=UTC),
-        llm_status="not configured",
+def test_path_filter_matches_openviking_test_paths() -> None:
+    pr = make_pr(
+        11,
+        "test: memory provider cleanup",
+        files=["tests/plugins/memory/test_openviking_provider.py"],
     )
 
-    assert "## Likely Duplicate Groups" in markdown
-    assert "Local resource upload" in markdown
-    assert "Scope: open OpenViking-related PRs updated in the last 24 hours." in markdown
-    assert "[#19569]" in markdown
+    assert pr.path_matches
+    assert report.openviking_paths(pr.files) == ["tests/plugins/memory/test_openviking_provider.py"]
 
 
-def test_llm_assessments_accept_real_related_prs_only() -> None:
-    prs = [
-        make_pr(10, "fix(openviking): update resource reads"),
-        make_pr(11, "fix: unrelated gateway cleanup"),
-    ]
-    data = {
-        "pull_requests": [
-            {
-                "number": 10,
-                "is_openviking_related": True,
-                "confidence": "high",
-                "topic": "Read routing",
-                "summary": "Updates OpenViking resource read behavior.",
-                "why": "Title explicitly names OpenViking.",
-                "duplicate_group": "",
-            },
-            {
-                "number": 11,
-                "is_openviking_related": False,
-                "confidence": "low",
-                "summary": "Rejected.",
-                "why": "No OpenViking signal.",
-            },
-            {
-                "number": 999,
-                "is_openviking_related": True,
-                "confidence": "high",
-                "summary": "Invented.",
-                "why": "Should be ignored.",
-            },
-        ]
-    }
-
-    assessments = report.parse_llm_assessments(data, prs)
-
-    assert [assessment.pr.number for assessment in assessments] == [10]
-    assert assessments[0].summary == "Updates OpenViking resource read behavior."
-
-
-def test_extract_json_object_accepts_fenced_json() -> None:
-    parsed = report.extract_json_object(
-        """```json
-{"pull_requests": []}
-```"""
-    )
-
-    assert parsed == {"pull_requests": []}
-
-
-def test_render_llm_report_includes_table_summaries_and_duplicate_groups() -> None:
-    first = make_pr(10, "fix(openviking): local upload")
-    second = make_pr(11, "feat(openviking): upload local resources")
-    assessments = [
-        report.LlmPrAssessment(
-            pr=first,
-            is_openviking_related=True,
-            confidence="high",
-            summary="Hardens local uploads before resource creation.",
-            why="Touches OpenViking local resource upload behavior.",
-            duplicate_group="Local resource upload",
-            topic="Local resource upload",
-        ),
-        report.LlmPrAssessment(
-            pr=second,
-            is_openviking_related=True,
-            confidence="medium",
-            summary="Adds another local resource upload path.",
-            why="Changes the same OpenViking upload flow.",
-            duplicate_group="Local resource upload",
-            topic="Local resource upload",
-        ),
-    ]
-
-    markdown = report.render_llm_report(
-        assessments,
-        reviewed_count=20,
-        upstream_repo="NousResearch/hermes-agent",
-        recent_hours=24,
-        generated_at=datetime(2026, 5, 4, tzinfo=UTC),
-        llm_status="classified with `model`",
-    )
-
-    assert "| PR | Confidence | Topic / duplicate group | Summary | Why included |" in markdown
-    assert "Hardens local uploads before resource creation." in markdown
-    assert "Reviewed: 20 open PRs" in markdown
-    assert "### Local resource upload" in markdown
-
-
-def test_classify_with_llm_batches_candidates(monkeypatch) -> None:
-    prs = [make_pr(number, f"fix(openviking): change {number}") for number in (1, 2, 3)]
-    calls: list[list[int]] = []
-
-    def fake_classify_batch(batch, **kwargs):
-        calls.append([pr.number for pr in batch])
-        return [
-            report.LlmPrAssessment(
-                pr=pr,
-                is_openviking_related=True,
-                confidence="high",
-                summary=pr.title,
-                why="OpenViking title.",
-            )
-            for pr in batch
-        ]
-
-    monkeypatch.setattr(report, "classify_llm_batch", fake_classify_batch)
-    monkeypatch.setenv("LLM_BATCH_SIZE", "2")
-    monkeypatch.setenv("LLM_CONCURRENCY", "20")
-    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "30")
-
-    assessments = report.classify_with_llm(
-        prs,
-        api_key="key",
-        base_url="https://api.example.com/v1",
-        model="model",
-        upstream_repo="NousResearch/hermes-agent",
-    )
-
-    assert sorted(calls) == [[1, 2], [3]]
-    assert [assessment.pr.number for assessment in assessments] == [3, 2, 1]
-
-
-def test_deterministic_guardrail_adds_llm_misses() -> None:
-    llm_match = report.LlmPrAssessment(
-        pr=make_pr(1, "fix(openviking): reconnect provider"),
-        is_openviking_related=True,
-        confidence="high",
-        summary="Reconnects the provider.",
-        why="LLM included it.",
-    )
-    deterministic_only = make_pr(
-        2,
-        "fix: memory provider cleanup",
-        files=["plugins/memory/openviking/__init__.py"],
-    )
-    unrelated = make_pr(3, "fix: gateway cleanup", files=["gateway/run.py"])
-
-    merged, added = report.merge_with_deterministic_matches(
-        [llm_match],
-        [llm_match.pr, deterministic_only, unrelated],
-    )
-
-    assert added == 1
-    assert {assessment.pr.number for assessment in merged} == {1, 2}
-    assert any("Deterministic guardrail" in assessment.why for assessment in merged if assessment.pr.number == 2)
-
-
-def test_fetch_recent_open_pull_records_paginates_until_cutoff(monkeypatch) -> None:
+def test_fetch_recent_open_prs_paginates_until_cutoff(monkeypatch) -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.pages = {
-                1: [{"number": number, "updated_at": "2026-05-04T12:00:00Z"} for number in range(1, 101)],
+                1: [
+                    {
+                        "number": number,
+                        "title": f"PR {number}",
+                        "body": "",
+                        "html_url": f"https://example.test/{number}",
+                        "updated_at": "2026-05-04T12:00:00Z",
+                        "user": {"login": "octo"},
+                        "head": {"ref": "branch"},
+                    }
+                    for number in range(1, 101)
+                ],
                 2: [
-                    {"number": 101, "updated_at": "2026-05-03T13:00:00Z"},
-                    {"number": 102, "updated_at": "2026-05-03T10:00:00Z"},
+                    {
+                        "number": 101,
+                        "title": "inside cutoff",
+                        "body": "",
+                        "html_url": "https://example.test/101",
+                        "updated_at": "2026-05-03T13:00:00Z",
+                        "user": {"login": "octo"},
+                        "head": {"ref": "branch"},
+                    },
+                    {
+                        "number": 102,
+                        "title": "outside cutoff",
+                        "body": "",
+                        "html_url": "https://example.test/102",
+                        "updated_at": "2026-05-03T10:00:00Z",
+                        "user": {"login": "octo"},
+                        "head": {"ref": "branch"},
+                    },
                 ],
             }
 
-        def request(self, method, path, *, params=None, data=None):
+        def request(self, method, path, *, params=None, data=None, timeout=30):
             assert method == "GET"
             assert path == "/repos/NousResearch/hermes-agent/pulls"
             return self.pages.get(params["page"], [])
@@ -308,27 +114,56 @@ def test_fetch_recent_open_pull_records_paginates_until_cutoff(monkeypatch) -> N
 
     monkeypatch.setattr(report, "datetime", FixedDatetime)
 
-    pulls = report.fetch_recent_open_pull_records(
+    prs = report.fetch_recent_open_prs(
         FakeClient(),
         "NousResearch/hermes-agent",
         recent_hours=24,
         max_open_prs=1000,
     )
 
-    assert [pull["number"] for pull in pulls][-2:] == [100, 101]
+    assert [pr.number for pr in prs][-2:] == [100, 101]
 
 
-def test_chat_completions_url_accepts_base_or_full_endpoint() -> None:
-    assert report.chat_completions_url("https://api.example.com/v1") == "https://api.example.com/v1/chat/completions"
-    assert (
-        report.chat_completions_url("https://api.example.com/v1/chat/completions")
-        == "https://api.example.com/v1/chat/completions"
+def test_attach_file_paths_parallel_adds_filenames() -> None:
+    class FakeClient:
+        def request(self, method, path, *, params=None, data=None, timeout=30):
+            number = int(path.rsplit("/", 2)[1])
+            return [{"filename": f"plugins/memory/openviking/{number}.py"}]
+
+    prs = [make_pr(1, "fix: one"), make_pr(2, "fix: two")]
+
+    report.attach_file_paths(FakeClient(), "NousResearch/hermes-agent", prs, concurrency=2)
+
+    assert prs[0].files == ["plugins/memory/openviking/1.py"]
+    assert prs[1].files == ["plugins/memory/openviking/2.py"]
+
+
+def test_build_llm_prompt_includes_only_matched_pr_facts() -> None:
+    pr = make_pr(
+        42,
+        "fix(openviking): resource routing",
+        "Longer body explaining viking_read behavior.",
+        ["plugins/memory/openviking/__init__.py"],
     )
 
+    messages = report.build_llm_prompt([pr], recent_hours=24, body_chars=200)
+    user_content = messages[1]["content"]
 
-def test_dated_report_title_uses_singapore_date() -> None:
-    generated_at = datetime(2026, 5, 3, 18, 30, tzinfo=UTC)
+    assert "fix(openviking): resource routing" in user_content
+    assert "plugins/memory/openviking/__init__.py" in user_content
+    assert "viking_read behavior" in user_content
 
-    assert report.dated_report_title("OpenViking PR Report", generated_at) == "OpenViking PR Report - 2026-05-04"
-    assert report.dated_report_title("OpenViking %Y-%m-%d", generated_at) == "OpenViking 2026-05-04"
-    assert report.dated_report_title("OpenViking PR Report - 2026-05-04", generated_at) == "OpenViking PR Report - 2026-05-04"
+
+def test_lark_card_envelope_uses_interactive_markdown_card() -> None:
+    card = report.build_lark_card("# Report\n\nBody", title="OpenViking PR Report", markdown_limit=1000)
+
+    assert card["msg_type"] == "interactive"
+    assert card["card"]["header"]["title"]["content"] == "OpenViking PR Report"
+    assert card["card"]["elements"][0]["tag"] == "markdown"
+    assert "# Report" in card["card"]["elements"][0]["content"]
+
+
+def test_no_matches_fallback_report_text() -> None:
+    markdown = report.render_fallback_report([], recent_hours=24, llm_status="skipped")
+
+    assert "No relevant PRs in the last 24 hours." in markdown
