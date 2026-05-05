@@ -342,8 +342,10 @@ def build_llm_prompt(prs: list[PullRequest], *, recent_hours: int, body_chars: i
                 "`plugins/memory/openviking`, `viking_*` tools, `viking://` resources, "
                 "provider setup, endpoint migration, memory recall/search, and resource handling.\n\n"
                 "Return standard Markdown only. Include:\n"
-                "- A short heading.\n"
-                "- A table with columns: PR, Confidence, Summary, Why relevant, Changed paths, Possible overlap.\n"
+                "- A short one-line summary.\n"
+                "- One section per PR using `### [#number](url) title`.\n"
+                "- Under each PR, use compact bullets for confidence, summary, why relevant, changed paths, and possible overlap.\n"
+                "- Do not use Markdown tables; Lark cards render stacked sections more reliably.\n"
                 "- Mention possible duplicates or overlap when PRs appear to touch the same behavior.\n"
                 "- Keep it compact and maintainer-facing.\n\n"
                 f"Input PR JSON:\n{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
@@ -364,18 +366,17 @@ def render_fallback_report(prs: list[PullRequest], *, recent_hours: int, llm_sta
         lines.append("No relevant PRs in the last 24 hours.")
         return "\n".join(lines) + "\n"
 
-    lines.extend(
-        [
-            "| PR | Why relevant | Changed paths |",
-            "| --- | --- | --- |",
-        ]
-    )
+    lines.append("## Matches")
+    lines.append("")
     for pr in prs:
         paths = ", ".join(openviking_paths(pr.files) or pr.files[:5]) or "n/a"
-        lines.append(
-            f"| [#{pr.number}]({pr.html_url}) {escape_table(pr.title)} "
-            f"| {escape_table(pr.match_reason)} "
-            f"| {escape_table(paths)} |"
+        lines.extend(
+            [
+                f"### [#{pr.number}]({pr.html_url}) {pr.title}",
+                f"- Why relevant: {pr.match_reason}",
+                f"- Changed paths: {paths}",
+                "",
+            ]
         )
     return "\n".join(lines) + "\n"
 
@@ -407,10 +408,6 @@ def summarize_with_llm(
     return markdown, f"summarized with `{model}`"
 
 
-def escape_table(value: str) -> str:
-    return " ".join(str(value or "").split()).replace("|", "\\|")
-
-
 def build_lark_card(markdown: str, *, title: str, markdown_limit: int) -> dict[str, Any]:
     content = markdown.strip()
     if len(content) > markdown_limit:
@@ -418,17 +415,20 @@ def build_lark_card(markdown: str, *, title: str, markdown_limit: int) -> dict[s
     return {
         "msg_type": "interactive",
         "card": {
-            "config": {"wide_screen_mode": True},
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True, "update_multi": True},
             "header": {
                 "template": "blue",
                 "title": {"tag": "plain_text", "content": title},
             },
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": content,
-                }
-            ],
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": content,
+                    }
+                ],
+            },
         },
     }
 

@@ -158,9 +158,10 @@ def test_lark_card_envelope_uses_interactive_markdown_card() -> None:
     card = report.build_lark_card("# Report\n\nBody", title="OpenViking PR Report", markdown_limit=1000)
 
     assert card["msg_type"] == "interactive"
+    assert card["card"]["schema"] == "2.0"
     assert card["card"]["header"]["title"]["content"] == "OpenViking PR Report"
-    assert card["card"]["elements"][0]["tag"] == "markdown"
-    assert "# Report" in card["card"]["elements"][0]["content"]
+    assert card["card"]["body"]["elements"][0]["tag"] == "markdown"
+    assert "# Report" in card["card"]["body"]["elements"][0]["content"]
 
 
 def test_no_matches_fallback_report_text() -> None:
