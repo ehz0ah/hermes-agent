@@ -33,7 +33,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_REPOSITORY: NousResearch/hermes-agent
-          RECENT_HOURS: "24"
           MAX_OPEN_PRS: "1000"
           FILE_FETCH_CONCURRENCY: "20"
           UPSTREAM_GITHUB_TOKEN: ${{ secrets.UPSTREAM_GITHUB_TOKEN }}

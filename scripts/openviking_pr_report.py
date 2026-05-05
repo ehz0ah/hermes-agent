@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send a Lark report for recent OpenViking-related Hermes PRs."""
+"""Send a Lark report for open OpenViking-related Hermes PRs."""
 
 from __future__ import annotations
 
@@ -14,13 +14,12 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 
 DEFAULT_UPSTREAM_REPO = "NousResearch/hermes-agent"
 DEFAULT_OUTPUT = "openviking-pr-report.md"
-DEFAULT_RECENT_HOURS = 24
 DEFAULT_MAX_OPEN_PRS = 1000
 DEFAULT_FILE_FETCH_CONCURRENCY = 20
 DEFAULT_LLM_TIMEOUT_SECONDS = 120
@@ -163,20 +162,17 @@ def make_pull_request(raw: dict[str, Any]) -> PullRequest:
     )
 
 
-def fetch_recent_open_prs(
+def fetch_open_prs(
     client: GitHubClient,
     repo: str,
     *,
-    recent_hours: int,
     max_open_prs: int,
 ) -> list[PullRequest]:
     owner, name = split_repo(repo)
-    cutoff = datetime.now(UTC) - timedelta(hours=recent_hours)
     prs: list[PullRequest] = []
     page = 1
-    reached_cutoff = False
 
-    while len(prs) < max_open_prs and not reached_cutoff:
+    while len(prs) < max_open_prs:
         items = client.request(
             "GET",
             f"/repos/{owner}/{name}/pulls",
@@ -194,10 +190,6 @@ def fetch_recent_open_prs(
             break
 
         for raw in items:
-            updated_at = parse_github_time(raw.get("updated_at"))
-            if updated_at and updated_at < cutoff:
-                reached_cutoff = True
-                break
             prs.append(make_pull_request(raw))
             if len(prs) >= max_open_prs:
                 break
@@ -207,8 +199,8 @@ def fetch_recent_open_prs(
         page += 1
 
     if len(prs) >= max_open_prs:
-        print(f"Stopped recent PR scan after safety cap of {max_open_prs} open PRs.", file=sys.stderr)
-    print(f"Fetched {len(prs)} open PRs updated in the last {recent_hours} hours.", file=sys.stderr)
+        print(f"Stopped open PR scan after safety cap of {max_open_prs} PRs.", file=sys.stderr)
+    print(f"Fetched {len(prs)} open PRs.", file=sys.stderr)
     return prs
 
 
@@ -312,7 +304,7 @@ def llm_chat_content(
     return content.strip() + "\n"
 
 
-def build_llm_prompt(prs: list[PullRequest], *, recent_hours: int, body_chars: int) -> list[dict[str, str]]:
+def build_llm_prompt(prs: list[PullRequest], *, body_chars: int) -> list[dict[str, str]]:
     payload = [
         {
             "number": pr.number,
@@ -336,17 +328,17 @@ def build_llm_prompt(prs: list[PullRequest], *, recent_hours: int, body_chars: i
         {
             "role": "user",
             "content": (
-                "Summarize OpenViking-related open PRs updated in the last "
-                f"{recent_hours} hours.\n\n"
+                "Summarize the currently open OpenViking-related PRs.\n\n"
                 "OpenViking is the Hermes memory/context plugin around "
                 "`plugins/memory/openviking`, `viking_*` tools, `viking://` resources, "
                 "provider setup, endpoint migration, memory recall/search, and resource handling.\n\n"
                 "Return standard Markdown only. Include:\n"
-                "- A short one-line summary.\n"
+                "- A short one-line overview.\n"
                 "- One section per PR using `### [#number](url) title`.\n"
-                "- Under each PR, use compact bullets for confidence, summary, why relevant, changed paths, and possible overlap.\n"
+                "- Under each PR, write a detailed 2-3 sentence summary with useful context.\n"
+                "- Add a `**Possible Overlaps:**` line when this PR likely overlaps or conflicts with another listed PR; otherwise write `**Possible Overlaps:** None.`\n"
+                "- Do not include confidence, changed paths, or a separate why/context section in the final report.\n"
                 "- Do not use Markdown tables; Lark cards render stacked sections more reliably.\n"
-                "- Mention possible duplicates or overlap when PRs appear to touch the same behavior.\n"
                 "- Keep it compact and maintainer-facing.\n\n"
                 f"Input PR JSON:\n{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
             ),
@@ -354,16 +346,16 @@ def build_llm_prompt(prs: list[PullRequest], *, recent_hours: int, body_chars: i
     ]
 
 
-def render_fallback_report(prs: list[PullRequest], *, recent_hours: int, llm_status: str) -> str:
+def render_fallback_report(prs: list[PullRequest], *, llm_status: str) -> str:
     lines = [
         "# OpenViking PR Report",
         "",
-        f"Open PRs updated in the last {recent_hours} hours.",
+        "Currently open OpenViking-related PRs.",
         f"LLM: {llm_status}",
         "",
     ]
     if not prs:
-        lines.append("No relevant PRs in the last 24 hours.")
+        lines.append("No open OpenViking-related PRs found.")
         return "\n".join(lines) + "\n"
 
     lines.append("## Matches")
@@ -373,8 +365,8 @@ def render_fallback_report(prs: list[PullRequest], *, recent_hours: int, llm_sta
         lines.extend(
             [
                 f"### [#{pr.number}]({pr.html_url}) {pr.title}",
-                f"- Why relevant: {pr.match_reason}",
-                f"- Changed paths: {paths}",
+                f"{pr.title} matched the OpenViking report filter. Matched signal: {pr.match_reason}.",
+                f"**Possible Overlaps:** Review alongside other PRs touching similar OpenViking files or behavior. Key paths: {paths}.",
                 "",
             ]
         )
@@ -384,7 +376,6 @@ def render_fallback_report(prs: list[PullRequest], *, recent_hours: int, llm_sta
 def summarize_with_llm(
     prs: list[PullRequest],
     *,
-    recent_hours: int,
     body_chars: int,
     timeout_seconds: int,
 ) -> tuple[str, str]:
@@ -392,11 +383,11 @@ def summarize_with_llm(
     base_url = os.getenv("LLM_BASE_URL", "")
     model = os.getenv("LLM_MODEL", "")
     if not (api_key and base_url and model):
-        return render_fallback_report(prs, recent_hours=recent_hours, llm_status="not configured"), "not configured"
+        return render_fallback_report(prs, llm_status="not configured"), "not configured"
 
     try:
         markdown = llm_chat_content(
-            build_llm_prompt(prs, recent_hours=recent_hours, body_chars=body_chars),
+            build_llm_prompt(prs, body_chars=body_chars),
             api_key=api_key,
             base_url=base_url,
             model=model,
@@ -404,7 +395,7 @@ def summarize_with_llm(
         )
     except Exception as exc:  # noqa: BLE001 - still send a useful report when LLM fails.
         status = f"configured but skipped after error: {exc}"
-        return render_fallback_report(prs, recent_hours=recent_hours, llm_status=status), status
+        return render_fallback_report(prs, llm_status=status), status
     return markdown, f"summarized with `{model}`"
 
 
@@ -451,7 +442,6 @@ def post_lark_card(webhook_url: str, card: dict[str, Any]) -> None:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upstream-repo", default=os.getenv("UPSTREAM_REPOSITORY", DEFAULT_UPSTREAM_REPO))
-    parser.add_argument("--recent-hours", type=int, default=int_from_env("RECENT_HOURS", DEFAULT_RECENT_HOURS))
     parser.add_argument("--max-open-prs", type=int, default=int_from_env("MAX_OPEN_PRS", DEFAULT_MAX_OPEN_PRS))
     parser.add_argument(
         "--file-fetch-concurrency",
@@ -475,31 +465,29 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     client = GitHubClient(github_token)
-    recent_prs = fetch_recent_open_prs(
+    open_prs = fetch_open_prs(
         client,
         args.upstream_repo,
-        recent_hours=args.recent_hours,
         max_open_prs=args.max_open_prs,
     )
     attach_file_paths(
         client,
         args.upstream_repo,
-        recent_prs,
+        open_prs,
         concurrency=args.file_fetch_concurrency,
     )
-    relevant_prs = filter_relevant_prs(recent_prs)
+    relevant_prs = filter_relevant_prs(open_prs)
     print(f"Found {len(relevant_prs)} OpenViking-related PR(s).", file=sys.stderr)
 
     if relevant_prs:
         markdown, llm_status = summarize_with_llm(
             relevant_prs,
-            recent_hours=args.recent_hours,
             body_chars=args.body_chars,
             timeout_seconds=args.llm_timeout_seconds,
         )
     else:
         llm_status = "skipped because no relevant PRs were found"
-        markdown = "No relevant PRs in the last 24 hours.\n"
+        markdown = "No open OpenViking-related PRs found.\n"
 
     with open(args.output, "w", encoding="utf-8") as handle:
         handle.write(markdown)

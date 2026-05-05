@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -64,7 +63,7 @@ def test_path_filter_matches_openviking_test_paths() -> None:
     assert report.openviking_paths(pr.files) == ["tests/plugins/memory/test_openviking_provider.py"]
 
 
-def test_fetch_recent_open_prs_paginates_until_cutoff(monkeypatch) -> None:
+def test_fetch_open_prs_paginates_all_open_prs() -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.pages = {
@@ -83,18 +82,9 @@ def test_fetch_recent_open_prs_paginates_until_cutoff(monkeypatch) -> None:
                 2: [
                     {
                         "number": 101,
-                        "title": "inside cutoff",
+                        "title": "next page",
                         "body": "",
                         "html_url": "https://example.test/101",
-                        "updated_at": "2026-05-03T13:00:00Z",
-                        "user": {"login": "octo"},
-                        "head": {"ref": "branch"},
-                    },
-                    {
-                        "number": 102,
-                        "title": "outside cutoff",
-                        "body": "",
-                        "html_url": "https://example.test/102",
                         "updated_at": "2026-05-03T10:00:00Z",
                         "user": {"login": "octo"},
                         "head": {"ref": "branch"},
@@ -107,17 +97,9 @@ def test_fetch_recent_open_prs_paginates_until_cutoff(monkeypatch) -> None:
             assert path == "/repos/NousResearch/hermes-agent/pulls"
             return self.pages.get(params["page"], [])
 
-    class FixedDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return datetime(2026, 5, 4, 12, 0, tzinfo=tz)
-
-    monkeypatch.setattr(report, "datetime", FixedDatetime)
-
-    prs = report.fetch_recent_open_prs(
+    prs = report.fetch_open_prs(
         FakeClient(),
         "NousResearch/hermes-agent",
-        recent_hours=24,
         max_open_prs=1000,
     )
 
@@ -146,12 +128,14 @@ def test_build_llm_prompt_includes_only_matched_pr_facts() -> None:
         ["plugins/memory/openviking/__init__.py"],
     )
 
-    messages = report.build_llm_prompt([pr], recent_hours=24, body_chars=200)
+    messages = report.build_llm_prompt([pr], body_chars=200)
     user_content = messages[1]["content"]
 
     assert "fix(openviking): resource routing" in user_content
     assert "plugins/memory/openviking/__init__.py" in user_content
     assert "viking_read behavior" in user_content
+    assert "Possible Overlaps" in user_content
+    assert "Do not include confidence" in user_content
 
 
 def test_lark_card_envelope_uses_interactive_markdown_card() -> None:
@@ -165,6 +149,6 @@ def test_lark_card_envelope_uses_interactive_markdown_card() -> None:
 
 
 def test_no_matches_fallback_report_text() -> None:
-    markdown = report.render_fallback_report([], recent_hours=24, llm_status="skipped")
+    markdown = report.render_fallback_report([], llm_status="skipped")
 
-    assert "No relevant PRs in the last 24 hours." in markdown
+    assert "No open OpenViking-related PRs found." in markdown
