@@ -2,8 +2,8 @@ name: OpenViking PR Report
 
 on:
   schedule:
-    # 9 AM Singapore time.
-    - cron: "0 1 * * *"
+    # 7:07 AM Singapore time; avoid top-of-hour scheduler congestion.
+    - cron: "7 23 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
