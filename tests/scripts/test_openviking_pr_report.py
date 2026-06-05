@@ -336,6 +336,41 @@ def test_lark_card_no_matches_text() -> None:
     assert elements[2]["content"] == "No open OpenViking plugin PRs found."
 
 
+def test_lark_webhook_urls_reads_multiline_secret_and_legacy_fallback(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "LARK_WEBHOOK_URLS",
+        "https://lark.test/one\n\n https://lark.test/two \nhttps://lark.test/legacy",
+    )
+    monkeypatch.setenv("LARK_WEBHOOK_URL", "https://lark.test/legacy")
+
+    assert report.lark_webhook_urls() == [
+        "https://lark.test/one",
+        "https://lark.test/two",
+        "https://lark.test/legacy",
+    ]
+
+
+def test_main_posts_report_to_all_lark_webhooks(monkeypatch, tmp_path) -> None:
+    posted: list[tuple[str, dict]] = []
+    output_path = tmp_path / "report.md"
+
+    monkeypatch.setenv("LARK_WEBHOOK_URLS", "https://lark.test/one\nhttps://lark.test/two")
+    monkeypatch.delenv("LARK_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.setattr(report, "fetch_search_prs", lambda client, repo, *, max_results: [])
+    monkeypatch.setattr(report, "attach_file_paths", lambda client, repo, prs, *, concurrency: None)
+    monkeypatch.setattr(report, "post_lark_card", lambda url, card: posted.append((url, card)))
+
+    exit_code = report.main(["--output", str(output_path)])
+
+    assert exit_code == 0
+    assert [url for url, _card in posted] == ["https://lark.test/one", "https://lark.test/two"]
+    assert all(card["msg_type"] == "interactive" for _url, card in posted)
+    assert output_path.exists()
+
+
 def test_markdown_report_renders_grouped_pr_list() -> None:
     pr = make_pr(
         42,

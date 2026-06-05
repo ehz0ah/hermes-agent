@@ -696,6 +696,19 @@ def post_lark_card(webhook_url: str, card: dict[str, Any]) -> None:
         raise RuntimeError(f"Lark webhook failed: {exc.code} {detail}") from exc
 
 
+def lark_webhook_urls() -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    raw_values = [os.getenv("LARK_WEBHOOK_URLS", ""), os.getenv("LARK_WEBHOOK_URL", "")]
+    for raw_value in raw_values:
+        for line in raw_value.splitlines():
+            url = line.strip()
+            if url and url not in seen:
+                urls.append(url)
+                seen.add(url)
+    return urls
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upstream-repo", default=os.getenv("UPSTREAM_REPOSITORY", DEFAULT_UPSTREAM_REPO))
@@ -721,9 +734,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     github_token = os.getenv("UPSTREAM_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or ""
-    lark_webhook_url = os.getenv("LARK_WEBHOOK_URL", "")
-    if not lark_webhook_url and not args.dry_run:
-        print("LARK_WEBHOOK_URL is required unless --dry-run is used.", file=sys.stderr)
+    webhook_urls = lark_webhook_urls()
+    if not webhook_urls and not args.dry_run:
+        print("LARK_WEBHOOK_URLS or LARK_WEBHOOK_URL is required unless --dry-run is used.", file=sys.stderr)
         return 2
 
     client = GitHubClient(github_token)
@@ -777,8 +790,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(card, ensure_ascii=False, indent=2))
         return 0
 
-    post_lark_card(lark_webhook_url, card)
-    print("Posted OpenViking PR report to Lark.", file=sys.stderr)
+    for webhook_url in webhook_urls:
+        post_lark_card(webhook_url, card)
+    print(f"Posted OpenViking PR report to {len(webhook_urls)} Lark webhook(s).", file=sys.stderr)
     return 0
 
 

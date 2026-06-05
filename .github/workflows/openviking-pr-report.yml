@@ -42,6 +42,7 @@ jobs:
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
           LLM_TIMEOUT_SECONDS: "120"
           LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+          LARK_WEBHOOK_URLS: ${{ secrets.LARK_WEBHOOK_URLS }}
         run: |
           args=(--output openviking-pr-report.md)
           if [ "${{ inputs.dry_run }}" = "true" ]; then
