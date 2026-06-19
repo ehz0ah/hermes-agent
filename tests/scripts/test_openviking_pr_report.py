@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -266,6 +267,117 @@ def test_build_llm_prompt_includes_only_matched_pr_facts() -> None:
     assert "cause-and-effect style" in user_content
     assert "Expected PR numbers: #42" in user_content
     assert "Do not include Markdown headings" in user_content
+
+
+def test_build_llm_prompt_keeps_full_body_when_body_chars_is_zero() -> None:
+    body = "A" * 5000
+    pr = make_pr(42, "fix(openviking): resource routing", body, ["plugins/memory/openviking/__init__.py"])
+
+    messages = report.build_llm_prompt([pr], body_chars=0)
+    user_content = messages[1]["content"]
+
+    assert body in user_content
+    assert "... [truncated]" not in user_content
+
+
+def test_summarize_with_llm_batches_prs_and_combines_groups(monkeypatch) -> None:
+    seen_batches: list[list[int]] = []
+
+    def fake_llm_chat_content(messages, *, api_key, base_url, model, timeout_seconds):
+        payload = json.loads(messages[1]["content"].split("Input PR JSON:\n", 1)[1])
+        numbers = [item["number"] for item in payload]
+        seen_batches.append(numbers)
+        return json.dumps(
+            {
+                "groups": [
+                    {
+                        "title": "OpenViking fixes",
+                        "prs": [{"number": number, "summary": f"Summary for #{number}."} for number in numbers],
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setenv("LLM_API_KEY", "key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.test")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setattr(report, "llm_chat_content", fake_llm_chat_content)
+
+    prs = [make_pr(number, f"PR {number}") for number in range(1, 6)]
+    groups, status = report.summarize_with_llm(prs, body_chars=0, timeout_seconds=180, batch_size=2, max_attempts=1)
+
+    assert seen_batches == [[1, 2], [3, 4], [5]]
+    assert status == "summarized with `test-model` in 3 batch(es)"
+    assert [group.title for group in groups] == ["OpenViking fixes"]
+    assert [item.number for group in groups for item in group.prs] == [1, 2, 3, 4, 5]
+
+
+def test_summarize_with_llm_retries_batch_failures(monkeypatch) -> None:
+    calls_by_batch: dict[tuple[int, ...], int] = {}
+
+    def fake_llm_chat_content(messages, *, api_key, base_url, model, timeout_seconds):
+        payload = json.loads(messages[1]["content"].split("Input PR JSON:\n", 1)[1])
+        numbers = [item["number"] for item in payload]
+        key = tuple(numbers)
+        calls_by_batch[key] = calls_by_batch.get(key, 0) + 1
+        if numbers == [1] and calls_by_batch[key] == 1:
+            raise TimeoutError("batch timed out")
+        return json.dumps(
+            {
+                "groups": [
+                    {
+                        "title": "Recovered",
+                        "prs": [{"number": number, "summary": f"LLM summary for #{number}."} for number in numbers],
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setenv("LLM_API_KEY", "key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.test")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setattr(report, "llm_chat_content", fake_llm_chat_content)
+
+    prs = [make_pr(1, "first failed batch"), make_pr(2, "second batch")]
+    groups, status = report.summarize_with_llm(prs, body_chars=0, timeout_seconds=180, batch_size=1, max_attempts=2)
+
+    assert status == "summarized with `test-model` in 2 batch(es)"
+    assert calls_by_batch[(1,)] == 2
+    assert calls_by_batch[(2,)] == 1
+    assert [group.title for group in groups] == ["Recovered"]
+    assert [item.summary for group in groups for item in group.prs] == ["LLM summary for #1.", "LLM summary for #2."]
+
+
+def test_summarize_with_llm_falls_back_only_failed_batches_after_retries(monkeypatch) -> None:
+    def fake_llm_chat_content(messages, *, api_key, base_url, model, timeout_seconds):
+        payload = json.loads(messages[1]["content"].split("Input PR JSON:\n", 1)[1])
+        numbers = [item["number"] for item in payload]
+        if numbers == [1]:
+            raise TimeoutError("batch timed out")
+        return json.dumps(
+            {
+                "groups": [
+                    {
+                        "title": "Recovered",
+                        "prs": [{"number": number, "summary": f"LLM summary for #{number}."} for number in numbers],
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setenv("LLM_API_KEY", "key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.test")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setattr(report, "llm_chat_content", fake_llm_chat_content)
+
+    prs = [make_pr(1, "first failed batch"), make_pr(2, "second batch")]
+    groups, status = report.summarize_with_llm(prs, body_chars=0, timeout_seconds=180, batch_size=1, max_attempts=2)
+
+    assert "summarized with `test-model` in 2 batch(es)" in status
+    assert "1 batch(es) fell back after errors" in status
+    assert [group.title for group in groups] == ["OpenViking plugin PRs", "Recovered"]
+    assert groups[0].prs[0].summary.startswith("first failed batch.")
+    assert groups[1].prs[0].summary == "LLM summary for #2."
 
 
 def test_validate_grouped_report_drops_hallucinations_and_adds_missing_prs() -> None:

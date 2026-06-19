@@ -22,6 +22,8 @@ DEFAULT_OUTPUT = "openviking-pr-report.md"
 DEFAULT_MAX_SEARCH_RESULTS = 1000
 DEFAULT_FILE_FETCH_CONCURRENCY = 20
 DEFAULT_LLM_TIMEOUT_SECONDS = 120
+DEFAULT_LLM_BATCH_SIZE = 5
+DEFAULT_LLM_MAX_ATTEMPTS = 2
 DEFAULT_BODY_CHARS = 4000
 DEFAULT_LARK_MARKDOWN_CHARS = 12000
 DEFAULT_RECENT_HOURS = 24
@@ -160,9 +162,14 @@ def int_from_env(name: str, default: int, *, minimum: int = 1) -> int:
 
 def truncate_text(value: str, limit: int) -> str:
     compact = "\n".join(line.rstrip() for line in (value or "").splitlines()).strip()
-    if len(compact) <= limit:
+    if limit <= 0 or len(compact) <= limit:
         return compact
     return compact[: limit - 20].rstrip() + "\n... [truncated]"
+
+
+def chunked(values: list[PullRequest], size: int) -> list[list[PullRequest]]:
+    batch_size = max(1, size)
+    return [values[index : index + batch_size] for index in range(0, len(values), batch_size)]
 
 
 def make_pull_request_from_issue(raw: dict[str, Any]) -> PullRequest:
@@ -551,11 +558,45 @@ def render_markdown_report(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def merge_report_groups(groups: list[ReportGroup]) -> list[ReportGroup]:
+    merged: list[ReportGroup] = []
+    index_by_title: dict[str, int] = {}
+    for group in groups:
+        key = group.title.strip().lower() or "other"
+        if key in index_by_title:
+            merged[index_by_title[key]].prs.extend(group.prs)
+            continue
+        index_by_title[key] = len(merged)
+        merged.append(ReportGroup(group.title, list(group.prs)))
+    return merged
+
+
+def summarize_pr_batch_with_llm(
+    prs: list[PullRequest],
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    body_chars: int,
+    timeout_seconds: int,
+) -> tuple[list[ReportGroup], list[int]]:
+    content = llm_chat_content(
+        build_llm_prompt(prs, body_chars=body_chars),
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        timeout_seconds=timeout_seconds,
+    )
+    return validate_grouped_report(parse_json_object(content), prs)
+
+
 def summarize_with_llm(
     prs: list[PullRequest],
     *,
     body_chars: int,
     timeout_seconds: int,
+    batch_size: int,
+    max_attempts: int,
 ) -> tuple[list[ReportGroup], str]:
     api_key = os.getenv("LLM_API_KEY", "")
     base_url = os.getenv("LLM_BASE_URL", "")
@@ -563,28 +604,54 @@ def summarize_with_llm(
     if not (api_key and base_url and model):
         return fallback_groups(prs), "not configured"
 
-    try:
-        content = llm_chat_content(
-            build_llm_prompt(prs, body_chars=body_chars),
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            timeout_seconds=timeout_seconds,
-        )
-    except Exception as exc:  # noqa: BLE001 - still send a useful report when LLM fails.
-        status = f"configured but skipped after error: {exc}"
-        return fallback_groups(prs), status
+    batches = chunked(prs, batch_size)
+    all_groups: list[ReportGroup] = []
+    missing_numbers: list[int] = []
+    failures: list[str] = []
+    print(
+        f"Summarizing {len(prs)} OpenViking plugin PR(s) with `{model}` in {len(batches)} batch(es).",
+        file=sys.stderr,
+    )
 
-    try:
-        groups, missing = validate_grouped_report(parse_json_object(content), prs)
-    except Exception as exc:  # noqa: BLE001 - malformed LLM output should not block the report.
-        status = f"configured but skipped after invalid JSON: {exc}"
-        return fallback_groups(prs), status
+    for index, batch in enumerate(batches, start=1):
+        batch_refs = ", ".join(f"#{pr.number}" for pr in batch)
+        print(f"Summarizing LLM batch {index}/{len(batches)}: {batch_refs}", file=sys.stderr)
+        batch_groups: list[ReportGroup] = []
+        batch_missing: list[int] = []
+        last_error: Exception | None = None
+        for attempt in range(1, max(1, max_attempts) + 1):
+            try:
+                batch_groups, batch_missing = summarize_pr_batch_with_llm(
+                    batch,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    body_chars=body_chars,
+                    timeout_seconds=timeout_seconds,
+                )
+                last_error = None
+                break
+            except Exception as exc:  # noqa: BLE001 - retry transient LLM failures before fallback.
+                last_error = exc
+                if attempt < max(1, max_attempts):
+                    print(f"LLM batch {index} attempt {attempt} failed; retrying: {exc}", file=sys.stderr)
+        if last_error is not None:
+            failures.append(f"batch {index}: {plain_text_excerpt(str(last_error), 160)}")
+            all_groups.extend(fallback_groups(batch))
+            continue
+        all_groups.extend(batch_groups)
+        missing_numbers.extend(batch_missing)
 
-    status = f"summarized with `{model}`"
-    if missing:
-        missing_refs = ", ".join(f"#{number}" for number in missing)
+    groups = merge_report_groups(all_groups)
+    status = f"summarized with `{model}` in {len(batches)} batch(es)"
+    if missing_numbers:
+        missing_refs = ", ".join(f"#{number}" for number in missing_numbers)
         status = f"{status}; filled missing PRs in Other: {missing_refs}"
+    if failures:
+        if len(failures) == len(batches):
+            status = f"configured but all {len(batches)} LLM batch(es) fell back after errors: " + "; ".join(failures)
+        else:
+            status = f"{status}; {len(failures)} batch(es) fell back after errors: " + "; ".join(failures)
     return groups, status
 
 
@@ -723,7 +790,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=int_from_env("FILE_FETCH_CONCURRENCY", DEFAULT_FILE_FETCH_CONCURRENCY),
     )
     parser.add_argument("--llm-timeout-seconds", type=int, default=int_from_env("LLM_TIMEOUT_SECONDS", DEFAULT_LLM_TIMEOUT_SECONDS))
-    parser.add_argument("--body-chars", type=int, default=int_from_env("PR_BODY_CHARS", DEFAULT_BODY_CHARS))
+    parser.add_argument("--llm-batch-size", type=int, default=int_from_env("LLM_BATCH_SIZE", DEFAULT_LLM_BATCH_SIZE))
+    parser.add_argument("--llm-max-attempts", type=int, default=int_from_env("LLM_MAX_ATTEMPTS", DEFAULT_LLM_MAX_ATTEMPTS))
+    parser.add_argument("--body-chars", type=int, default=int_from_env("PR_BODY_CHARS", DEFAULT_BODY_CHARS, minimum=0))
     parser.add_argument("--lark-markdown-chars", type=int, default=int_from_env("LARK_MARKDOWN_CHARS", DEFAULT_LARK_MARKDOWN_CHARS))
     parser.add_argument("--recent-hours", type=int, default=int_from_env("RECENT_HOURS", DEFAULT_RECENT_HOURS))
     parser.add_argument("--output", default=os.getenv("REPORT_OUTPUT", DEFAULT_OUTPUT))
@@ -760,6 +829,8 @@ def main(argv: list[str] | None = None) -> int:
             relevant_prs,
             body_chars=args.body_chars,
             timeout_seconds=args.llm_timeout_seconds,
+            batch_size=args.llm_batch_size,
+            max_attempts=args.llm_max_attempts,
         )
     else:
         llm_status = "skipped because no relevant PRs were found"

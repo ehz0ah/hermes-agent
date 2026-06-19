@@ -24,7 +24,7 @@ jobs:
   report:
     if: github.repository == 'ehz0ah/hermes-agent'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -40,7 +40,10 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
-          LLM_TIMEOUT_SECONDS: "120"
+          LLM_TIMEOUT_SECONDS: "180"
+          LLM_BATCH_SIZE: "5"
+          LLM_MAX_ATTEMPTS: "2"
+          PR_BODY_CHARS: "0"
           LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
           LARK_WEBHOOK_URLS: ${{ secrets.LARK_WEBHOOK_URLS }}
         run: |
