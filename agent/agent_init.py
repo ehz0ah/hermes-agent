@@ -33,6 +33,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
+from agent.memory_provider import MemoryTurnContext
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     fetch_model_metadata,
@@ -294,6 +295,30 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    _memory_context_values = {
+        "session_id": session_id or "",
+        "session_key": gateway_session_key or "",
+        "platform": platform or "",
+        "chat_type": chat_type or "",
+        "chat_id": chat_id or "",
+        "chat_name": chat_name or "",
+        "thread_id": thread_id or "",
+        "user_id": user_id or "",
+        "user_id_alt": user_id_alt or "",
+        "user_name": user_name or "",
+    }
+    _memory_context_has_source_identity = any(
+        value
+        for key, value in _memory_context_values.items()
+        if key not in {"session_id", "platform"}
+    )
+    if platform and str(platform).lower() != "cli":
+        _memory_context_has_source_identity = True
+    agent._memory_turn_context = (
+        MemoryTurnContext(**_memory_context_values)
+        if _memory_context_has_source_identity
+        else None
+    )
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy

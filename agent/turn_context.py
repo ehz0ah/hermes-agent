@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.iteration_budget import IterationBudget
+from agent.memory_provider import current_memory_turn_context
 from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
@@ -371,7 +372,13 @@ def build_turn_context(
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            _memory_context = current_memory_turn_context(agent)
+            _prefetch_kwargs = {"session_id": getattr(agent, "session_id", "") or ""}
+            if _memory_context is not None:
+                _prefetch_kwargs["context"] = _memory_context
+            ext_prefetch_cache = (
+                agent._memory_manager.prefetch_all(_query, **_prefetch_kwargs) or ""
+            )
         except Exception:
             pass
 

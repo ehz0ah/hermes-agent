@@ -28,6 +28,7 @@ from agent.display import (
     get_tool_emoji as _get_tool_emoji,
     _detect_tool_failure,
 )
+from agent.memory_provider import current_memory_turn_context
 from agent.tool_guardrails import ToolGuardrailDecision
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
@@ -1035,16 +1036,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             [{"action": next_args.get("action"), "content": next_args.get("content")}]
                             if next_args.get("action") in {"add", "replace"} else []
                         )
+                    _memory_context = current_memory_turn_context(agent)
                     for _op in _mem_ops:
                         try:
+                            _write_kwargs = {
+                                "metadata": agent._build_memory_write_metadata(
+                                    task_id=effective_task_id,
+                                    tool_call_id=getattr(tool_call, "id", None),
+                                )
+                            }
+                            if _memory_context is not None:
+                                _write_kwargs["context"] = _memory_context
                             agent._memory_manager.on_memory_write(
                                 _op.get("action", ""),
                                 target,
                                 _op.get("content", "") or "",
-                                metadata=agent._build_memory_write_metadata(
-                                    task_id=effective_task_id,
-                                    tool_call_id=getattr(tool_call, "id", None),
-                                ),
+                                **_write_kwargs,
                             )
                         except Exception:
                             pass
@@ -1181,6 +1188,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _mem_result = None
             try:
                 def _execute(next_args: dict) -> Any:
+                    _memory_context = current_memory_turn_context(agent)
+                    if _memory_context is not None:
+                        return agent._memory_manager.handle_tool_call(
+                            function_name,
+                            next_args,
+                            context=_memory_context,
+                        )
                     return agent._memory_manager.handle_tool_call(function_name, next_args)
                 function_result, function_args = _run_agent_tool_execution_middleware(
                     agent,

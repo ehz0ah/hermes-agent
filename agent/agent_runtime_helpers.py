@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout
+from agent.memory_provider import current_memory_turn_context
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -1862,23 +1863,38 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                         [{"action": next_args.get("action"), "content": next_args.get("content")}]
                         if next_args.get("action") in {"add", "replace"} else []
                     )
+                _memory_context = current_memory_turn_context(agent)
                 for _op in _mem_ops:
                     try:
+                        _write_kwargs = {
+                            "metadata": agent._build_memory_write_metadata(
+                                task_id=effective_task_id,
+                                tool_call_id=tool_call_id,
+                            )
+                        }
+                        if _memory_context is not None:
+                            _write_kwargs["context"] = _memory_context
                         agent._memory_manager.on_memory_write(
                             _op.get("action", ""),
                             target,
                             _op.get("content", "") or "",
-                            metadata=agent._build_memory_write_metadata(
-                                task_id=effective_task_id,
-                                tool_call_id=tool_call_id,
-                            ),
+                            **_write_kwargs,
                         )
                     except Exception:
                         pass
             return _finish_agent_tool(result, next_args)
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
+            _memory_context = current_memory_turn_context(agent)
+            if _memory_context is not None:
+                result = agent._memory_manager.handle_tool_call(
+                    function_name,
+                    next_args,
+                    context=_memory_context,
+                )
+            else:
+                result = agent._memory_manager.handle_tool_call(function_name, next_args)
+            return _finish_agent_tool(result, next_args)
     elif function_name == "clarify":
         def _execute(next_args: dict) -> Any:
             from tools.clarify_tool import clarify_tool as _clarify_tool

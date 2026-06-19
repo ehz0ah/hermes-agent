@@ -62,6 +62,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+from agent.memory_provider import current_memory_turn_context
 from hermes_constants import get_hermes_home
 
 
@@ -3108,18 +3109,21 @@ class AIAgent:
         if not (user_text and response_text):
             return
         try:
+            memory_context = current_memory_turn_context(self)
             sync_kwargs = {"session_id": self.session_id or ""}
             if messages is not None:
                 sync_kwargs["messages"] = messages
+            if memory_context is not None:
+                sync_kwargs["context"] = memory_context
             self._memory_manager.sync_all(
                 user_text,
                 response_text,
                 **sync_kwargs,
             )
-            self._memory_manager.queue_prefetch_all(
-                user_text,
-                session_id=self.session_id or "",
-            )
+            queue_kwargs = {"session_id": self.session_id or ""}
+            if memory_context is not None:
+                queue_kwargs["context"] = memory_context
+            self._memory_manager.queue_prefetch_all(user_text, **queue_kwargs)
         except Exception:
             pass
 

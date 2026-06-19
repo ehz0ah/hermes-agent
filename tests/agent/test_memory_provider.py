@@ -5,7 +5,7 @@ import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, MemoryTurnContext
 from agent.memory_manager import MemoryManager, inject_memory_provider_tools
 
 # ---------------------------------------------------------------------------
@@ -92,6 +92,59 @@ class MessagesMemoryProvider(FakeMemoryProvider):
         self.synced_turns.append((user_content, assistant_content, session_id, messages))
 
 
+class ContextMemoryProvider(FakeMemoryProvider):
+    """Provider that opts into the generic memory turn context."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.prefetch_contexts = []
+        self.queue_contexts = []
+        self.sync_contexts = []
+        self.tool_contexts = []
+        self.write_contexts = []
+
+    def prefetch(self, query, *, session_id="", context=None):
+        self.prefetch_queries.append((query, session_id))
+        self.prefetch_contexts.append(context)
+        return self._prefetch_result
+
+    def queue_prefetch(self, query, *, session_id="", context=None):
+        self.queued_prefetches.append((query, session_id))
+        self.queue_contexts.append(context)
+
+    def sync_turn(
+        self,
+        user_content,
+        assistant_content,
+        *,
+        session_id="",
+        messages=None,
+        context=None,
+    ):
+        self.synced_turns.append((user_content, assistant_content, session_id, messages))
+        self.sync_contexts.append(context)
+
+    def handle_tool_call(self, tool_name, args, **kwargs):
+        self.tool_contexts.append(kwargs.get("context"))
+        return json.dumps({"handled": tool_name, "args": args})
+
+    def on_memory_write(self, action, target, content, metadata=None, context=None):
+        self.memory_writes.append((action, target, content, metadata or {}))
+        self.write_contexts.append(context)
+
+
+class ContextOnlyMemoryWriteProvider(FakeMemoryProvider):
+    """Provider that accepts write context without accepting metadata."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.write_contexts = []
+
+    def on_memory_write(self, action, target, content, *, context=None):
+        self.memory_writes.append((action, target, content))
+        self.write_contexts.append(context)
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider ABC tests
 # ---------------------------------------------------------------------------
@@ -120,6 +173,25 @@ class TestMemoryProviderABC:
         p.queue_prefetch("query")
         p.sync_turn("user", "assistant")
         p.shutdown()
+
+    def test_memory_turn_context_is_plain_source_identity(self):
+        ctx = MemoryTurnContext(
+            session_id="sess-1",
+            session_key="telegram:group:123",
+            platform="telegram",
+            chat_type="group",
+            chat_id="-100123",
+            thread_id="topic-7",
+            user_id="alice-platform-id",
+            user_id_alt="alice-stable-alt",
+            user_name="Alice",
+            message_id="msg-9",
+        )
+
+        assert ctx.session_id == "sess-1"
+        assert ctx.platform == "telegram"
+        assert ctx.chat_id == "-100123"
+        assert ctx.user_id_alt == "alice-stable-alt"
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +330,91 @@ class TestMemoryManager:
         mgr.sync_all("user msg", "assistant msg", session_id="sess-1", messages=messages)
         mgr.flush_pending(timeout=5)
         assert p.synced_turns == [("user msg", "assistant msg", "sess-1", messages)]
+
+    def test_context_passed_to_opted_in_provider_hooks(self):
+        mgr = MemoryManager()
+        p = ContextMemoryProvider(
+            "external",
+            tools=[{"name": "ext_tool", "description": "External", "parameters": {}}],
+        )
+        p._prefetch_result = "ctx memory"
+        mgr.add_provider(p)
+        ctx = MemoryTurnContext(
+            session_id="sess-1",
+            session_key="discord:channel:c1",
+            platform="discord",
+            chat_type="channel",
+            chat_id="c1",
+            user_id="u1",
+            user_name="Alice",
+            message_id="m1",
+        )
+
+        assert mgr.prefetch_all("query", session_id="sess-1", context=ctx) == "ctx memory"
+        mgr.queue_prefetch_all("next turn", session_id="sess-1", context=ctx)
+        mgr.sync_all(
+            "user msg",
+            "assistant msg",
+            session_id="sess-1",
+            messages=[{"role": "user", "content": "user msg"}],
+            context=ctx,
+        )
+        mgr.flush_pending(timeout=5)
+        result = json.loads(mgr.handle_tool_call("ext_tool", {"q": "test"}, context=ctx))
+        mgr.on_memory_write(
+            "add",
+            "memory",
+            "new fact",
+            metadata={"write_origin": "assistant_tool"},
+            context=ctx,
+        )
+
+        assert result["handled"] == "ext_tool"
+        assert p.prefetch_contexts == [ctx]
+        assert p.queue_contexts == [ctx]
+        assert p.sync_contexts == [ctx]
+        assert p.tool_contexts == [ctx]
+        assert p.write_contexts == [ctx]
+
+    def test_context_does_not_break_legacy_fixed_signature_providers(self):
+        mgr = MemoryManager()
+        p = FakeMemoryProvider(
+            "external",
+            tools=[{"name": "legacy_tool", "description": "External", "parameters": {}}],
+        )
+        p._prefetch_result = "legacy memory"
+        mgr.add_provider(p)
+        ctx = MemoryTurnContext(session_id="sess-legacy", platform="telegram")
+
+        assert mgr.prefetch_all("query", session_id="sess-legacy", context=ctx) == "legacy memory"
+        mgr.queue_prefetch_all("next turn", session_id="sess-legacy", context=ctx)
+        mgr.sync_all("user msg", "assistant msg", session_id="sess-legacy", context=ctx)
+        mgr.flush_pending(timeout=5)
+        result = json.loads(mgr.handle_tool_call("legacy_tool", {"q": "test"}, context=ctx))
+        mgr.on_memory_write("add", "memory", "new fact", context=ctx)
+
+        assert result["handled"] == "legacy_tool"
+        assert p.prefetch_queries == ["query"]
+        assert p.queued_prefetches == ["next turn"]
+        assert p.synced_turns == [("user msg", "assistant msg")]
+        assert p.memory_writes == [("add", "memory", "new fact")]
+
+    def test_memory_write_context_does_not_require_metadata_support(self):
+        mgr = MemoryManager()
+        p = ContextOnlyMemoryWriteProvider("external")
+        mgr.add_provider(p)
+        ctx = MemoryTurnContext(session_id="sess-context-only", platform="telegram")
+
+        mgr.on_memory_write(
+            "add",
+            "memory",
+            "new fact",
+            metadata={"write_origin": "assistant_tool"},
+            context=ctx,
+        )
+
+        assert p.memory_writes == [("add", "memory", "new fact")]
+        assert p.write_contexts == [ctx]
 
     def test_sync_all_omits_messages_for_legacy_provider(self):
         mgr = MemoryManager()

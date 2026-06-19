@@ -92,6 +92,35 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert provider.init_kwargs["platform"] == "feishu"
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
+    assert agent._memory_turn_context.session_id == "sess-alt"
+    assert agent._memory_turn_context.platform == "feishu"
+    assert agent._memory_turn_context.user_id == "open-id"
+    assert agent._memory_turn_context.user_id_alt == "union-id"
+
+
+def test_cli_platform_alone_does_not_create_memory_turn_context():
+    cfg = {"memory": {"provider": ""}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_id="cli-session",
+            platform="cli",
+        )
+
+    assert agent._memory_turn_context is None
 
 
 class CoreShadowProvider:

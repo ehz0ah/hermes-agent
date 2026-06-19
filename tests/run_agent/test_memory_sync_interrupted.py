@@ -21,6 +21,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent.memory_provider import MemoryTurnContext
+
 
 def _bare_agent():
     """Build an ``AIAgent`` with only the attributes
@@ -128,6 +130,38 @@ class TestSyncExternalMemoryForTurn:
             "tests passed",
             session_id="test_session_001",
             messages=messages,
+        )
+
+    def test_completed_turn_threads_memory_context_with_current_session(self):
+        agent = _bare_agent()
+        agent._memory_turn_context = MemoryTurnContext(
+            session_id="stale-session",
+            session_key="telegram:group:g1",
+            platform="telegram",
+            chat_type="group",
+            chat_id="g1",
+            user_id="u1",
+        )
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="remember this",
+            final_response="noted",
+            interrupted=False,
+        )
+
+        expected_context = agent._memory_turn_context.with_session_id(
+            "test_session_001"
+        )
+        agent._memory_manager.sync_all.assert_called_once_with(
+            "remember this",
+            "noted",
+            session_id="test_session_001",
+            context=expected_context,
+        )
+        agent._memory_manager.queue_prefetch_all.assert_called_once_with(
+            "remember this",
+            session_id="test_session_001",
+            context=expected_context,
         )
 
     def test_completed_skill_turn_keeps_original_message_for_memory_manager(self):

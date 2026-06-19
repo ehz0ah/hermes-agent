@@ -32,7 +32,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, MemoryTurnContext
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 
@@ -432,6 +432,18 @@ class MemoryManager:
     # -- Prefetch / recall ---------------------------------------------------
 
     @staticmethod
+    def _call_accepts_keyword(method: Any, keyword: str) -> bool:
+        """Return whether ``method`` can receive ``keyword`` safely."""
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            return True
+        params = list(signature.parameters.values())
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+            return True
+        return keyword in signature.parameters
+
+    @staticmethod
     def _strip_skill_scaffolding(text: str) -> Optional[str]:
         """Return memory-worthy user text, or None to skip the turn.
 
@@ -449,7 +461,13 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+    def prefetch_all(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> str:
         """Collect prefetch context from all providers.
 
         Returns merged context text labeled by provider. Empty providers
@@ -461,7 +479,12 @@ class MemoryManager:
         parts = []
         for provider in self._providers:
             try:
-                result = provider.prefetch(clean_query, session_id=session_id)
+                kwargs: Dict[str, Any] = {"session_id": session_id}
+                if context is not None and self._call_accepts_keyword(
+                    provider.prefetch, "context"
+                ):
+                    kwargs["context"] = context
+                result = provider.prefetch(clean_query, **kwargs)
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -471,7 +494,13 @@ class MemoryManager:
                 )
         return "\n\n".join(parts)
 
-    def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch_all(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> None:
         """Queue background prefetch on all providers for the next turn.
 
         Provider work is dispatched to a background worker so a slow or
@@ -489,7 +518,12 @@ class MemoryManager:
         def _run() -> None:
             for provider in providers:
                 try:
-                    provider.queue_prefetch(clean_query, session_id=session_id)
+                    kwargs: Dict[str, Any] = {"session_id": session_id}
+                    if context is not None and self._call_accepts_keyword(
+                        provider.queue_prefetch, "context"
+                    ):
+                        kwargs["context"] = context
+                    provider.queue_prefetch(clean_query, **kwargs)
                 except Exception as e:
                     logger.debug(
                         "Memory provider '%s' queue_prefetch failed (non-fatal): %s",
@@ -519,6 +553,7 @@ class MemoryManager:
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Sync a completed turn to all providers.
 
@@ -549,19 +584,18 @@ class MemoryManager:
         def _run() -> None:
             for provider in providers:
                 try:
+                    kwargs: Dict[str, Any] = {"session_id": session_id}
                     if messages is not None and self._provider_sync_accepts_messages(provider):
-                        provider.sync_turn(
-                            user_content,
-                            assistant_content,
-                            session_id=session_id,
-                            messages=messages,
-                        )
-                    else:
-                        provider.sync_turn(
-                            user_content,
-                            assistant_content,
-                            session_id=session_id,
-                        )
+                        kwargs["messages"] = messages
+                    if context is not None and self._call_accepts_keyword(
+                        provider.sync_turn, "context"
+                    ):
+                        kwargs["context"] = context
+                    provider.sync_turn(
+                        user_content,
+                        assistant_content,
+                        **kwargs,
+                    )
                 except Exception as e:
                     logger.warning(
                         "Memory provider '%s' sync_turn failed: %s",
@@ -691,7 +725,13 @@ class MemoryManager:
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
         try:
-            return provider.handle_tool_call(tool_name, args, **kwargs)
+            provider_kwargs = dict(kwargs)
+            if (
+                "context" in provider_kwargs
+                and not self._call_accepts_keyword(provider.handle_tool_call, "context")
+            ):
+                provider_kwargs.pop("context", None)
+            return provider.handle_tool_call(tool_name, args, **provider_kwargs)
         except Exception as e:
             logger.error(
                 "Memory provider '%s' handle_tool_call(%s) failed: %s",
@@ -807,15 +847,17 @@ class MemoryManager:
         if "metadata" in signature.parameters:
             return "keyword"
 
-        accepted = [
+        accepted_positional = [
             p for p in params
             if p.kind in {
                 inspect.Parameter.POSITIONAL_ONLY,
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
             }
         ]
-        if len(accepted) >= 4:
+        if (
+            len(accepted_positional) >= 4
+            and accepted_positional[3].name != "context"
+        ):
             return "positional"
         return "legacy"
 
@@ -825,6 +867,7 @@ class MemoryManager:
         target: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Notify external providers when the built-in memory tool writes.
 
@@ -835,14 +878,26 @@ class MemoryManager:
                 continue
             try:
                 metadata_mode = self._provider_memory_write_metadata_mode(provider)
+                accepts_context = (
+                    context is not None
+                    and self._call_accepts_keyword(provider.on_memory_write, "context")
+                )
+                kwargs: Dict[str, Any] = {}
+                if accepts_context:
+                    kwargs["context"] = context
                 if metadata_mode == "keyword":
-                    provider.on_memory_write(
-                        action, target, content, metadata=dict(metadata or {})
-                    )
+                    kwargs["metadata"] = dict(metadata or {})
+                    provider.on_memory_write(action, target, content, **kwargs)
                 elif metadata_mode == "positional":
-                    provider.on_memory_write(action, target, content, dict(metadata or {}))
+                    provider.on_memory_write(
+                        action,
+                        target,
+                        content,
+                        dict(metadata or {}),
+                        **kwargs,
+                    )
                 else:
-                    provider.on_memory_write(action, target, content)
+                    provider.on_memory_write(action, target, content, **kwargs)
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_memory_write failed: %s",

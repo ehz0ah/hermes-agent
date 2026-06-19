@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
+from agent.memory_provider import MemoryTurnContext
 from agent.turn_context import TurnContext, build_turn_context
 
 
@@ -30,6 +31,19 @@ class _FakeGuardrails:
 
     def reset_for_turn(self):
         self.reset_called = True
+
+
+class _RecordingMemoryManager:
+    def __init__(self):
+        self.turn_starts = []
+        self.prefetch_calls = []
+
+    def on_turn_start(self, turn_number, message, **kwargs):
+        self.turn_starts.append((turn_number, message, kwargs))
+
+    def prefetch_all(self, query, **kwargs):
+        self.prefetch_calls.append((query, kwargs))
+        return "prefetched memory"
 
 
 class _FakeAgent:
@@ -185,3 +199,27 @@ def test_no_review_when_memory_disabled():
     agent = _FakeAgent()
     ctx = _build(agent)
     assert ctx.should_review_memory is False
+
+
+def test_memory_prefetch_receives_turn_context():
+    agent = _FakeAgent()
+    manager = _RecordingMemoryManager()
+    context = MemoryTurnContext(
+        session_id="sess-1",
+        session_key="telegram:group:g1",
+        platform="telegram",
+        chat_type="group",
+        chat_id="g1",
+        user_id="u1",
+        message_id="m1",
+    )
+    agent._memory_manager = manager
+    agent._memory_turn_context = context
+
+    ctx = _build(agent)
+
+    assert ctx.ext_prefetch_cache == "prefetched memory"
+    assert manager.turn_starts == [(1, "hello", {})]
+    assert manager.prefetch_calls == [
+        ("hello", {"session_id": "sess-1", "context": context})
+    ]

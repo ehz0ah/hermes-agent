@@ -34,9 +34,46 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MemoryTurnContext:
+    """Source identity attached to a single memory-provider turn.
+
+    This object intentionally carries raw Hermes/gateway identity only.
+    Provider-specific namespace decisions, such as OpenViking user or peer
+    derivation, stay inside the provider that owns that backend contract.
+    """
+
+    session_id: str = ""
+    session_key: str = ""
+    platform: str = ""
+    chat_type: str = ""
+    chat_id: str = ""
+    chat_name: str = ""
+    thread_id: str = ""
+    user_id: str = ""
+    user_id_alt: str = ""
+    user_name: str = ""
+    message_id: str = ""
+
+    def with_session_id(self, session_id: str) -> "MemoryTurnContext":
+        """Return a copy scoped to the current runtime session_id."""
+        if not session_id or session_id == self.session_id:
+            return self
+        return replace(self, session_id=session_id)
+
+
+def current_memory_turn_context(owner: Any) -> Optional[MemoryTurnContext]:
+    """Return ``owner``'s memory context scoped to its active session_id."""
+    context = getattr(owner, "_memory_turn_context", None)
+    if context is None:
+        return None
+    return context.with_session_id(getattr(owner, "session_id", "") or "")
 
 
 class MemoryProvider(ABC):
@@ -90,7 +127,13 @@ class MemoryProvider(ABC):
         """
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> str:
         """Recall relevant context for the upcoming turn.
 
         Called before each API call. Return formatted text to inject as
@@ -101,10 +144,20 @@ class MemoryProvider(ABC):
         session_id is provided for providers serving concurrent sessions
         (gateway group chats, cached agents). Providers that don't need
         per-session scoping can ignore it.
+
+        context carries the source identity for the turn when Hermes has one
+        (gateway sessions, threaded chats, etc.). Providers that don't need
+        per-source routing can ignore it.
         """
         return ""
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> None:
         """Queue a background recall for the NEXT turn.
 
         Called after each turn completes. The result will be consumed
@@ -119,6 +172,7 @@ class MemoryProvider(ABC):
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Persist a completed turn to the backend.
 
@@ -128,6 +182,9 @@ class MemoryProvider(ABC):
         ``messages`` is the OpenAI-style conversation message list as of the
         completed turn, including any assistant tool calls and tool results.
         Providers that do not need raw turn context can ignore it.
+
+        ``context`` carries source identity for providers that need to route
+        memory by gateway user, chat, thread, or other turn-level metadata.
         """
 
     @abstractmethod
@@ -282,6 +339,7 @@ class MemoryProvider(ABC):
         target: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Called when the built-in memory tool writes an entry.
 
@@ -291,6 +349,7 @@ class MemoryProvider(ABC):
         metadata: structured provenance for the write, when available. Common
           keys include ``write_origin``, ``execution_context``, ``session_id``,
           ``parent_session_id``, ``platform``, and ``tool_name``.
+        context: source identity for the turn that produced the write.
 
         Use to mirror built-in memory writes to your backend.
         """
