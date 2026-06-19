@@ -2,11 +2,13 @@ import json
 import os
 import stat
 import zipfile
+from hashlib import sha256
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from agent.memory_provider import MemoryTurnContext
 import plugins.memory.openviking as openviking_module
 from plugins.memory.openviking import (
     OpenVikingMemoryProvider,
@@ -33,6 +35,8 @@ def _clear_openviking_env(monkeypatch):
         "OPENVIKING_ACCOUNT",
         "OPENVIKING_USER",
         "OPENVIKING_AGENT",
+        "OPENVIKING_IDENTITY_MODE",
+        "OPENVIKING_GATEWAY_NAMESPACE_MODE",
         "OPENVIKING_CLI_CONFIG_FILE",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -78,6 +82,54 @@ def _allow_setup_validation(monkeypatch, *, root_access: bool = False):
         ),
         raising=False,
     )
+
+
+def _short_hash(value: str) -> str:
+    return sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _gateway_context(
+    *,
+    user_id: str = "telegram-user-111",
+    user_id_alt: str = "telegram-stable-111",
+    chat_id: str = "-100123456",
+    thread_id: str = "topic-7",
+) -> MemoryTurnContext:
+    return MemoryTurnContext(
+        session_id="gw-session",
+        session_key="agent:main:telegram:group:-100123456",
+        platform="telegram",
+        chat_type="group",
+        chat_id=chat_id,
+        thread_id=thread_id,
+        user_id=user_id,
+        user_id_alt=user_id_alt,
+        user_name="Alice",
+        message_id="message-9",
+    )
+
+
+def _gateway_scope(ctx: MemoryTurnContext) -> str:
+    scope = f"{ctx.platform}_{ctx.chat_type}_{_short_hash(ctx.chat_id)}"
+    if ctx.thread_id:
+        scope += f"_thread_{_short_hash(ctx.thread_id)}"
+    return scope
+
+
+def _single_user_human_peer(ctx: MemoryTurnContext) -> str:
+    return f"{_gateway_scope(ctx)}_user_{_short_hash(ctx.user_id_alt or ctx.user_id)}"
+
+
+def _single_user_assistant_peer(ctx: MemoryTurnContext, agent: str = "hermes") -> str:
+    return f"{_gateway_scope(ctx)}_assistant_{_short_hash(agent)}"
+
+
+def _per_group_user(ctx: MemoryTurnContext) -> str:
+    return f"hermes_{_gateway_scope(ctx)}"
+
+
+def _per_group_human_peer(ctx: MemoryTurnContext) -> str:
+    return f"{ctx.platform}_user_{_short_hash(ctx.user_id_alt or ctx.user_id)}"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
@@ -140,6 +192,8 @@ def test_linked_ovcli_config_is_read_at_runtime(tmp_path, monkeypatch):
         "account": "",
         "user": "",
         "agent": "agent-one",
+        "identity_mode": "personal",
+        "gateway_namespace_mode": "single_user",
     }
 
     ovcli_path.write_text(
@@ -159,6 +213,8 @@ def test_linked_ovcli_config_is_read_at_runtime(tmp_path, monkeypatch):
         "account": "",
         "user": "",
         "agent": "agent-two",
+        "identity_mode": "personal",
+        "gateway_namespace_mode": "single_user",
     }
 
 
@@ -192,6 +248,8 @@ def test_openviking_env_overrides_linked_ovcli_config(tmp_path, monkeypatch):
         "account": "env-account",
         "user": "env-user",
         "agent": "env-agent",
+        "identity_mode": "personal",
+        "gateway_namespace_mode": "single_user",
     }
 
 
@@ -2267,6 +2325,210 @@ def test_sync_turn_structured_messages_include_assistant_peer_id():
     )]
 
 
+def test_gateway_single_user_sync_threads_human_and_group_scoped_assistant_peer():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://test"
+    provider._api_key = "user-key"
+    provider._account = ""
+    provider._user = ""
+    provider._agent = "hermes"
+    provider._identity_mode = "gateway"
+    provider._gateway_namespace_mode = "single_user"
+    provider._session_id = "sid-gateway"
+    ctx = _gateway_context()
+    human_peer = _single_user_human_peer(ctx)
+    assistant_peer = _single_user_assistant_peer(ctx)
+
+    client_inits = []
+    captured = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key="", **kwargs):
+            client_inits.append((endpoint, api_key, kwargs))
+
+        def post(self, path, payload=None, **kwargs):
+            captured.append((path, payload))
+            return {}
+
+    import plugins.memory.openviking as _mod
+
+    real_client_cls = _mod._VikingClient
+    _mod._VikingClient = StubClient
+    try:
+        provider.sync_turn(
+            "I prefer bullet summaries.",
+            "Noted.",
+            messages=[
+                {"role": "user", "content": "I prefer bullet summaries."},
+                {"role": "assistant", "content": "Noted."},
+            ],
+            context=ctx,
+        )
+        assert provider._drain_writers("sid-gateway", timeout=2.0)
+    finally:
+        _mod._VikingClient = real_client_cls
+
+    assert client_inits == [(
+        "http://test",
+        "user-key",
+        {
+            "account": "",
+            "user": "",
+            "agent": human_peer,
+            "force_tenant_headers": False,
+        },
+    )]
+    assert captured == [(
+        "/api/v1/sessions/sid-gateway/messages/batch",
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "I prefer bullet summaries."}],
+                    "peer_id": human_peer,
+                },
+                {
+                    "role": "assistant",
+                    "parts": [{"type": "text", "text": "Noted."}],
+                    "peer_id": assistant_peer,
+                },
+            ]
+        },
+    )]
+
+
+def test_gateway_per_group_sync_uses_derived_user_and_trusted_headers():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://test"
+    provider._api_key = "root-key"
+    provider._account = "acct"
+    provider._user = "configured-user"
+    provider._agent = "hermes"
+    provider._identity_mode = "gateway"
+    provider._gateway_namespace_mode = "per_group"
+    provider._session_id = "sid-trusted"
+    ctx = _gateway_context()
+    derived_user = _per_group_user(ctx)
+    human_peer = _per_group_human_peer(ctx)
+
+    client_inits = []
+    captured = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key="", **kwargs):
+            client_inits.append((endpoint, api_key, kwargs))
+
+        def post(self, path, payload=None, **kwargs):
+            captured.append((path, payload))
+            return {}
+
+    import plugins.memory.openviking as _mod
+
+    real_client_cls = _mod._VikingClient
+    _mod._VikingClient = StubClient
+    try:
+        provider.sync_turn("Alice fact", "ok", context=ctx)
+        assert provider._drain_writers("sid-trusted", timeout=2.0)
+    finally:
+        _mod._VikingClient = real_client_cls
+
+    assert client_inits == [(
+        "http://test",
+        "root-key",
+        {
+            "account": "acct",
+            "user": derived_user,
+            "agent": human_peer,
+            "force_tenant_headers": True,
+        },
+    )]
+    assert captured == [(
+        "/api/v1/sessions/sid-trusted/messages/batch",
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "Alice fact"}],
+                    "peer_id": human_peer,
+                },
+                {
+                    "role": "assistant",
+                    "parts": [{"type": "text", "text": "ok"}],
+                    "peer_id": "hermes",
+                },
+            ]
+        },
+    )]
+
+
+def test_gateway_per_group_commit_uses_derived_turn_identity():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://test"
+    provider._api_key = "root-key"
+    provider._account = "acct"
+    provider._user = "configured-user"
+    provider._agent = "hermes"
+    provider._identity_mode = "gateway"
+    provider._gateway_namespace_mode = "per_group"
+    provider._session_id = "sid-trusted-commit"
+    ctx = _gateway_context()
+    derived_user = _per_group_user(ctx)
+    human_peer = _per_group_human_peer(ctx)
+
+    client_inits = []
+    posts = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key="", **kwargs):
+            client_inits.append((endpoint, api_key, kwargs))
+
+        def post(self, path, payload=None, **kwargs):
+            posts.append((path, payload))
+            return {}
+
+    import plugins.memory.openviking as _mod
+
+    real_client_cls = _mod._VikingClient
+    _mod._VikingClient = StubClient
+    try:
+        provider.sync_turn("Alice fact", "ok", context=ctx)
+        assert provider._drain_writers("sid-trusted-commit", timeout=2.0)
+        provider.on_session_end([])
+    finally:
+        _mod._VikingClient = real_client_cls
+
+    expected_sync_init = (
+        "http://test",
+        "root-key",
+        {
+            "account": "acct",
+            "user": derived_user,
+            "agent": human_peer,
+            "force_tenant_headers": True,
+        },
+    )
+    expected_commit_init = (
+        "http://test",
+        "root-key",
+        {
+            "account": "acct",
+            "user": derived_user,
+            "agent": "",
+            "force_tenant_headers": True,
+        },
+    )
+    assert client_inits == [expected_sync_init, expected_commit_init]
+    assert posts[0][0] == "/api/v1/sessions/sid-trusted-commit/messages/batch"
+    assert posts[1] == (
+        "/api/v1/sessions/sid-trusted-commit/commit",
+        {"keep_recent_count": 0},
+    )
+    assert provider._session_identity("sid-trusted-commit") is None
+
+
 def test_sync_turn_noop_when_session_id_blank():
     provider = OpenVikingMemoryProvider()
     provider._client = MagicMock()
@@ -2637,6 +2899,139 @@ def test_on_memory_write_uses_content_write_independent_of_session_rotation():
     )
 
 
+def test_gateway_on_memory_write_targets_active_human_peer():
+    import threading
+
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://test"
+    provider._api_key = "user-key"
+    provider._account = ""
+    provider._user = ""
+    provider._agent = "hermes"
+    provider._identity_mode = "gateway"
+    provider._gateway_namespace_mode = "single_user"
+    ctx = _gateway_context()
+    human_peer = _single_user_human_peer(ctx)
+
+    done = threading.Event()
+    captured = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key="", **kwargs):
+            captured.append(("init", endpoint, api_key, kwargs))
+
+        def post(self, path, payload=None, **kwargs):
+            captured.append(("post", path, payload))
+            done.set()
+            return {}
+
+    import plugins.memory.openviking as _mod
+
+    real_client_cls = _mod._VikingClient
+    _mod._VikingClient = StubClient
+    try:
+        provider.on_memory_write(
+            "add",
+            "user",
+            "Alice prefers bullets",
+            context=ctx,
+        )
+        assert done.wait(timeout=2.0), "memory write worker never posted"
+    finally:
+        _mod._VikingClient = real_client_cls
+
+    assert captured[0] == (
+        "init",
+        "http://test",
+        "user-key",
+        {
+            "account": "",
+            "user": "",
+            "agent": human_peer,
+            "force_tenant_headers": False,
+        },
+    )
+    assert captured[1][0:2] == ("post", "/api/v1/content/write")
+    assert captured[1][2]["content"] == "Alice prefers bullets"
+    assert captured[1][2]["uri"].startswith(
+        f"viking://user/peers/{human_peer}/memories/preferences/mem_"
+    )
+
+
+def test_gateway_viking_remember_requires_active_human_peer():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._identity_mode = "gateway"
+    provider._gateway_namespace_mode = "single_user"
+    ctx = _gateway_context(user_id="", user_id_alt="")
+
+    result = json.loads(provider.handle_tool_call(
+        "viking_remember",
+        {"content": "orphan fact", "category": "preference"},
+        context=ctx,
+    ))
+
+    assert result["error"]
+    assert "stable OpenViking human peer" in result["error"]
+    provider._client.post.assert_not_called()
+
+
+def test_gateway_viking_remember_writes_to_active_human_peer():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://test"
+    provider._api_key = "user-key"
+    provider._account = ""
+    provider._user = ""
+    provider._agent = "hermes"
+    provider._identity_mode = "gateway"
+    provider._gateway_namespace_mode = "single_user"
+    ctx = _gateway_context()
+    human_peer = _single_user_human_peer(ctx)
+
+    captured = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key="", **kwargs):
+            captured.append(("init", endpoint, api_key, kwargs))
+
+        def post(self, path, payload=None, **kwargs):
+            captured.append(("post", path, payload))
+            return {"result": {"written_bytes": 17}}
+
+    import plugins.memory.openviking as _mod
+
+    real_client_cls = _mod._VikingClient
+    _mod._VikingClient = StubClient
+    try:
+        result = json.loads(provider.handle_tool_call(
+            "viking_remember",
+            {"content": "Alice prefers bullets", "category": "preference"},
+            context=ctx,
+        ))
+    finally:
+        _mod._VikingClient = real_client_cls
+
+    assert result["status"] == "stored"
+    assert captured[0] == (
+        "init",
+        "http://test",
+        "user-key",
+        {
+            "account": "",
+            "user": "",
+            "agent": human_peer,
+            "force_tenant_headers": False,
+        },
+    )
+    _, path, payload = captured[1]
+    assert path == "/api/v1/content/write"
+    assert payload["uri"].startswith(
+        f"viking://user/peers/{human_peer}/memories/preferences/mem_"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Prefetch staleness: a prefetch worker that finishes AFTER a session switch
 # must drop its result instead of repopulating the new session with stale
@@ -2728,3 +3123,53 @@ def test_queue_prefetch_sends_limit_not_legacy_top_k():
 
     assert captured_payloads == [{"query": "anything", "limit": 5}]
     assert "top_k" not in captured_payloads[0]
+
+
+def test_gateway_prefetch_isolated_by_active_human_peer():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://test"
+    provider._api_key = "user-key"
+    provider._account = ""
+    provider._user = ""
+    provider._agent = "hermes"
+    provider._identity_mode = "gateway"
+    provider._gateway_namespace_mode = "single_user"
+    alice = _gateway_context(user_id="alice", user_id_alt="alice-stable")
+    bob = _gateway_context(user_id="bob", user_id_alt="bob-stable")
+    alice_peer = _single_user_human_peer(alice)
+
+    captured_inits = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key="", **kwargs):
+            captured_inits.append(kwargs)
+
+        def post(self, path, payload=None, **kwargs):
+            return {
+                "result": {
+                    "memories": [
+                        {
+                            "uri": f"viking://user/peers/{alice_peer}/memories/preferences/mem_1.md",
+                            "score": 0.91,
+                            "abstract": "Alice prefers bullets",
+                        },
+                    ],
+                    "resources": [],
+                }
+            }
+
+    import plugins.memory.openviking as _mod
+
+    real_client_cls = _mod._VikingClient
+    _mod._VikingClient = StubClient
+    try:
+        provider.queue_prefetch("summaries", context=alice)
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=2.0)
+    finally:
+        _mod._VikingClient = real_client_cls
+
+    assert captured_inits[0]["agent"] == alice_peer
+    assert provider.prefetch("summaries", context=bob) == ""
+    assert "Alice prefers bullets" in provider.prefetch("summaries", context=alice)

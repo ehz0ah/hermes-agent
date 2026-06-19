@@ -26,6 +26,7 @@ Capabilities:
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import mimetypes
@@ -46,7 +47,7 @@ from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 from agent.message_content import flatten_message_text
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, MemoryTurnContext
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 from utils import atomic_json_write, env_var_enabled
@@ -66,6 +67,8 @@ _OPENVIKING_ENV_KEYS = (
     "OPENVIKING_ACCOUNT",
     "OPENVIKING_USER",
     "OPENVIKING_AGENT",
+    "OPENVIKING_IDENTITY_MODE",
+    "OPENVIKING_GATEWAY_NAMESPACE_MODE",
 )
 _TIMEOUT = 30.0
 _SESSION_DRAIN_TIMEOUT = 10.0
@@ -96,6 +99,11 @@ _LOCAL_OPENVIKING_AUTOSTART_TIMEOUT = 60.0
 _OPENVIKING_SERVER_LOG_RELATIVE_PATH = Path("logs") / "openviking-server.log"
 _OPENVIKING_RESPONDED_FAILURE_PREFIX = "OpenViking server responded"
 _SETUP_CANCELLED = object()
+_IDENTITY_MODE_PERSONAL = "personal"
+_IDENTITY_MODE_GATEWAY = "gateway"
+_GATEWAY_NAMESPACE_SINGLE_USER = "single_user"
+_GATEWAY_NAMESPACE_PER_GROUP = "per_group"
+_DEFAULT_PREFETCH_KEY = "__default__"
 
 
 @dataclass(frozen=True)
@@ -106,6 +114,19 @@ class _OvcliProfile:
     data: dict
     values: dict
     is_active: bool = False
+
+
+@dataclass(frozen=True)
+class _OpenVikingTurnIdentity:
+    mode: str
+    namespace_mode: str
+    account: str
+    user: str
+    actor_peer: str
+    human_peer: str
+    assistant_peer: str
+    force_tenant_headers: bool
+    prefetch_key: str
 
 
 class _OpenVikingHTTPError(RuntimeError):
@@ -212,7 +233,8 @@ class _VikingClient:
 
     def __init__(self, endpoint: str, api_key: str = "",
                  account: Optional[str] = None, user: Optional[str] = None,
-                 agent: Optional[str] = None):
+                 agent: Optional[str] = None,
+                 force_tenant_headers: Optional[bool] = None):
         self._endpoint = endpoint.rstrip("/")
         self._api_key = api_key
         # Account/user are local/trusted-mode tenant identity. API-key requests
@@ -221,13 +243,18 @@ class _VikingClient:
         self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "default")
         self._user = user or os.environ.get("OPENVIKING_USER", "default")
         self._agent = agent if agent is not None else os.environ.get("OPENVIKING_AGENT", _DEFAULT_AGENT)
+        self._force_tenant_headers = force_tenant_headers
         self._httpx = _get_httpx()
         if self._httpx is None:
             raise ImportError("httpx is required for OpenViking: pip install httpx")
 
     def _headers(self, *, include_tenant: bool | None = None) -> dict:
         if include_tenant is None:
-            include_tenant = not bool(self._api_key)
+            include_tenant = (
+                self._force_tenant_headers
+                if self._force_tenant_headers is not None
+                else not bool(self._api_key)
+            )
 
         h = {"Content-Type": "application/json"}
         if self._agent:
@@ -775,6 +802,60 @@ def _first_nonempty(*values: Optional[str], default: str = "") -> str:
     return default
 
 
+def _normalize_identity_mode(value: Any) -> str:
+    mode = _clean_config_value(value).lower()
+    if mode in {_IDENTITY_MODE_PERSONAL, _IDENTITY_MODE_GATEWAY}:
+        return mode
+    return _IDENTITY_MODE_PERSONAL
+
+
+def _normalize_gateway_namespace_mode(value: Any) -> str:
+    mode = _clean_config_value(value).lower()
+    if mode in {_GATEWAY_NAMESPACE_SINGLE_USER, _GATEWAY_NAMESPACE_PER_GROUP}:
+        return mode
+    return _GATEWAY_NAMESPACE_SINGLE_USER
+
+
+def _hash_identifier(value: Any) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _safe_identity_label(value: Any, *, default: str) -> str:
+    raw = str(value or "").strip().lower()
+    chars = [ch if ch.isascii() and ch.isalnum() else "_" for ch in raw]
+    label = re.sub(r"_+", "_", "".join(chars)).strip("_")
+    return label or default
+
+
+def _validate_generated_identifier(value: str, *, field: str) -> str:
+    ok, message, normalized = _validate_openviking_identity_value(value, field="user")
+    if ok:
+        return normalized
+    raise ValueError(f"Derived OpenViking {field} is invalid: {message}")
+
+
+def _gateway_scope_from_context(context: MemoryTurnContext) -> str:
+    platform = _safe_identity_label(context.platform, default="gateway")
+    chat_type = _safe_identity_label(context.chat_type, default="chat")
+    chat_key = context.chat_id or context.session_key or context.session_id
+    if not chat_key:
+        raise ValueError("OpenViking gateway mode requires a stable chat/session id.")
+    scope = f"{platform}_{chat_type}_{_hash_identifier(chat_key)}"
+    if context.thread_id:
+        scope += f"_thread_{_hash_identifier(context.thread_id)}"
+    return _validate_generated_identifier(scope, field="scope")
+
+
+def _gateway_human_key(context: MemoryTurnContext) -> str:
+    human_key = context.user_id_alt or context.user_id
+    if not human_key:
+        raise ValueError(
+            "OpenViking gateway mode requires a stable OpenViking human peer "
+            "source, but this turn has no user_id or user_id_alt."
+        )
+    return human_key
+
+
 def _resolve_connection_settings(provider_config: Optional[dict] = None) -> dict:
     provider_config = dict(provider_config or {})
     ovcli_values: dict = {}
@@ -787,6 +868,8 @@ def _resolve_connection_settings(provider_config: Optional[dict] = None) -> dict
     account_env = _env_value("OPENVIKING_ACCOUNT")
     user_env = _env_value("OPENVIKING_USER")
     agent_env = _env_value("OPENVIKING_AGENT")
+    identity_mode_env = _env_value("OPENVIKING_IDENTITY_MODE")
+    gateway_namespace_env = _env_value("OPENVIKING_GATEWAY_NAMESPACE_MODE")
 
     return {
         "endpoint": _first_nonempty(endpoint_env, ovcli_values.get("endpoint"), default=_DEFAULT_ENDPOINT),
@@ -794,6 +877,16 @@ def _resolve_connection_settings(provider_config: Optional[dict] = None) -> dict
         "account": account_env if account_env is not None else ovcli_values.get("account", ""),
         "user": user_env if user_env is not None else ovcli_values.get("user", ""),
         "agent": _first_nonempty(agent_env, ovcli_values.get("agent"), default=_DEFAULT_AGENT),
+        "identity_mode": _normalize_identity_mode(
+            identity_mode_env
+            if identity_mode_env is not None
+            else provider_config.get("identity_mode", _IDENTITY_MODE_PERSONAL)
+        ),
+        "gateway_namespace_mode": _normalize_gateway_namespace_mode(
+            gateway_namespace_env
+            if gateway_namespace_env is not None
+            else provider_config.get("gateway_namespace_mode", _GATEWAY_NAMESPACE_SINGLE_USER)
+        ),
     }
 
 
@@ -805,6 +898,8 @@ def _env_writes_from_connection_values(values: dict) -> dict:
         "OPENVIKING_ACCOUNT": "account",
         "OPENVIKING_USER": "user",
         "OPENVIKING_AGENT": "agent",
+        "OPENVIKING_IDENTITY_MODE": "identity_mode",
+        "OPENVIKING_GATEWAY_NAMESPACE_MODE": "gateway_namespace_mode",
     }
     for env_key, value_key in mapping.items():
         value = _clean_config_value(values.get(value_key))
@@ -1701,7 +1796,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._deferred_commit_lock = threading.Lock()
         self._committed_session_ids: Set[str] = set()
         self._committed_session_lock = threading.Lock()
+        self._session_identities: Dict[str, _OpenVikingTurnIdentity] = {}
+        self._session_identity_lock = threading.Lock()
         self._prefetch_result = ""
+        self._prefetch_results: Dict[str, str] = {}
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
         self._runtime_start_lock = threading.Lock()
@@ -1715,6 +1813,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._shutting_down = False
         # Drop prefetch results from older switch generations.
         self._prefetch_generation = 0
+        self._identity_mode = _IDENTITY_MODE_PERSONAL
+        self._gateway_namespace_mode = _GATEWAY_NAMESPACE_SINGLE_USER
 
     @property
     def name(self) -> str:
@@ -1766,6 +1866,20 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 ),
                 "default": "hermes",
                 "env_var": "OPENVIKING_AGENT",
+            },
+            {
+                "key": "identity_mode",
+                "description": "OpenViking identity mode",
+                "default": _IDENTITY_MODE_PERSONAL,
+                "choices": [_IDENTITY_MODE_PERSONAL, _IDENTITY_MODE_GATEWAY],
+                "env_var": "OPENVIKING_IDENTITY_MODE",
+            },
+            {
+                "key": "gateway_namespace_mode",
+                "description": "OpenViking gateway namespace mode",
+                "default": _GATEWAY_NAMESPACE_SINGLE_USER,
+                "choices": [_GATEWAY_NAMESPACE_SINGLE_USER, _GATEWAY_NAMESPACE_PER_GROUP],
+                "env_var": "OPENVIKING_GATEWAY_NAMESPACE_MODE",
             },
         ]
 
@@ -1980,6 +2094,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._account = settings["account"]
         self._user = settings["user"]
         self._agent = settings["agent"]
+        self._identity_mode = settings.get("identity_mode", _IDENTITY_MODE_PERSONAL)
+        self._gateway_namespace_mode = settings.get(
+            "gateway_namespace_mode",
+            _GATEWAY_NAMESPACE_SINGLE_USER,
+        )
         self._session_id = session_id
         self._turn_count = 0
         warning_callback = (
@@ -2045,21 +2164,51 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "viking_remember, viking_add_resource."
             )
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> str:
         """Return prefetched results from the background thread."""
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
+        try:
+            identity = self._resolve_turn_identity(context)
+        except Exception as e:
+            logger.warning("OpenViking gateway prefetch identity error: %s", e)
+            return ""
         with self._prefetch_lock:
-            result = self._prefetch_result
-            self._prefetch_result = ""
+            result = self._prefetch_results.pop(identity.prefetch_key, "")
+            if not result and identity.prefetch_key == _DEFAULT_PREFETCH_KEY:
+                result = self._prefetch_result
+            if identity.prefetch_key == _DEFAULT_PREFETCH_KEY:
+                self._prefetch_result = ""
         if not result:
             return ""
         return f"## OpenViking Context\n{result}"
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> None:
         """Fire a background search to pre-load relevant context."""
         query = _derive_openviking_user_text(query)
         if not self._client or not query:
+            return
+        try:
+            identity = self._resolve_turn_identity(
+                context,
+                require_human_peer=_normalize_identity_mode(
+                    getattr(self, "_identity_mode", _IDENTITY_MODE_PERSONAL)
+                ) == _IDENTITY_MODE_GATEWAY,
+            )
+        except Exception as e:
+            logger.warning("OpenViking gateway prefetch skipped: %s", e)
             return
 
         # Drop prefetch results from older switch generations.
@@ -2070,10 +2219,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         def _run():
             try:
-                client = _VikingClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
-                )
+                client = self._new_client(identity)
                 resp = client.post("/api/v1/search/find", {
                     "query": query,
                     "limit": 5,
@@ -2092,7 +2238,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     with self._prefetch_lock:
                         if gen != self._prefetch_generation:
                             return
-                        self._prefetch_result = "\n".join(parts)
+                        result_text = "\n".join(parts)
+                        self._prefetch_results[identity.prefetch_key] = result_text
+                        if identity.prefetch_key == _DEFAULT_PREFETCH_KEY:
+                            self._prefetch_result = result_text
             except Exception as e:
                 logger.debug("OpenViking prefetch failed: %s", e)
             finally:
@@ -2182,29 +2331,185 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     break
                 t.join(timeout=slice_left)
 
-    def _new_client(self) -> _VikingClient:
+    def _resolve_turn_identity(
+        self,
+        context: Optional[MemoryTurnContext] = None,
+        *,
+        require_human_peer: bool = False,
+    ) -> _OpenVikingTurnIdentity:
+        mode = _normalize_identity_mode(getattr(self, "_identity_mode", _IDENTITY_MODE_PERSONAL))
+        namespace_mode = _normalize_gateway_namespace_mode(
+            getattr(self, "_gateway_namespace_mode", _GATEWAY_NAMESPACE_SINGLE_USER)
+        )
+        agent_peer = str(getattr(self, "_agent", "") or _DEFAULT_AGENT).strip() or _DEFAULT_AGENT
+
+        if mode != _IDENTITY_MODE_GATEWAY:
+            account = getattr(self, "_account", "")
+            user = getattr(self, "_user", "")
+            return _OpenVikingTurnIdentity(
+                mode=_IDENTITY_MODE_PERSONAL,
+                namespace_mode=_GATEWAY_NAMESPACE_SINGLE_USER,
+                account=account,
+                user=user,
+                actor_peer=agent_peer,
+                human_peer="",
+                assistant_peer=agent_peer,
+                force_tenant_headers=not bool(getattr(self, "_api_key", "")),
+                prefetch_key="|".join([
+                    _IDENTITY_MODE_PERSONAL,
+                    account,
+                    user,
+                    agent_peer,
+                ]) or _DEFAULT_PREFETCH_KEY,
+            )
+
+        if context is None:
+            if require_human_peer:
+                raise ValueError(
+                    "OpenViking gateway mode requires MemoryTurnContext for this memory operation."
+                )
+            return _OpenVikingTurnIdentity(
+                mode=_IDENTITY_MODE_GATEWAY,
+                namespace_mode=namespace_mode,
+                account=getattr(self, "_account", ""),
+                user=getattr(self, "_user", ""),
+                actor_peer=agent_peer,
+                human_peer="",
+                assistant_peer=agent_peer,
+                force_tenant_headers=not bool(getattr(self, "_api_key", "")),
+                prefetch_key=_DEFAULT_PREFETCH_KEY,
+            )
+
+        scope = _gateway_scope_from_context(context)
+        human_key = _gateway_human_key(context)
+        platform = _safe_identity_label(context.platform, default="gateway")
+
+        if namespace_mode == _GATEWAY_NAMESPACE_PER_GROUP:
+            if getattr(self, "_api_key", "") and not getattr(self, "_account", ""):
+                raise ValueError(
+                    "OpenViking gateway per_group mode requires OPENVIKING_ACCOUNT "
+                    "with trusted/root-backed OpenViking credentials."
+                )
+            account = getattr(self, "_account", "") or "default"
+            user = _validate_generated_identifier(f"hermes_{scope}", field="user_id")
+            human_peer = _validate_generated_identifier(
+                f"{platform}_user_{_hash_identifier(human_key)}",
+                field="peer_id",
+            )
+            assistant_peer = agent_peer
+            force_tenant_headers = True
+        else:
+            account = getattr(self, "_account", "")
+            user = getattr(self, "_user", "")
+            human_peer = _validate_generated_identifier(
+                f"{scope}_user_{_hash_identifier(human_key)}",
+                field="peer_id",
+            )
+            assistant_peer = _validate_generated_identifier(
+                f"{scope}_assistant_{_hash_identifier(agent_peer)}",
+                field="peer_id",
+            )
+            force_tenant_headers = not bool(getattr(self, "_api_key", ""))
+
+        return _OpenVikingTurnIdentity(
+            mode=_IDENTITY_MODE_GATEWAY,
+            namespace_mode=namespace_mode,
+            account=account,
+            user=user,
+            actor_peer=human_peer,
+            human_peer=human_peer,
+            assistant_peer=assistant_peer,
+            force_tenant_headers=force_tenant_headers,
+            prefetch_key="|".join([
+                _IDENTITY_MODE_GATEWAY,
+                namespace_mode,
+                str(context.session_id or self._session_id or ""),
+                account,
+                user,
+                human_peer,
+                assistant_peer,
+            ]),
+        )
+
+    def _new_client(
+        self,
+        identity: Optional[_OpenVikingTurnIdentity] = None,
+    ) -> _VikingClient:
+        account = identity.account if identity is not None else self._account
+        user = identity.user if identity is not None else self._user
+        agent = identity.actor_peer if identity is not None else self._agent
+        force_tenant_headers = (
+            identity.force_tenant_headers if identity is not None else None
+        )
         return _VikingClient(
             self._endpoint,
             self._api_key,
-            account=self._account,
-            user=self._user,
-            agent=self._agent,
+            account=account,
+            user=user,
+            agent=agent,
+            force_tenant_headers=force_tenant_headers,
         )
+
+    def _remember_session_identity(
+        self,
+        sid: str,
+        identity: _OpenVikingTurnIdentity,
+    ) -> None:
+        if not sid or identity.mode != _IDENTITY_MODE_GATEWAY:
+            return
+        with self._session_identity_lock:
+            self._session_identities[sid] = identity
+
+    def _session_identity(self, sid: str) -> Optional[_OpenVikingTurnIdentity]:
+        with self._session_identity_lock:
+            return self._session_identities.get(sid)
+
+    def _forget_session_identity(self, sid: str) -> None:
+        with self._session_identity_lock:
+            self._session_identities.pop(sid, None)
+
+    def _client_for_context(
+        self,
+        context: Optional[MemoryTurnContext] = None,
+        *,
+        require_human_peer: bool = False,
+    ) -> tuple[_VikingClient, Optional[_OpenVikingTurnIdentity]]:
+        identity = self._resolve_turn_identity(
+            context,
+            require_human_peer=require_human_peer,
+        )
+        if identity.mode == _IDENTITY_MODE_GATEWAY:
+            return self._new_client(identity), identity
+        return self._client, identity
 
     @staticmethod
     def _text_part(content: str) -> Dict[str, str]:
         return {"type": "text", "text": content}
 
-    def _turn_batch_payload(self, user_content: str, assistant_content: str) -> Dict[str, Any]:
+    def _turn_batch_payload(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        user_peer_id: str = "",
+        assistant_peer_id: str = "",
+    ) -> Dict[str, Any]:
+        user_message: Dict[str, Any] = {
+            "role": "user",
+            "parts": [self._text_part(user_content)],
+        }
+        if user_peer_id:
+            user_message["peer_id"] = user_peer_id
         assistant_message: Dict[str, Any] = {
             "role": "assistant",
             "parts": [self._text_part(assistant_content)],
         }
-        if self._agent:
-            assistant_message["peer_id"] = self._agent
+        assistant_peer_id = assistant_peer_id or self._agent
+        if assistant_peer_id:
+            assistant_message["peer_id"] = assistant_peer_id
         return {
             "messages": [
-                {"role": "user", "parts": [self._text_part(user_content)]},
+                user_message,
                 assistant_message,
             ]
         }
@@ -2215,15 +2520,35 @@ class OpenVikingMemoryProvider(MemoryProvider):
         sid: str,
         user_content: str,
         assistant_content: str,
+        *,
+        identity: Optional[_OpenVikingTurnIdentity] = None,
     ) -> None:
         client.post(
             f"/api/v1/sessions/{sid}/messages/batch",
-            self._turn_batch_payload(user_content, assistant_content),
+            self._turn_batch_payload(
+                user_content,
+                assistant_content,
+                user_peer_id=identity.human_peer if identity else "",
+                assistant_peer_id=identity.assistant_peer if identity else "",
+            ),
         )
 
-    def _session_has_pending_tokens(self, sid: str) -> bool:
+    def _session_client(
+        self,
+        identity: Optional[_OpenVikingTurnIdentity],
+    ) -> _VikingClient:
+        if identity and identity.mode == _IDENTITY_MODE_GATEWAY:
+            return self._new_client(replace(identity, actor_peer=""))
+        return self._client
+
+    def _session_has_pending_tokens(
+        self,
+        sid: str,
+        *,
+        identity: Optional[_OpenVikingTurnIdentity] = None,
+    ) -> bool:
         try:
-            response = self._client.get(f"/api/v1/sessions/{sid}")
+            response = self._session_client(identity).get(f"/api/v1/sessions/{sid}")
         except Exception:
             return False
         session = self._unwrap_result(response)
@@ -2242,7 +2567,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
         with self._committed_session_lock:
             self._committed_session_ids.add(sid)
 
-    def _session_needs_commit(self, sid: str, turn_count: int) -> bool:
+    def _session_needs_commit(
+        self,
+        sid: str,
+        turn_count: int,
+        *,
+        identity: Optional[_OpenVikingTurnIdentity] = None,
+    ) -> bool:
         # Already-committed sessions never need a second commit, regardless of
         # the turn counter — a racing sync_turn can re-increment _turn_count
         # after a commit+reset, so the committed-guard must win over turn_count.
@@ -2250,15 +2581,23 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return False
         if turn_count > 0:
             return True
-        return self._session_has_pending_tokens(sid)
+        return self._session_has_pending_tokens(sid, identity=identity)
 
-    def _commit_session(self, sid: str, turn_count: int, *, context: str) -> bool:
+    def _commit_session(
+        self,
+        sid: str,
+        turn_count: int,
+        *,
+        context: str,
+        identity: Optional[_OpenVikingTurnIdentity] = None,
+    ) -> bool:
         try:
-            self._client.post(
+            self._session_client(identity).post(
                 f"/api/v1/sessions/{sid}/commit",
                 {"keep_recent_count": 0},
             )
             self._mark_session_committed(sid)
+            self._forget_session_identity(sid)
             logger.info("OpenViking session %s committed %s (%d turns)", sid, context, turn_count)
             return True
         except Exception as e:
@@ -2296,8 +2635,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     return
                 if self._shutting_down:
                     return
-                if self._session_needs_commit(sid, turn_count):
-                    self._commit_session(sid, turn_count, context=context)
+                identity = self._session_identity(sid)
+                if self._session_needs_commit(sid, turn_count, identity=identity):
+                    self._commit_session(sid, turn_count, context=context, identity=identity)
             finally:
                 with self._deferred_commit_lock:
                     self._deferred_commit_sids.discard(sid)
@@ -2320,6 +2660,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_generation += 1
             self._prefetch_result = ""
+            self._prefetch_results.clear()
             # Join EVERY tracked prefetch thread, not just the latest slot — a
             # rapid re-queue can leave an older thread for the abandoned session
             # still running (consistent with shutdown()).
@@ -2328,6 +2669,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             t.join(timeout=3.0)
         with self._prefetch_lock:
             self._prefetch_result = ""
+            self._prefetch_results.clear()
 
     @staticmethod
     def _message_text(content: Any) -> str:
@@ -2466,9 +2808,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         cls,
         messages: List[Dict[str, Any]],
         *,
+        user_peer_id: str = "",
         assistant_peer_id: str = "",
     ) -> List[Dict[str, Any]]:
         """Convert Hermes canonical messages into OpenViking batch payloads."""
+        user_peer_id = str(user_peer_id or "").strip()
         assistant_peer_id = str(assistant_peer_id or "").strip()
         tool_calls_by_id: Dict[str, Dict[str, Any]] = {}
         completed_tool_ids: set[str] = set()
@@ -2503,7 +2847,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         def payload_message(role: str, parts: List[Dict[str, Any]]) -> Dict[str, Any]:
             payload: Dict[str, Any] = {"role": role, "parts": parts}
-            if role == "assistant" and assistant_peer_id:
+            if role == "user" and user_peer_id:
+                payload["peer_id"] = user_peer_id
+            elif role == "assistant" and assistant_peer_id:
                 payload["peer_id"] = assistant_peer_id
             return payload
 
@@ -2587,6 +2933,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Record the conversation turn in OpenViking's session (non-blocking)."""
         if not self._client:
@@ -2594,6 +2941,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         user_content = _derive_openviking_user_text(user_content)
         if not user_content:
+            return
+        try:
+            identity = self._resolve_turn_identity(
+                context,
+                require_human_peer=_normalize_identity_mode(
+                    getattr(self, "_identity_mode", _IDENTITY_MODE_PERSONAL)
+                ) == _IDENTITY_MODE_GATEWAY,
+            )
+        except Exception as e:
+            logger.warning("OpenViking sync_turn skipped: %s", e)
             return
 
         turn_messages = (
@@ -2609,7 +2966,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     break
         batch_messages = self._messages_to_openviking_batch(
             turn_messages,
-            assistant_peer_id=getattr(self, "_agent", _DEFAULT_AGENT),
+            user_peer_id=identity.human_peer,
+            assistant_peer_id=identity.assistant_peer,
         )
 
         if _sync_trace_enabled():
@@ -2639,6 +2997,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             if not sid:
                 return
             self._turn_count += 1
+        self._remember_session_identity(sid, identity)
 
         def _sync():
             def _post_turn(client: _VikingClient) -> None:
@@ -2664,15 +3023,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     sid,
                     user_content[:4000],
                     self._message_text(assistant_content)[:4000],
+                    identity=identity,
                 )
 
             try:
-                client = self._new_client()
+                client = self._new_client(identity)
                 _post_turn(client)
             except Exception as e:
                 logger.debug("OpenViking sync_turn failed, reconnecting: %s", e)
                 try:
-                    client = self._new_client()
+                    client = self._new_client(identity)
                     _post_turn(client)
                 except Exception as retry_error:
                     logger.warning("OpenViking sync_turn failed: %s", retry_error)
@@ -2704,10 +3064,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
             )
             return
 
-        if not self._session_needs_commit(sid, turn_count):
+        identity = self._session_identity(sid)
+        if not self._session_needs_commit(sid, turn_count, identity=identity):
             return
 
-        if self._commit_session(sid, turn_count, context="on session end"):
+        if self._commit_session(sid, turn_count, context="on session end", identity=identity):
             # Mark clean so a follow-up on_session_switch skips its own commit.
             with self._session_state_lock:
                 if self._session_id == sid:
@@ -2781,10 +3142,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
             old_session_id, new_id, parent_session_id, reset,
         )
 
-    def _build_memory_uri(self, subdir: str) -> str:
+    def _build_memory_uri(self, subdir: str, *, peer_id: str = "") -> str:
         """Build a viking:// memory URI under the configured peer namespace."""
         slug = uuid.uuid4().hex[:12]
-        return f"viking://user/peers/{self._agent}/memories/{subdir}/mem_{slug}.md"
+        peer = str(peer_id or self._agent or _DEFAULT_AGENT).strip() or _DEFAULT_AGENT
+        return f"viking://user/peers/{peer}/memories/{subdir}/mem_{slug}.md"
 
     def on_memory_write(
         self,
@@ -2792,20 +3154,30 @@ class OpenVikingMemoryProvider(MemoryProvider):
         target: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Mirror built-in memory writes to OpenViking via content/write."""
         if not self._client or action != "add" or not content:
             return
 
+        try:
+            identity = self._resolve_turn_identity(
+                context,
+                require_human_peer=_normalize_identity_mode(
+                    getattr(self, "_identity_mode", _IDENTITY_MODE_PERSONAL)
+                ) == _IDENTITY_MODE_GATEWAY,
+            )
+        except Exception as e:
+            logger.warning("OpenViking memory mirror skipped: %s", e)
+            return
+
         subdir = _MEMORY_WRITE_TARGET_SUBDIR_MAP.get(target, _DEFAULT_MEMORY_SUBDIR)
-        uri = self._build_memory_uri(subdir)
+        target_peer = identity.human_peer or identity.assistant_peer
+        uri = self._build_memory_uri(subdir, peer_id=target_peer)
 
         def _write():
             try:
-                client = _VikingClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
-                )
+                client = self._new_client(identity)
                 client.post("/api/v1/content/write", {
                     "uri": uri,
                     "content": content,
@@ -2824,17 +3196,18 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if not self._client:
             return tool_error("OpenViking server not connected")
 
+        context = kwargs.get("context")
         try:
             if tool_name == "viking_search":
-                return self._tool_search(args)
+                return self._tool_search(args, context=context)
             elif tool_name == "viking_read":
-                return self._tool_read(args)
+                return self._tool_read(args, context=context)
             elif tool_name == "viking_browse":
-                return self._tool_browse(args)
+                return self._tool_browse(args, context=context)
             elif tool_name == "viking_remember":
-                return self._tool_remember(args)
+                return self._tool_remember(args, context=context)
             elif tool_name == "viking_add_resource":
-                return self._tool_add_resource(args)
+                return self._tool_add_resource(args, context=context)
             return tool_error(f"Unknown tool: {tool_name}")
         except Exception as e:
             return tool_error(str(e))
@@ -2885,7 +3258,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return uri[: -len(suffix)] or "viking://"
         return uri
 
-    def _is_directory_uri(self, uri: str) -> bool | None:
+    def _is_directory_uri(
+        self,
+        uri: str,
+        *,
+        client: Optional[_VikingClient] = None,
+    ) -> bool | None:
         """Probe fs/stat to decide if a URI is a directory.
 
         Returns True/False when the server answers cleanly, and None when the
@@ -2893,7 +3271,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         treat None as "unknown" and fall back to the exception-based path.
         """
         try:
-            resp = self._client.get("/api/v1/fs/stat", params={"uri": uri})
+            active_client = client or self._client
+            resp = active_client.get("/api/v1/fs/stat", params={"uri": uri})
         except Exception:
             return None
         result = self._unwrap_result(resp)
@@ -2908,10 +3287,21 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return False
         return None
 
-    def _tool_search(self, args: dict) -> str:
+    def _tool_search(
+        self,
+        args: dict,
+        *,
+        context: Optional[MemoryTurnContext] = None,
+    ) -> str:
         query = args.get("query", "")
         if not query:
             return tool_error("query is required")
+        client, _identity = self._client_for_context(
+            context,
+            require_human_peer=_normalize_identity_mode(
+                getattr(self, "_identity_mode", _IDENTITY_MODE_PERSONAL)
+            ) == _IDENTITY_MODE_GATEWAY,
+        )
 
         payload: Dict[str, Any] = {"query": query}
         mode = args.get("mode", "auto")
@@ -2924,7 +3314,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if endpoint == "/api/v1/search/search" and self._session_id:
             payload["session_id"] = self._session_id
 
-        resp = self._client.post(endpoint, payload)
+        resp = client.post(endpoint, payload)
         result = resp.get("result", {})
 
         # Format results for the model — keep it concise
@@ -2952,10 +3342,21 @@ class OpenVikingMemoryProvider(MemoryProvider):
             "total": result.get("total", len(formatted)),
         }, ensure_ascii=False)
 
-    def _tool_read(self, args: dict) -> str:
+    def _tool_read(
+        self,
+        args: dict,
+        *,
+        context: Optional[MemoryTurnContext] = None,
+    ) -> str:
         uri = args.get("uri", "")
         if not uri:
             return tool_error("uri is required")
+        client, _identity = self._client_for_context(
+            context,
+            require_human_peer=_normalize_identity_mode(
+                getattr(self, "_identity_mode", _IDENTITY_MODE_PERSONAL)
+            ) == _IDENTITY_MODE_GATEWAY,
+        )
 
         level = args.get("level", "overview")
 
@@ -2972,7 +3373,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # round-trip. The pseudo-URI path already points at a directory, so
         # skip the probe there.
         if summary_level and resolved_uri == uri:
-            is_dir = self._is_directory_uri(uri)
+            is_dir = self._is_directory_uri(uri, client=client)
             if is_dir is False:
                 resolved_uri = uri
                 used_fallback = True
@@ -2986,13 +3387,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 endpoint = "/api/v1/content/overview"
 
         try:
-            resp = self._client.get(endpoint, params={"uri": resolved_uri})
+            resp = client.get(endpoint, params={"uri": resolved_uri})
         except Exception:
             # OpenViking may return HTTP 500 for abstract/overview reads on normal
             # file URIs (mem_*.md). For those, gracefully fallback to full read.
             if not summary_level or resolved_uri != uri or used_fallback:
                 raise
-            resp = self._client.get("/api/v1/content/read", params={"uri": uri})
+            resp = client.get("/api/v1/content/read", params={"uri": uri})
             used_fallback = True
 
         result = self._unwrap_result(resp)
@@ -3025,14 +3426,25 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         return json.dumps(payload, ensure_ascii=False)
 
-    def _tool_browse(self, args: dict) -> str:
+    def _tool_browse(
+        self,
+        args: dict,
+        *,
+        context: Optional[MemoryTurnContext] = None,
+    ) -> str:
         action = args.get("action", "list")
         path = args.get("path", "viking://")
+        client, _identity = self._client_for_context(
+            context,
+            require_human_peer=_normalize_identity_mode(
+                getattr(self, "_identity_mode", _IDENTITY_MODE_PERSONAL)
+            ) == _IDENTITY_MODE_GATEWAY,
+        )
 
         # Map action to the correct fs endpoint (all GET with uri= param)
         endpoint_map = {"tree": "/api/v1/fs/tree", "list": "/api/v1/fs/ls", "stat": "/api/v1/fs/stat"}
         endpoint = endpoint_map.get(action, "/api/v1/fs/ls")
-        resp = self._client.get(endpoint, params={"uri": path})
+        resp = client.get(endpoint, params={"uri": path})
         result = self._unwrap_result(resp)
 
         # Format list/tree results for readability
@@ -3057,20 +3469,32 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         return json.dumps(result, ensure_ascii=False)
 
-    def _tool_remember(self, args: dict) -> str:
+    def _tool_remember(
+        self,
+        args: dict,
+        *,
+        context: Optional[MemoryTurnContext] = None,
+    ) -> str:
         content = args.get("content", "")
         if not content:
             return tool_error("content is required")
+        client, identity = self._client_for_context(
+            context,
+            require_human_peer=_normalize_identity_mode(
+                getattr(self, "_identity_mode", _IDENTITY_MODE_PERSONAL)
+            ) == _IDENTITY_MODE_GATEWAY,
+        )
 
         category = args.get("category", "")
         subdir = _CATEGORY_SUBDIR_MAP.get(category, _DEFAULT_MEMORY_SUBDIR)
-        uri = self._build_memory_uri(subdir)
+        target_peer = identity.human_peer if identity else ""
+        uri = self._build_memory_uri(subdir, peer_id=target_peer)
 
         # Write directly via content/write API.
         # This creates the file, stores the content, and queues vector indexing
         # in a single call — no dependency on session commit / VLM extraction.
         try:
-            result = self._client.post("/api/v1/content/write", {
+            result = client.post("/api/v1/content/write", {
                 "uri": uri,
                 "content": content,
                 "mode": "create",
@@ -3084,10 +3508,21 @@ class OpenVikingMemoryProvider(MemoryProvider):
             logger.error("OpenViking content/write failed: %s", e)
             return tool_error(f"Failed to store memory: {e}")
 
-    def _tool_add_resource(self, args: dict) -> str:
+    def _tool_add_resource(
+        self,
+        args: dict,
+        *,
+        context: Optional[MemoryTurnContext] = None,
+    ) -> str:
         url = args.get("url", "")
         if not url:
             return tool_error("url is required")
+        client, _identity = self._client_for_context(
+            context,
+            require_human_peer=_normalize_identity_mode(
+                getattr(self, "_identity_mode", _IDENTITY_MODE_PERSONAL)
+            ) == _IDENTITY_MODE_GATEWAY,
+        )
 
         if args.get("to") and args.get("parent"):
             return tool_error("Cannot specify both 'to' and 'parent'")
@@ -3122,7 +3557,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         upload_path = source_path
                     else:
                         return tool_error(f"Unsupported local resource path: {url}")
-                    payload["temp_file_id"] = self._client.upload_temp_file(upload_path)
+                    payload["temp_file_id"] = client.upload_temp_file(upload_path)
                 elif _is_local_path_reference(url):
                     return tool_error(f"Local resource path does not exist: {url}")
                 else:
@@ -3130,7 +3565,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             else:
                 payload["path"] = url
 
-            resp = self._client.post("/api/v1/resources", payload)
+            resp = client.post("/api/v1/resources", payload)
             result = resp.get("result", {})
         finally:
             if cleanup_path:
