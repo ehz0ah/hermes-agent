@@ -1115,6 +1115,37 @@ def _wrap_current_message_with_observed_context(
     return message
 
 
+def _with_observed_group_context_ephemeral_prompt(
+    base_prompt: Optional[str],
+    observed_context: Optional[str],
+    *,
+    channel_prompt: Optional[str] = None,
+) -> Optional[str]:
+    """Return the per-turn ephemeral prompt with observed chat context.
+
+    The stable gateway/channel prompt stays in the agent cache signature. The
+    observed window is turn-local data, so it is attached after cache lookup and
+    before the model call. This gives the model a high-priority instruction to
+    use visible chat context without rebuilding the cached agent for every
+    observed side message.
+    """
+
+    observed_context = str(observed_context or "").strip()
+    if not observed_context:
+        return base_prompt or None
+
+    observed_prompt = (
+        f"{_observed_group_context_header(channel_prompt)}\n"
+        f"{observed_context}\n\n"
+        f"{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
+        "The next user message is the current addressed message. Use the "
+        "observed context above to resolve it when relevant."
+    )
+    if base_prompt:
+        return f"{base_prompt.rstrip()}\n\n{observed_prompt}"
+    return observed_prompt
+
+
 def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     """Return the ``timestamp`` of the last usable transcript row, if any.
 
@@ -19130,6 +19161,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             observed_group_memory_messages = _observed_group_messages_for_memory(
                 history,
+                channel_prompt=channel_prompt,
+            )
+            # Refresh turn-local context after the observed window is known.
+            # Do not include this dynamic block in the cache signature above:
+            # cached agents can safely reuse the stable prompt, then receive
+            # this turn's observed chat context immediately before the model
+            # call.
+            agent.ephemeral_system_prompt = _with_observed_group_context_ephemeral_prompt(
+                combined_ephemeral or None,
+                observed_group_context,
                 channel_prompt=channel_prompt,
             )
 

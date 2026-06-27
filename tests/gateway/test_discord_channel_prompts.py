@@ -36,12 +36,17 @@ from gateway.session import SessionSource
 
 class _CapturingAgent:
     last_init = None
+    last_run_ephemeral = None
+    last_run_user_message = None
 
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
+        self.ephemeral_system_prompt = kwargs.get("ephemeral_system_prompt")
         self.tools = []
 
     def run_conversation(self, user_message, conversation_history=None, task_id=None, persist_user_message=None):
+        type(self).last_run_ephemeral = self.ephemeral_system_prompt
+        type(self).last_run_user_message = user_message
         return {
             "final_response": "ok",
             "messages": [],
@@ -256,3 +261,73 @@ async def test_run_agent_appends_channel_prompt_to_ephemeral_system_prompt(monke
     assert _CapturingAgent.last_init["ephemeral_system_prompt"] == (
         "Context prompt\n\nChannel prompt\n\nGlobal prompt"
     )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_promotes_observed_feishu_context_to_ephemeral_prompt(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    (tmp_path / "config.yaml").write_text("agent:\n  system_prompt: Global prompt\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    _CapturingAgent.last_init = None
+    _CapturingAgent.last_run_ephemeral = None
+    _CapturingAgent.last_run_user_message = None
+    channel_prompt = "You are handling observed Feishu/Lark group context."
+    history = [
+        {
+            "role": "user",
+            "content": (
+                "[Hao | mention=<at user_id=\"ou_a\">Hao</at>]\n"
+                "I am too tired to watch the morning match portugal vs columbia"
+            ),
+            "observed": True,
+        }
+    ]
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_group",
+        chat_type="group",
+        user_id="ou_a",
+        user_name="Hao",
+    )
+
+    result = await runner._run_agent(
+        message="[Hao | mention=<at user_id=\"ou_a\">Hao</at>]\nwhat am i too tired for",
+        context_prompt="Context prompt",
+        history=history,
+        source=source,
+        session_id="session-1",
+        session_key="agent:main:feishu:group:oc_group",
+        channel_prompt=channel_prompt,
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init["ephemeral_system_prompt"] == (
+        "Context prompt\n\n"
+        "You are handling observed Feishu/Lark group context.\n\n"
+        "Global prompt"
+    )
+    assert _CapturingAgent.last_run_ephemeral is not None
+    assert "Observed Feishu/Lark group context" in _CapturingAgent.last_run_ephemeral
+    assert "I am too tired to watch the morning match portugal vs columbia" in _CapturingAgent.last_run_ephemeral
+    assert "First answer from this block when it contains the answer" in _CapturingAgent.last_run_ephemeral
