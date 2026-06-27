@@ -35,10 +35,26 @@ All config via environment variables in `.env`:
 | `OPENVIKING_ACCOUNT` | `default` | Tenant account for local/trusted mode |
 | `OPENVIKING_USER` | `default` | Tenant user for local/trusted mode |
 | `OPENVIKING_AGENT` | `hermes` | Hermes peer ID in OpenViking, used for peer-scoped memories |
+| `OPENVIKING_IDENTITY_MODE` | `solo` | `solo` for one human, `team` for messaging gateways where multiple humans share one Hermes agent |
 
 When `OPENVIKING_API_KEY` is set, Hermes lets OpenViking derive account/user
 identity from the key. In local or trusted deployments without an API key,
 Hermes sends `OPENVIKING_ACCOUNT` and `OPENVIKING_USER` as identity headers.
+
+## Identity Modes
+
+`solo` is the default and preserves the existing behavior: Hermes writes under
+the configured `OPENVIKING_AGENT` peer.
+
+`team` is for gateways such as Feishu/Lark where one Hermes agent participates
+as a team colleague. Hermes keeps one shared OpenViking user namespace, writes
+human messages under a deterministic platform peer derived from the sender's
+stable gateway identity, and writes assistant procedural memories under the
+Hermes peer. Search/read/browse use the shared user namespace without an actor
+peer so the agent can recall what it has learned across the team.
+
+Team mode is not valid for direct CLI sessions. Run `hermes memory setup
+openviking` again and choose `solo` for CLI-only profiles.
 
 ## Tools
 
@@ -59,6 +75,12 @@ and `mode=create`. It creates peer-scoped memory files under
 canonical user-scoped form such as
 `viking://user/default/peers/${OPENVIKING_AGENT}/memories/...` in API-key mode.
 Explicit remembers do not depend on session commit extraction.
+
+In `team` mode, human preferences/entities/events/default memories are written
+under the active sender's peer. `case` and `pattern` memories are written under
+the Hermes peer because they describe assistant behavior rather than a human
+participant. Hermes also maintains a small `resources/profile.md` file for each
+observed human peer with readable display/mention metadata for attribution.
 
 Hermes built-in `memory` tool additions are mirrored to OpenViking after the
 local memory operation succeeds:

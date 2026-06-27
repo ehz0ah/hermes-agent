@@ -35,9 +35,86 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MemoryTurnContext:
+    """Raw gateway identity for one turn.
+
+    The base memory interface deliberately carries platform-native fields only.
+    Backend-specific IDs such as OpenViking peer IDs are derived inside the
+    provider that owns those rules.
+    """
+
+    platform: str = ""
+    chat_id: str = ""
+    chat_name: str = ""
+    chat_type: str = ""
+    user_id: str = ""
+    user_id_alt: str = ""
+    user_name: str = ""
+    user_handle: str = ""
+    thread_id: str = ""
+    message_id: str = ""
+    session_id: str = ""
+    gateway_session_key: str = ""
+
+
+def _context_value(source: Any, field: str) -> str:
+    value = getattr(source, field, "")
+    if value is None:
+        return ""
+    if field == "platform":
+        value = getattr(value, "value", value)
+    return str(value).strip()
+
+
+def build_memory_turn_context(
+    source: Any,
+    *,
+    session_id: str = "",
+    gateway_session_key: str = "",
+) -> Optional[MemoryTurnContext]:
+    """Build a backend-neutral memory context from a gateway SessionSource.
+
+    ``message_id`` is intentionally not a source-identity signal: a message id
+    alone is per-message metadata and must not keep a stale speaker alive.
+    """
+
+    if source is None:
+        return None
+
+    values = {
+        "platform": _context_value(source, "platform"),
+        "chat_id": _context_value(source, "chat_id"),
+        "chat_name": _context_value(source, "chat_name"),
+        "chat_type": _context_value(source, "chat_type"),
+        "user_id": _context_value(source, "user_id"),
+        "user_id_alt": _context_value(source, "user_id_alt"),
+        "user_name": _context_value(source, "user_name"),
+        "user_handle": _context_value(source, "user_handle"),
+        "thread_id": _context_value(source, "thread_id"),
+        "message_id": _context_value(source, "message_id"),
+        "session_id": str(session_id or "").strip(),
+        "gateway_session_key": str(gateway_session_key or "").strip(),
+    }
+    identity_fields = (
+        "chat_id",
+        "chat_name",
+        "user_id",
+        "user_id_alt",
+        "user_name",
+        "user_handle",
+        "thread_id",
+        "gateway_session_key",
+    )
+    if not any(values.get(field) for field in identity_fields):
+        return None
+    return MemoryTurnContext(**values)
 
 
 class MemoryProvider(ABC):
@@ -91,7 +168,13 @@ class MemoryProvider(ABC):
         """
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> str:
         """Recall relevant context for the upcoming turn.
 
         Called before each API call. Return formatted text to inject as
@@ -105,7 +188,13 @@ class MemoryProvider(ABC):
         """
         return ""
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> None:
         """Queue a background recall for the NEXT turn.
 
         Called after each turn completes. The result will be consumed
@@ -120,6 +209,7 @@ class MemoryProvider(ABC):
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Persist a completed turn to the backend.
 
@@ -141,7 +231,14 @@ class MemoryProvider(ABC):
         Return empty list if this provider has no tools (context-only).
         """
 
-    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+    def handle_tool_call(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        *,
+        context: Optional[MemoryTurnContext] = None,
+        **kwargs,
+    ) -> str:
         """Handle a tool call for one of this provider's tools.
 
         Must return a JSON string (the tool result).

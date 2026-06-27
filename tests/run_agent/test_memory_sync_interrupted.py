@@ -130,6 +130,85 @@ class TestSyncExternalMemoryForTurn:
             messages=messages,
         )
 
+    def test_completed_turn_prepends_observed_context_messages_for_memory_sync_once(self):
+        agent = _bare_agent()
+        observed = [
+            {
+                "role": "user",
+                "content": "[Alice]\nfavorite snack is oreo",
+                "observed": True,
+                "memory_source": {"platform": "feishu", "user_id": "ou_alice"},
+            }
+        ]
+        messages = [
+            {"role": "user", "content": "what did Alice mention?"},
+            {"role": "assistant", "content": "Alice mentioned oreos."},
+        ]
+        agent._memory_observed_context_messages = list(observed)
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="what did Alice mention?",
+            final_response="Alice mentioned oreos.",
+            interrupted=False,
+            messages=messages,
+        )
+
+        agent._memory_manager.sync_all.assert_called_once_with(
+            "what did Alice mention?",
+            "Alice mentioned oreos.",
+            session_id="test_session_001",
+            messages=observed + messages,
+        )
+        assert getattr(agent, "_memory_observed_context_messages", None) == []
+
+    def test_completed_turn_inserts_observed_context_before_current_user_for_memory_sync(self):
+        """Observed rows must be adjacent to the current addressed user turn.
+
+        OpenViking slices the current turn by walking backward from the current
+        user message and collecting immediately-preceding observed rows. Live
+        gateway transcripts include older user/assistant history before the
+        current turn, so blindly prepending observed rows to the whole
+        transcript makes them invisible to that slice.
+        """
+        agent = _bare_agent()
+        observed = [
+            {
+                "role": "user",
+                "content": "[Alice]\nFrance beat Norway and Portugal plays tomorrow",
+                "observed": True,
+                "memory_source": {"platform": "feishu", "user_id": "ou_alice"},
+            }
+        ]
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "what am I happy about?"},
+            {"role": "assistant", "content": "France beat Norway."},
+        ]
+        agent._memory_observed_context_messages = list(observed)
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="what am I happy about?",
+            final_response="France beat Norway.",
+            interrupted=False,
+            messages=messages,
+        )
+
+        expected_messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            observed[0],
+            {"role": "user", "content": "what am I happy about?"},
+            {"role": "assistant", "content": "France beat Norway."},
+        ]
+        agent._memory_manager.sync_all.assert_called_once_with(
+            "what am I happy about?",
+            "France beat Norway.",
+            session_id="test_session_001",
+            messages=expected_messages,
+        )
+        assert getattr(agent, "_memory_observed_context_messages", None) == []
+
     def test_completed_skill_turn_keeps_original_message_for_memory_manager(self):
         """Provider-specific query shaping belongs inside the provider.
 

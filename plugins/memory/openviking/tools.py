@@ -147,15 +147,21 @@ class OpenVikingToolMixin:
                 return uri[: -len(suffix)] or "viking://"
         return uri
 
-    def _is_directory_uri(self, uri: str) -> bool | None:
+    def _tool_client(self, context: Optional[Any] = None) -> Any:
+        if getattr(self, "_team_mode", lambda: False)() and hasattr(self, "_client_for_context"):
+            return self._client_for_context(context)
+        return self._client
+
+    def _is_directory_uri(self, uri: str, *, client: Optional[Any] = None) -> bool | None:
         """Probe fs/stat to decide if a URI is a directory.
 
         Returns True/False when the server answers cleanly, and None when the
         probe itself fails (network error, unexpected shape). Callers should
         treat None as "unknown" and fall back to the exception-based path.
         """
+        client = client or self._client
         try:
-            resp = self._client.get("/api/v1/fs/stat", params={"uri": uri})
+            resp = client.get("/api/v1/fs/stat", params={"uri": uri})
         except Exception:
             return None
         result = self._unwrap_result(resp)
@@ -170,23 +176,29 @@ class OpenVikingToolMixin:
                 return False
         return None
 
-    def _tool_search(self, args: dict) -> str:
+    def _tool_search(self, args: dict, *, context: Optional[Any] = None) -> str:
         query = args.get("query", "")
         if not query:
             return tool_error("query is required")
 
+        team_mode = bool(getattr(self, "_team_mode", lambda: False)())
+        if team_mode and args.get("scope"):
+            return tool_error(
+                "scope is not supported in OpenViking team mode; search uses the shared team memory namespace"
+            )
+
         payload: Dict[str, Any] = {"query": query}
         mode = args.get("mode", "auto")
-        if args.get("scope"):
+        if args.get("scope") and not team_mode:
             payload["target_uri"] = args["scope"]
         if args.get("limit"):
             payload["limit"] = args["limit"]
 
         endpoint = "/api/v1/search/search" if mode == "deep" else "/api/v1/search/find"
-        if endpoint == "/api/v1/search/search" and self._session_id:
+        if endpoint == "/api/v1/search/search" and self._session_id and not team_mode:
             payload["session_id"] = self._session_id
 
-        resp = self._client.post(endpoint, payload)
+        resp = self._tool_client(context).post(endpoint, payload)
         result = resp.get("result", {})
 
         # Format results for the model — keep it concise
@@ -220,7 +232,9 @@ class OpenVikingToolMixin:
         level: str,
         *,
         limit: Optional[int] = None,
+        client: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        client = client or self._client
         summary_level = level in {"abstract", "overview"}
         # OpenViking expects directory URIs for pseudo summary files
         # (e.g. viking://user/hermes/.overview.md).
@@ -234,7 +248,7 @@ class OpenVikingToolMixin:
         # round-trip. The pseudo-URI path already points at a directory, so
         # skip the probe there.
         if summary_level and resolved_uri == uri:
-            is_dir = self._is_directory_uri(uri)
+            is_dir = self._is_directory_uri(uri, client=client)
             if is_dir is False:
                 resolved_uri = uri
                 used_fallback = True
@@ -248,13 +262,13 @@ class OpenVikingToolMixin:
                 endpoint = "/api/v1/content/overview"
 
         try:
-            resp = self._client.get(endpoint, params={"uri": resolved_uri})
+            resp = client.get(endpoint, params={"uri": resolved_uri})
         except Exception:
             # OpenViking may return HTTP 500 for abstract/overview reads on normal
             # file URIs (mem_*.md). For those, gracefully fallback to full read.
             if not summary_level or resolved_uri != uri or used_fallback:
                 raise
-            resp = self._client.get("/api/v1/content/read", params={"uri": uri})
+            resp = client.get("/api/v1/content/read", params={"uri": uri})
             used_fallback = True
 
         result = self._unwrap_result(resp)
@@ -289,7 +303,7 @@ class OpenVikingToolMixin:
 
         return payload
 
-    def _tool_read(self, args: dict) -> str:
+    def _tool_read(self, args: dict, *, context: Optional[Any] = None) -> str:
         level = args.get("level", "overview")
         uri_arg = args.get("uri", "")
         uris_arg = args.get("uris", [])
@@ -320,6 +334,7 @@ class OpenVikingToolMixin:
             return tool_error("uri or uris is required")
 
         selected = uris[:_READ_BATCH_LIMIT]
+        client = self._tool_client(context)
         per_item_limit = (
             _READ_BATCH_FULL_LIMIT
             if len(selected) > 1 and level == "full"
@@ -327,7 +342,7 @@ class OpenVikingToolMixin:
         )
         if len(selected) == 1 and not batch_requested:
             return json.dumps(
-                self._read_uri_payload(selected[0], level),
+                self._read_uri_payload(selected[0], level, client=client),
                 ensure_ascii=False,
             )
 
@@ -335,7 +350,7 @@ class OpenVikingToolMixin:
         for uri in selected:
             try:
                 results.append(
-                    self._read_uri_payload(uri, level, limit=per_item_limit)
+                    self._read_uri_payload(uri, level, limit=per_item_limit, client=client)
                 )
             except Exception as e:
                 results.append({"uri": uri, "level": level, "error": str(e)})
@@ -351,14 +366,14 @@ class OpenVikingToolMixin:
             ensure_ascii=False,
         )
 
-    def _tool_browse(self, args: dict) -> str:
+    def _tool_browse(self, args: dict, *, context: Optional[Any] = None) -> str:
         action = args.get("action", "list")
         path = args.get("path", "viking://")
 
         # Map action to the correct fs endpoint (all GET with uri= param)
         endpoint_map = {"tree": "/api/v1/fs/tree", "list": "/api/v1/fs/ls", "stat": "/api/v1/fs/stat"}
         endpoint = endpoint_map.get(action, "/api/v1/fs/ls")
-        resp = self._client.get(endpoint, params={"uri": path})
+        resp = self._tool_client(context).get(endpoint, params={"uri": path})
         result = self._unwrap_result(resp)
 
         # Format list/tree results for readability
@@ -383,20 +398,33 @@ class OpenVikingToolMixin:
 
         return json.dumps(result, ensure_ascii=False)
 
-    def _tool_remember(self, args: dict) -> str:
+    def _tool_remember(self, args: dict, *, context: Optional[Any] = None) -> str:
         content = args.get("content", "")
         if not content:
             return tool_error("content is required")
 
         category = args.get("category", "")
         subdir = _CATEGORY_SUBDIR_MAP.get(category, _DEFAULT_MEMORY_SUBDIR)
-        uri = self._build_memory_uri(subdir)
+        try:
+            if getattr(self, "_team_mode", lambda: False)():
+                if category in {"case", "pattern"}:
+                    peer_id = self._assistant_peer_id()
+                else:
+                    peer_id = self._peer_id_for_context(context)
+            else:
+                peer_id = self._assistant_peer_id()
+        except ValueError as e:
+            return tool_error(str(e))
+        uri = self._build_memory_uri(subdir, peer_id=peer_id)
 
         # Write directly via content/write API.
         # This creates the file, stores the content, and queues vector indexing
         # in a single call — no dependency on session commit / VLM extraction.
         try:
-            result = self._client.post("/api/v1/content/write", {
+            client = self._tool_client(context)
+            if getattr(self, "_team_mode", lambda: False)() and peer_id != self._assistant_peer_id():
+                self._write_peer_profile(client, context)
+            result = client.post("/api/v1/content/write", {
                 "uri": uri,
                 "content": content,
                 "mode": "create",
@@ -410,12 +438,13 @@ class OpenVikingToolMixin:
             logger.error("OpenViking content/write failed: %s", e)
             return tool_error(f"Failed to store memory: {e}")
 
-    def _tool_forget(self, args: dict) -> str:
+    def _tool_forget(self, args: dict, *, context: Optional[Any] = None) -> str:
         uri, error = _validate_forget_memory_uri(args.get("uri"))
         if error:
             return tool_error(error)
 
-        resp = self._client.delete(
+        client = self._tool_client(context)
+        resp = client.delete(
             "/api/v1/fs",
             params={"uri": uri, "recursive": False},
         )

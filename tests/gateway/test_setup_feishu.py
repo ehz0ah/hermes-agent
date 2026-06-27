@@ -26,9 +26,9 @@ def _run_setup_feishu(
     """
     existing_env = existing_env or {}
     prompt_yes_no_responses = list(prompt_yes_no_responses or [True])
-    # QR path: method(0), dm(0), group(0) — 3 choices (no connection mode)
-    # Manual path: method(1), domain(0), connection(0), dm(0), group(0) — 5 choices
-    prompt_choice_responses = list(prompt_choice_responses or [0, 0, 0])
+    # QR path: method(0), dm(0), group(0), observe(0) — no connection mode.
+    # Manual path: method(1), domain(0), connection(0), dm(0), group(0), observe(0).
+    prompt_choice_responses = list(prompt_choice_responses or [0, 0, 0, 0])
     prompt_responses = list(prompt_responses or [""])
 
     saved_env = {}
@@ -75,7 +75,7 @@ class TestSetupFeishuQrPath:
                 "bot_open_id": "ou_bot",
             },
             prompt_yes_no_responses=[True],        # Start QR
-            prompt_choice_responses=[0, 0, 0],  # method=QR, dm=pairing, group=open
+            prompt_choice_responses=[0, 0, 0, 0],  # method=QR, dm=pairing, group=open, observe=yes
             prompt_responses=[""],                  # home channel: skip
         )
         assert env["FEISHU_APP_ID"] == "cli_test"
@@ -95,7 +95,7 @@ class TestSetupFeishuQrPath:
                 "bot_open_id": "ou_bot",
             },
             prompt_yes_no_responses=[True],
-            prompt_choice_responses=[0, 0, 0],
+            prompt_choice_responses=[0, 0, 0, 0],
             prompt_responses=[""],
         )
         assert "FEISHU_BOT_OPEN_ID" not in env
@@ -115,7 +115,7 @@ class TestSetupFeishuConnectionMode:
                 "app_id": "cli_test", "app_secret": "s", "domain": "feishu",
                 "open_id": None, "bot_name": None, "bot_open_id": None,
             },
-            prompt_choice_responses=[0, 0, 0],  # method=QR, dm=pairing, group=open
+            prompt_choice_responses=[0, 0, 0, 0],  # method=QR, dm=pairing, group=open, observe=yes
             prompt_responses=[""],
         )
         assert env["FEISHU_CONNECTION_MODE"] == "websocket"
@@ -124,7 +124,7 @@ class TestSetupFeishuConnectionMode:
     def test_manual_path_websocket(self, _mock_probe):
         env = _run_setup_feishu(
             qr_result=None,
-            prompt_choice_responses=[1, 0, 0, 0, 0],  # method=manual, domain=feishu, connection=ws, dm=pairing, group=open
+            prompt_choice_responses=[1, 0, 0, 0, 0, 0],  # method=manual, domain=feishu, connection=ws, dm=pairing, group=open, observe=yes
             prompt_responses=["cli_manual", "secret_manual", ""],  # app_id, app_secret, home_channel
         )
         assert env["FEISHU_CONNECTION_MODE"] == "websocket"
@@ -133,7 +133,7 @@ class TestSetupFeishuConnectionMode:
     def test_manual_path_webhook(self, _mock_probe):
         env = _run_setup_feishu(
             qr_result=None,
-            prompt_choice_responses=[1, 0, 1, 0, 0],  # method=manual, domain=feishu, connection=webhook, dm=pairing, group=open
+            prompt_choice_responses=[1, 0, 1, 0, 0, 0],  # method=manual, domain=feishu, connection=webhook, dm=pairing, group=open, observe=yes
             prompt_responses=["cli_manual", "secret_manual", ""],  # app_id, app_secret, home_channel
         )
         assert env["FEISHU_CONNECTION_MODE"] == "webhook"
@@ -153,7 +153,7 @@ class TestSetupFeishuDmPolicy:
                 "open_id": "ou_owner", "bot_name": None, "bot_open_id": None,
             },
             prompt_yes_no_responses=[True],
-            prompt_choice_responses=[0, dm_choice_idx, 0],  # method=QR, dm=<choice>, group=open
+            prompt_choice_responses=[0, dm_choice_idx, 0, 0],  # method=QR, dm=<choice>, group=open, observe=yes
             prompt_responses=prompt_responses or [""],
         )
 
@@ -196,10 +196,11 @@ class TestSetupFeishuGroupPolicy:
                 "open_id": None, "bot_name": None, "bot_open_id": None,
             },
             prompt_yes_no_responses=[True],
-            prompt_choice_responses=[0, 0, 0],  # method=QR, dm=pairing, group=open
+            prompt_choice_responses=[0, 0, 0, 0],  # method=QR, dm=pairing, group=open, observe=yes
             prompt_responses=[""],
         )
         assert env["FEISHU_GROUP_POLICY"] == "open"
+        assert env["FEISHU_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] == "true"
 
     def test_disabled(self):
         env = _run_setup_feishu(
@@ -212,6 +213,7 @@ class TestSetupFeishuGroupPolicy:
             prompt_responses=[""],
         )
         assert env["FEISHU_GROUP_POLICY"] == "disabled"
+        assert env["FEISHU_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] == "false"
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +239,9 @@ class TestSetupFeishuAdapterIntegration:
                 "bot_open_id": "ou_bot_integration",
             },
             prompt_yes_no_responses=[True],
-            prompt_choice_responses=[0, dm_idx, group_idx],  # method=QR, dm, group
+            prompt_choice_responses=(
+                [0, dm_idx, group_idx, 0] if group_idx == 0 else [0, dm_idx, group_idx]
+            ),
             prompt_responses=[""],
         )
 
@@ -254,6 +258,7 @@ class TestSetupFeishuAdapterIntegration:
             assert adapter._app_secret == "test_secret_value"
             assert adapter._domain_name == "feishu"
             assert adapter._connection_mode == "websocket"
+            assert adapter._observe_unmentioned_group_messages is True
 
     @patch.dict(os.environ, {}, clear=True)
     def test_open_dm_env_sets_correct_adapter_state(self):

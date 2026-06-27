@@ -160,6 +160,7 @@ class SessionSource:
     chat_type: str = "dm"  # "dm", "group", "channel", "thread"
     user_id: Optional[str] = None
     user_name: Optional[str] = None
+    user_handle: Optional[str] = None  # Platform-native mention string, if available
     thread_id: Optional[str] = None  # For forum topics, Discord threads, etc.
     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
     user_id_alt: Optional[str] = None  # Platform-specific stable alt ID (Signal UUID, Feishu union_id)
@@ -242,6 +243,7 @@ class SessionSource:
             "chat_type": self.chat_type,
             "user_id": self.user_id,
             "user_name": self.user_name,
+            "user_handle": self.user_handle,
             "thread_id": self.thread_id,
             "chat_topic": self.chat_topic,
         }
@@ -278,6 +280,7 @@ class SessionSource:
             chat_type=data.get("chat_type", "dm"),
             user_id=data.get("user_id"),
             user_name=data.get("user_name"),
+            user_handle=data.get("user_handle"),
             thread_id=data.get("thread_id"),
             chat_topic=data.get("chat_topic"),
             user_id_alt=data.get("user_id_alt"),
@@ -2429,6 +2432,7 @@ class SessionStore:
                         message.get("platform_message_id") or message.get("message_id")
                     ),
                     observed=bool(message.get("observed")),
+                    memory_source=message.get("memory_source"),
                     timestamp=message.get("timestamp"),
                 )
             except Exception as e:

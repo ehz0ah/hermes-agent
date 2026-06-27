@@ -3484,17 +3484,54 @@ class AIAgent:
             return
         try:
             sync_kwargs = {"session_id": self.session_id or ""}
+            observed_messages = getattr(self, "_memory_observed_context_messages", None)
+            if observed_messages is not None:
+                self._memory_observed_context_messages = []
             if messages is not None:
-                sync_kwargs["messages"] = messages
+                if observed_messages:
+                    observed_for_sync = [
+                        dict(message)
+                        for message in observed_messages
+                        if isinstance(message, dict)
+                    ]
+                    messages_for_sync = [dict(message) if isinstance(message, dict) else message for message in messages]
+                    if observed_for_sync:
+                        # Keep observed rows adjacent to the addressed user
+                        # turn. OpenViking slices the current turn by walking
+                        # backward from that user row and collecting
+                        # immediately-preceding observed rows; prepending to
+                        # the full transcript hides them behind older history.
+                        insert_at = 0
+                        for idx in range(len(messages_for_sync) - 1, -1, -1):
+                            message = messages_for_sync[idx]
+                            if (
+                                isinstance(message, dict)
+                                and message.get("role") == "user"
+                                and not message.get("observed")
+                            ):
+                                insert_at = idx
+                                break
+                        sync_kwargs["messages"] = (
+                            messages_for_sync[:insert_at]
+                            + observed_for_sync
+                            + messages_for_sync[insert_at:]
+                        )
+                    else:
+                        sync_kwargs["messages"] = messages_for_sync
+                else:
+                    sync_kwargs["messages"] = messages
+            _memory_turn_context = getattr(self, "_memory_turn_context", None)
+            if _memory_turn_context is not None:
+                sync_kwargs["context"] = _memory_turn_context
             self._memory_manager.sync_all(
                 user_text,
                 response_text,
                 **sync_kwargs,
             )
-            self._memory_manager.queue_prefetch_all(
-                user_text,
-                session_id=self.session_id or "",
-            )
+            prefetch_kwargs = {"session_id": self.session_id or ""}
+            if _memory_turn_context is not None:
+                prefetch_kwargs["context"] = _memory_turn_context
+            self._memory_manager.queue_prefetch_all(user_text, **prefetch_kwargs)
         except Exception:
             pass
 

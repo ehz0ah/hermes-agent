@@ -110,8 +110,10 @@ def _reply_anchor_for_event(event) -> str | None:
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "telegram" and thread_id:
         return None
-    if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
-        return getattr(event, "reply_to_message_id", None)
+    if platform == "feishu":
+        if thread_id:
+            return getattr(event, "reply_to_message_id", None) or getattr(event, "message_id", None)
+        return None
     return getattr(event, "message_id", None)
 
 
@@ -1756,6 +1758,13 @@ class MessageEvent:
     
     # Source information
     source: SessionSource = None
+    # Optional identity used only for session routing.  Delivery, auth, and
+    # sender metadata still use ``source``.
+    session_source: Optional[SessionSource] = None
+    # Optional identity used only for memory attribution.  Platforms that route
+    # an addressed group turn through a shared chat/session source can still
+    # preserve the original human speaker here.
+    memory_source: Optional[SessionSource] = None
     
     # Original platform data
     raw_message: Any = None
@@ -4667,8 +4676,9 @@ class BasePlatformAdapter(ABC):
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        session_source = event.session_source or event.source
         session_key = build_session_key(
-            event.source,
+            session_source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
@@ -5504,6 +5514,7 @@ class BasePlatformAdapter(ABC):
         chat_type: str = "dm",
         user_id: Optional[str] = None,
         user_name: Optional[str] = None,
+        user_handle: Optional[str] = None,
         thread_id: Optional[str] = None,
         chat_topic: Optional[str] = None,
         user_id_alt: Optional[str] = None,
@@ -5565,6 +5576,7 @@ class BasePlatformAdapter(ABC):
             chat_type=chat_type,
             user_id=str(user_id) if user_id else None,
             user_name=user_name,
+            user_handle=user_handle,
             thread_id=str(thread_id) if thread_id else None,
             chat_topic=chat_topic.strip() if chat_topic else None,
             user_id_alt=user_id_alt,

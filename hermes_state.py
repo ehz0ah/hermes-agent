@@ -816,6 +816,7 @@ CREATE TABLE IF NOT EXISTS messages (
     codex_message_items TEXT,
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
+    memory_source TEXT,
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0
 );
@@ -3805,6 +3806,7 @@ class SessionDB:
         platform_message_id: str = None,
         observed: bool = False,
         effect_disposition: Optional[str] = None,
+        memory_source: Any = None,
         timestamp: Any = None,
     ) -> int:
         """
@@ -3833,6 +3835,7 @@ class SessionDB:
             if codex_message_items else None
         )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        memory_source_json = json.dumps(memory_source) if memory_source else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
@@ -3857,8 +3860,8 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, memory_source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -3878,6 +3881,7 @@ class SessionDB:
                     platform_message_id,
                     1 if observed else 0,
                     1,
+                    memory_source_json,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -3940,6 +3944,7 @@ class SessionDB:
                 json.dumps(codex_message_items) if codex_message_items else None
             )
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+            memory_source_json = json.dumps(msg.get("memory_source")) if msg.get("memory_source") else None
             # Accept either `platform_message_id` (new explicit name) or
             # `message_id` (yuanbao's existing convention on message dicts).
             platform_msg_id = (
@@ -3950,8 +3955,8 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, memory_source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -3971,6 +3976,7 @@ class SessionDB:
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
                     1,
+                    memory_source_json,
                 ),
             )
             inserted += 1
@@ -4143,6 +4149,12 @@ class SessionDB:
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
                     msg["tool_calls"] = []
+            if msg.get("memory_source"):
+                try:
+                    msg["memory_source"] = json.loads(msg["memory_source"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize memory_source in get_messages, dropping it")
+                    msg.pop("memory_source", None)
             result.append(msg)
         return result
 
@@ -4457,7 +4469,8 @@ class SessionDB:
             rows = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
-                "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
+                "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
+                "memory_source, timestamp "
                 f"FROM messages WHERE session_id IN ({placeholders})"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
                 # append_message stamps rows with time.time(), which is not
@@ -4500,6 +4513,14 @@ class SessionDB:
                 msg["message_id"] = row["platform_message_id"]
             if row["observed"]:
                 msg["observed"] = True
+            if row["memory_source"]:
+                try:
+                    memory_source = json.loads(row["memory_source"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize memory_source in conversation replay")
+                    memory_source = None
+                if isinstance(memory_source, dict):
+                    msg["memory_source"] = memory_source
             # Restore reasoning fields on assistant messages so providers
             # that replay reasoning (OpenRouter, OpenAI, Nous) receive
             # coherent multi-turn reasoning context.

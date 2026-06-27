@@ -237,6 +237,8 @@ FEISHU_GROUP_POLICY=allowlist   # default
 
 In all modes, the bot must be explicitly @mentioned (or @all) in the group before the message is processed. Direct messages always bypass this gate.
 
+Set `FEISHU_OBSERVE_UNMENTIONED_GROUP_MESSAGES=true` to let Hermes record allowed group messages as context without replying or taking action until it is @mentioned. This is the recommended group setting when Feishu/Lark is paired with OpenViking team memory.
+
 Set `FEISHU_REQUIRE_MENTION=false` to let Hermes read all group traffic without requiring an @mention:
 
 ```bash
@@ -547,6 +549,7 @@ Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedu
 | `FEISHU_ALLOWED_USERS` | — | _(empty)_ | Comma-separated open_id list for user allowlist |
 | `FEISHU_ALLOW_BOTS` | — | `none` | Accept messages from other bots: `none`, `mentions`, or `all` |
 | `FEISHU_REQUIRE_MENTION` | — | `true` | Whether group messages must @mention the bot |
+| `FEISHU_OBSERVE_UNMENTIONED_GROUP_MESSAGES` | — | `false` | Silently record allowed unmentioned group messages without replying |
 | `FEISHU_HOME_CHANNEL` | — | — | Chat ID for cron/notification output |
 | `FEISHU_ENCRYPT_KEY` | — | _(empty)_ | Encrypt key for webhook signature verification |
 | `FEISHU_VERIFICATION_TOKEN` | — | _(empty)_ | Verification token for webhook payload auth |

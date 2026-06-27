@@ -42,6 +42,10 @@ from .constants import (
 )
 
 
+_IDENTITY_MODE_SOLO = "solo"
+_IDENTITY_MODE_TEAM = "team"
+
+
 def _facade_attr(name: str, default):
     facade = sys.modules.get(__package__)
     return getattr(facade, name, default) if facade is not None else default
@@ -329,6 +333,21 @@ def _set_openviking_provider(config: dict, provider_config: dict) -> None:
     config["memory"]["openviking"] = provider_config
 
 
+def _prompt_identity_mode(select, cancelled) -> str | object:
+    choice = select(
+        "  OpenViking memory mode",
+        [
+            ("Solo", "one Hermes agent to one human; default and backward compatible"),
+            ("Team", "messaging gateway mode; one Hermes agent observes a team/channel"),
+        ],
+        default=0,
+        cancel_returns=cancelled,
+    )
+    if choice == cancelled:
+        return _SETUP_CANCELLED
+    return _IDENTITY_MODE_TEAM if choice == 1 else _IDENTITY_MODE_SOLO
+
+
 def _link_ovcli_profile(
     *,
     config: dict,
@@ -417,6 +436,10 @@ def _run_existing_profile_setup(
         _print_validation_progress("Validating OpenViking profile...")
         ok, message, _role = _validate_profile_for_setup(profile)
         if ok:
+            identity_mode = _prompt_identity_mode(select, cancelled)
+            if identity_mode is _SETUP_CANCELLED:
+                return _SETUP_CANCELLED
+            provider_config["identity_mode"] = identity_mode
             _link_ovcli_profile(
                 config=config,
                 provider_config=provider_config,
@@ -443,6 +466,10 @@ def _run_existing_profile_setup(
             _print_validation_progress("Validating OpenViking profile...")
             ok, message, _role = _validate_profile_for_setup(profile)
             if ok:
+                identity_mode = _prompt_identity_mode(select, cancelled)
+                if identity_mode is _SETUP_CANCELLED:
+                    return _SETUP_CANCELLED
+                provider_config["identity_mode"] = identity_mode
                 _link_ovcli_profile(
                     config=config,
                     provider_config=provider_config,
@@ -503,6 +530,11 @@ def _run_create_profile_setup(
         return _SETUP_CANCELLED
     if values is None:
         return False
+
+    identity_mode = _prompt_identity_mode(select, cancelled)
+    if identity_mode is _SETUP_CANCELLED:
+        return _SETUP_CANCELLED
+    provider_config["identity_mode"] = identity_mode
 
     save_choice = select(
         "  Save OpenViking config",

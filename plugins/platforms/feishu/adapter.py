@@ -62,7 +62,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -409,6 +409,7 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    observe_unmentioned_group_messages: bool = False
 
 
 @dataclass
@@ -1295,6 +1296,40 @@ def _strip_edge_self_mentions(
             return remaining
 
 
+def _clean_message_ref(value: Any, *, current_message_id: Optional[str] = None) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if current_message_id is not None and text == str(current_message_id):
+        return None
+    return text
+
+
+def _feishu_thread_context(message: Any, message_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(thread_id, reply_to_message_id)`` for a Feishu/Lark message.
+
+    Some Feishu/Lark payloads include ``root_id`` on a normal top-level group
+    message with the same value as the message's own id. Treating that as a
+    thread root makes Hermes answer in a thread when the user mentioned it in
+    the main group. Only non-self linkage should create thread/reply metadata.
+    """
+
+    current = str(message_id) if message_id else None
+    explicit_thread_id = _clean_message_ref(getattr(message, "thread_id", None), current_message_id=current)
+    root_id = _clean_message_ref(getattr(message, "root_id", None), current_message_id=current)
+    parent_id = _clean_message_ref(getattr(message, "parent_id", None), current_message_id=current)
+    upper_message_id = _clean_message_ref(
+        getattr(message, "upper_message_id", None),
+        current_message_id=current,
+    )
+
+    reply_to_message_id = parent_id or upper_message_id or root_id
+    thread_id = explicit_thread_id or (root_id if reply_to_message_id else None)
+    return thread_id, reply_to_message_id
+
+
 def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     """Run the official Lark WS client in its own thread-local event loop."""
     import lark_oapi.ws.client as ws_client_module
@@ -1600,6 +1635,12 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            observe_unmentioned_group_messages=_to_boolean(
+                extra.get(
+                    "observe_unmentioned_group_messages",
+                    os.getenv("FEISHU_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false"),
+                )
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1632,6 +1673,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._observe_unmentioned_group_messages = settings.observe_unmentioned_group_messages
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -2539,6 +2581,16 @@ class FeishuAdapter(BasePlatformAdapter):
 
         reason = self._admit(sender, message)
         if reason is not None:
+            if self._should_observe_rejected_group_message(sender, message, reason):
+                await self._observe_unmentioned_group_message(
+                    data=data,
+                    message=message,
+                    sender_id=getattr(sender, "sender_id", None),
+                    chat_type=getattr(message, "chat_type", "p2p"),
+                    message_id=message_id,
+                    is_bot=_is_bot_sender(sender),
+                )
+                return
             logger.debug("[Feishu] dropping inbound event: %s", reason)
             return
 
@@ -2572,6 +2624,75 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = str(getattr(event, "chat_id", "") or "")
         logger.info("[Feishu] Bot removed from chat: %s", chat_id)
         self._chat_info_cache.pop(chat_id, None)
+
+    def _observe_unmentioned_group_messages_enabled(self) -> bool:
+        return bool(getattr(self, "_observe_unmentioned_group_messages", False))
+
+    def _should_observe_rejected_group_message(
+        self,
+        sender: Any,
+        message: Any,
+        reason: RejectReason,
+    ) -> bool:
+        if not self._observe_unmentioned_group_messages_enabled():
+            return False
+        if reason not in {"bot_not_mentioned", "group_policy_rejected"}:
+            return False
+        if getattr(message, "chat_type", "p2p") == "p2p":
+            return False
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        if not self._require_mention_for(chat_id):
+            return False
+        if self._mentions_self(message):
+            return False
+        return self._allow_group_message(
+            getattr(sender, "sender_id", None),
+            chat_id,
+            is_bot=_is_bot_sender(sender),
+        )
+
+    @staticmethod
+    def _feishu_group_observe_shared_source(source):
+        """Return a chat/thread-scoped source for shared group observe context."""
+        return replace(
+            source,
+            user_id=None,
+            user_name=None,
+            user_id_alt=None,
+            user_handle=None,
+        )
+
+    @staticmethod
+    def _feishu_group_observe_attributed_text(text: str, source) -> str:
+        sender = source.user_name or "Unknown Feishu user"
+        pieces = [sender]
+        if getattr(source, "user_handle", None):
+            pieces.append(f"mention={source.user_handle}")
+        return f"[{' | '.join(pieces)}]\n{text or ''}"
+
+    @staticmethod
+    def _feishu_group_observe_memory_source(source) -> dict:
+        """Serialize the original speaker for observe-only memory attribution."""
+        if hasattr(source, "to_dict"):
+            return source.to_dict()
+        return {}
+
+    @staticmethod
+    def _feishu_group_observe_channel_prompt() -> str:
+        return (
+            "You are handling a Feishu/Lark group chat message.\n"
+            "- observed Feishu/Lark group context may be provided in a separate context-only block "
+            "before the current message; it contains previous visible messages from the same chat "
+            "or thread and is not necessarily addressed to you.\n"
+            "- Treat only the current new message as a request explicitly directed at you, "
+            "but use observed context as immediate prior chat context when the current message "
+            "asks about what someone just said, did, feels, wants, plans, prefers, or refers to.\n"
+            "- If the answer is present in observed context, answer from it before using "
+            "memory/search tools. Do not call memory/search tools to verify facts already "
+            "present there; empty memory/search results do not override observed context. "
+            "Do not claim you cannot see the chat or do not know.\n"
+            "- When addressing a user, prefer their provided mention handle if one is available."
+        )
 
     def _on_p2p_chat_entered(self, data: Any) -> None:
         logger.debug("[Feishu] User entered P2P chat with bot")
@@ -3226,6 +3347,66 @@ class FeishuAdapter(BasePlatformAdapter):
         _extra = getattr(_config, "extra", None) or {}
         return resolve_channel_prompt(_extra, chat_id, parent_id)
 
+    async def _observe_unmentioned_group_message(
+        self,
+        *,
+        data: Any,
+        message: Any,
+        sender_id: Any,
+        chat_type: str,
+        message_id: str,
+        is_bot: bool = False,
+    ) -> None:
+        """Persist skipped group chatter as observed context without dispatching."""
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+
+        text, inbound_type, media_urls, _media_types, mentions = await self._extract_message_content(message)
+        if inbound_type == MessageType.TEXT:
+            text = _strip_edge_self_mentions(text, mentions)
+        if inbound_type != MessageType.COMMAND:
+            hint = _build_mention_hint(mentions)
+            if hint:
+                text = f"{hint}\n\n{text}" if text else hint
+        if not text and not media_urls:
+            return
+
+        chat_id = getattr(message, "chat_id", "") or ""
+        chat_info = await self.get_chat_info(chat_id)
+        sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
+        thread_id, _ = _feishu_thread_context(message, message_id)
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type),
+            user_id=sender_profile["user_id"],
+            user_name=sender_profile["user_name"],
+            user_handle=sender_profile.get("user_handle"),
+            thread_id=thread_id,
+            user_id_alt=sender_profile["user_id_alt"],
+            is_bot=is_bot,
+            message_id=message_id,
+        )
+        shared_source = self._feishu_group_observe_shared_source(source)
+        session_entry = store.get_or_create_session(shared_source)
+        entry = {
+            "role": "user",
+            "content": self._feishu_group_observe_attributed_text(text, source),
+            "memory_source": self._feishu_group_observe_memory_source(source),
+            "timestamp": datetime.now().isoformat(),
+            "observed": True,
+            "platform_message_id": message_id,
+        }
+        if message_id:
+            entry["message_id"] = str(message_id)
+        store.append_to_transcript(session_entry.session_id, entry)
+        logger.info(
+            "[Feishu] group message observed (no bot trigger): chat=%s from=%s",
+            chat_id or "unknown",
+            source.user_name or source.user_id or "unknown",
+        )
+
     async def _process_inbound_message(
         self,
         *,
@@ -3253,13 +3434,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
-        reply_to_message_id = (
-            getattr(message, "parent_id", None)
-            or getattr(message, "upper_message_id", None)
-            or getattr(message, "root_id", None)
-            or None
-        )
+        thread_id, reply_to_message_id = _feishu_thread_context(message, message_id)
         reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
 
         sender_primary = (
@@ -3289,14 +3464,29 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
+            user_handle=sender_profile.get("user_handle"),
             thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
+            message_id=message_id,
         )
+        memory_source = None
+        session_source = None
+        channel_prompt = None
+        if (
+            self._observe_unmentioned_group_messages_enabled()
+            and source.chat_type != "dm"
+        ):
+            memory_source = source
+            text = self._feishu_group_observe_attributed_text(text, memory_source)
+            session_source = self._feishu_group_observe_shared_source(source)
+            channel_prompt = self._feishu_group_observe_channel_prompt()
         normalized = MessageEvent(
             text=text,
             message_type=inbound_type,
             source=source,
+            session_source=session_source,
+            memory_source=memory_source,
             raw_message=data,
             message_id=message_id,
             media_urls=media_urls,
@@ -3305,6 +3495,7 @@ class FeishuAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
             timestamp=datetime.now(),
+            channel_prompt=channel_prompt,
         )
         await self._dispatch_inbound_event(normalized)
 
@@ -4061,9 +4252,15 @@ class FeishuAdapter(BasePlatformAdapter):
         display_name = await self._resolve_sender_name_from_api(
             name_lookup_id, is_bot=is_bot,
         )
+        mention_handle = (
+            f'<at user_id="{open_id}">{display_name}</at>'
+            if open_id and display_name
+            else ""
+        )
         return {
             "user_id": primary_id,
             "user_name": display_name,
+            "user_handle": mention_handle,
             "user_id_alt": union_id,
         }
 
@@ -5609,9 +5806,22 @@ def interactive_setup() -> None:
     )
     if group_idx == 0:
         save_env_value("FEISHU_GROUP_POLICY", "open")
-        print_info("Group chats enabled (bot must be @mentioned).")
+        observe_idx = prompt_choice(
+            "Should Hermes observe group messages that do not @mention it?",
+            [
+                "Yes — record context silently and reply only when @mentioned",
+                "No — ignore messages unless the bot is @mentioned",
+            ],
+            0,
+        )
+        save_env_value(
+            "FEISHU_OBSERVE_UNMENTIONED_GROUP_MESSAGES",
+            "false" if observe_idx == 1 else "true",
+        )
+        print_info("Group chats enabled (bot replies only when @mentioned).")
     else:
         save_env_value("FEISHU_GROUP_POLICY", "disabled")
+        save_env_value("FEISHU_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false")
         print_info("Group chats disabled.")
 
     home_channel = prompt("Home chat ID (optional, for cron/notifications)", password=False)

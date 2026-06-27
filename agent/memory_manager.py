@@ -33,7 +33,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, MemoryTurnContext
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 
@@ -492,7 +492,25 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+    @staticmethod
+    def _call_accepts_keyword(callable_obj: Callable[..., Any], keyword: str) -> bool:
+        """Return whether callable_obj can accept keyword."""
+        try:
+            signature = inspect.signature(callable_obj)
+        except (TypeError, ValueError):
+            return True
+        params = list(signature.parameters.values())
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+            return True
+        return keyword in signature.parameters
+
+    def prefetch_all(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> str:
         """Collect prefetch context from all providers.
 
         Returns merged context text labeled by provider. Empty providers
@@ -504,7 +522,10 @@ class MemoryManager:
         parts = []
         for provider in self._providers:
             try:
-                result = provider.prefetch(clean_query, session_id=session_id)
+                kwargs: Dict[str, Any] = {"session_id": session_id}
+                if context is not None and self._call_accepts_keyword(provider.prefetch, "context"):
+                    kwargs["context"] = context
+                result = provider.prefetch(clean_query, **kwargs)
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -514,7 +535,13 @@ class MemoryManager:
                 )
         return "\n\n".join(parts)
 
-    def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch_all(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> None:
         """Queue background prefetch on all providers for the next turn.
 
         Provider work is dispatched to a background worker so a slow or
@@ -532,7 +559,10 @@ class MemoryManager:
         def _run() -> None:
             for provider in providers:
                 try:
-                    provider.queue_prefetch(clean_query, session_id=session_id)
+                    kwargs: Dict[str, Any] = {"session_id": session_id}
+                    if context is not None and self._call_accepts_keyword(provider.queue_prefetch, "context"):
+                        kwargs["context"] = context
+                    provider.queue_prefetch(clean_query, **kwargs)
                 except Exception as e:
                     logger.debug(
                         "Memory provider '%s' queue_prefetch failed (non-fatal): %s",
@@ -546,14 +576,7 @@ class MemoryManager:
     @staticmethod
     def _provider_sync_accepts_messages(provider: MemoryProvider) -> bool:
         """Return whether sync_turn accepts a messages keyword."""
-        try:
-            signature = inspect.signature(provider.sync_turn)
-        except (TypeError, ValueError):
-            return True
-        params = list(signature.parameters.values())
-        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
-            return True
-        return "messages" in signature.parameters
+        return MemoryManager._call_accepts_keyword(provider.sync_turn, "messages")
 
     def sync_all(
         self,
@@ -562,6 +585,7 @@ class MemoryManager:
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Sync a completed turn to all providers.
 
@@ -592,19 +616,12 @@ class MemoryManager:
         def _run() -> None:
             for provider in providers:
                 try:
+                    kwargs: Dict[str, Any] = {"session_id": session_id}
                     if messages is not None and self._provider_sync_accepts_messages(provider):
-                        provider.sync_turn(
-                            user_content,
-                            assistant_content,
-                            session_id=session_id,
-                            messages=messages,
-                        )
-                    else:
-                        provider.sync_turn(
-                            user_content,
-                            assistant_content,
-                            session_id=session_id,
-                        )
+                        kwargs["messages"] = messages
+                    if context is not None and self._call_accepts_keyword(provider.sync_turn, "context"):
+                        kwargs["context"] = context
+                    provider.sync_turn(user_content, assistant_content, **kwargs)
                 except Exception as e:
                     logger.warning(
                         "Memory provider '%s' sync_turn failed: %s",
@@ -747,7 +764,12 @@ class MemoryManager:
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
         try:
-            return provider.handle_tool_call(tool_name, args, **kwargs)
+            accepted_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if self._call_accepts_keyword(provider.handle_tool_call, key)
+            }
+            return provider.handle_tool_call(tool_name, args, **accepted_kwargs)
         except Exception as e:
             logger.error(
                 "Memory provider '%s' handle_tool_call(%s) failed: %s",
@@ -764,7 +786,12 @@ class MemoryManager:
         """
         for provider in self._providers:
             try:
-                provider.on_turn_start(turn_number, message, **kwargs)
+                accepted_kwargs = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if self._call_accepts_keyword(provider.on_turn_start, key)
+                }
+                provider.on_turn_start(turn_number, message, **accepted_kwargs)
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_turn_start failed: %s",

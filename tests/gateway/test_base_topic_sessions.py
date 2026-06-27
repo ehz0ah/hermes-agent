@@ -114,6 +114,49 @@ class TestBasePlatformTopicSessions:
         assert adapter.get_pending_message(build_session_key(pending_event.source)) == pending_event
 
     @pytest.mark.asyncio
+    async def test_handle_message_uses_session_source_for_active_session_key(self, monkeypatch):
+        adapter = DummyTelegramAdapter()
+        adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))
+
+        human_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            thread_id="10",
+            user_id="alice",
+            user_name="Alice",
+        )
+        shared_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            thread_id="10",
+        )
+        shared_key = build_session_key(shared_source)
+        adapter._active_sessions[shared_key] = asyncio.Event()
+
+        scheduled = []
+
+        def fake_create_task(coro):
+            scheduled.append(coro)
+            coro.close()
+            return SimpleNamespace()
+
+        monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+        event = MessageEvent(
+            text="hello",
+            source=human_source,
+            session_source=shared_source,
+            message_id="2",
+        )
+        await adapter.handle_message(event)
+
+        assert scheduled == []
+        assert adapter.get_pending_message(shared_key) == event
+        assert adapter.get_pending_message(build_session_key(human_source)) is None
+
+    @pytest.mark.asyncio
     async def test_process_message_background_replies_in_same_topic(self):
         adapter = DummyTelegramAdapter()
         typing_calls = []

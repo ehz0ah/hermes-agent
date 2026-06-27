@@ -1021,6 +1021,33 @@ class TestMessageStorage:
         assert isinstance(conversation[0].get("timestamp"), float)
         assert "observed" not in conversation[1]
 
+    def test_observed_memory_source_round_trips_for_gateway_memory_sync(self, db):
+        db.create_session(session_id="s1", source="feishu:oc_group")
+        memory_source = {
+            "platform": "feishu",
+            "chat_id": "oc_group",
+            "chat_name": "Alerts",
+            "chat_type": "group",
+            "user_id": "ou_alice",
+            "user_id_alt": "on_alice",
+            "user_name": "Alice",
+            "user_handle": '<at user_id="ou_alice">Alice</at>',
+            "message_id": "om_observed",
+        }
+
+        db.append_message(
+            "s1",
+            role="user",
+            content="[Alice]\nfavorite snack is oreo",
+            observed=True,
+            platform_message_id="om_observed",
+            memory_source=memory_source,
+        )
+
+        conversation = db.get_messages_as_conversation("s1")
+        assert conversation[0]["observed"] is True
+        assert conversation[0]["memory_source"] == memory_source
+
     def test_tool_response_does_not_increment_tool_count(self, db):
         """Tool responses (role=tool) should not increment tool_call_count.
 

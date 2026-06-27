@@ -56,6 +56,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+from agent.memory_provider import build_memory_turn_context
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -800,22 +801,72 @@ def _build_replay_entry(
 
 
 _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
-_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed Telegram group context - context only, not requests]"
-_CURRENT_ADDRESSED_MESSAGE_HEADER = "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]"
+_FEISHU_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Feishu/Lark group context"
+_OBSERVED_CONTEXT_PROMPT_MARKERS = (
+    _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER,
+    _FEISHU_OBSERVED_CONTEXT_PROMPT_MARKER,
+)
+_CURRENT_ADDRESSED_MESSAGE_HEADER = (
+    "[Current addressed message - answer this request. The observed context above is "
+    "not a separate request, but it is available chat context for this answer.]"
+)
 
 
-def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool:
-    """Return True for Telegram group turns that may include observed chatter.
+def _observed_group_context_header(channel_prompt: Optional[str]) -> str:
+    if channel_prompt and _FEISHU_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt:
+        title = "Observed Feishu/Lark group context"
+    elif channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt:
+        title = "Observed Telegram group context"
+    else:
+        title = "Observed group chat context"
+    return (
+        f"[{title} - previous visible messages from the same chat or thread, "
+        "context only, not requests]\n"
+        "These are prior messages Hermes could see in this chat or thread. Use "
+        "them as immediate chat context for the current addressed message, "
+        "including pronouns, references, preferences, plans, emotions, and "
+        "questions about what someone just said, did, feels, wants, or refers "
+        "to. First answer from this block when it contains the answer. No "
+        "memory or search tool is needed when this block already answers the "
+        "current question. Do not call memory/search tools to verify facts "
+        "already present in this block. Empty memory/search results do not disprove this "
+        "block; it is directly visible chat context, not retrieved memory. do not "
+        "say you cannot see the chat or do not know when the answer is present "
+        "here."
+    )
 
-    Telegram's observe-unmentioned mode persists skipped group chatter so a
+
+def _stream_initial_reply_to_id(source: Any, event_message_id: Optional[str]) -> Optional[str]:
+    """Return the streaming reply anchor for a gateway turn.
+
+    Feishu/Lark top-level group messages should stream as normal group
+    messages. Thread messages keep their reply anchor so streaming stays in the
+    thread where the user addressed Hermes.
+    """
+    if not event_message_id:
+        return None
+    platform = getattr(source, "platform", None)
+    platform_value = getattr(platform, "value", platform)
+    if str(platform_value or "").lower() == "feishu" and not getattr(source, "thread_id", None):
+        return None
+    return event_message_id
+
+
+def _uses_observed_group_context(channel_prompt: Optional[str]) -> bool:
+    """Return True for gateway turns that may include observed chatter.
+
+    Observe-unmentioned modes persist skipped group chatter so a
     later @mention can see it. Those rows must not replay as ordinary user
     turns: a weak wake word like ``@bot cambio`` should not make the model treat
-    old unmentioned chatter as pending work. The Telegram adapter marks these
+    old unmentioned chatter as pending work. Platform adapters mark these
     turns with a channel prompt; this helper keeps the run-path check explicit
     and unit-testable.
     """
 
-    return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
+    return bool(
+        channel_prompt
+        and any(marker in channel_prompt for marker in _OBSERVED_CONTEXT_PROMPT_MARKERS)
+    )
 
 
 def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
@@ -846,7 +897,7 @@ def _build_gateway_agent_history(
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
     """Convert stored gateway transcript rows into agent replay messages.
 
-    Observed Telegram group rows are returned as API-only context for the
+    Observed group rows are returned as API-only context for the
     current addressed message instead of being replayed as normal prior user
     turns.  Keeping that context out of ``conversation_history`` avoids
     consecutive-user repair merging it with the live user turn and then hiding
@@ -865,7 +916,7 @@ def _build_gateway_agent_history(
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
     observed_group_context: List[str] = []
-    separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
+    separate_observed_context = _uses_observed_group_context(channel_prompt)
 
     for msg in history or []:
         role = msg.get("role")
@@ -943,6 +994,37 @@ def _build_gateway_agent_history(
     return agent_history, observed_context
 
 
+def _observed_group_messages_for_memory(
+    history: List[Dict[str, Any]],
+    *,
+    channel_prompt: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return observed context rows for provider-only memory sync.
+
+    These rows are withheld from replayable conversation history. Passing them
+    separately to memory providers lets OpenViking extract observed group
+    chatter with the original speaker metadata while keeping the model focused
+    on the current addressed turn.
+    """
+    if not _uses_observed_group_context(channel_prompt):
+        return []
+    observed_messages: List[Dict[str, Any]] = []
+    for msg in history or []:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "user" or not msg.get("observed"):
+            continue
+        content = msg.get("content")
+        if not content:
+            continue
+        observed = dict(msg)
+        observed["role"] = "user"
+        observed["content"] = content
+        observed["observed"] = True
+        observed_messages.append(observed)
+    return observed_messages
+
+
 def _select_cached_agent_history(
     persisted_history: List[Dict[str, Any]],
     live_history: Any,
@@ -965,14 +1047,19 @@ def _select_cached_agent_history(
     return persisted_history
 
 
-def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
-    """Prepend observed Telegram context to the API-only current user turn."""
+def _wrap_current_message_with_observed_context(
+    message: Any,
+    observed_context: Optional[str],
+    *,
+    channel_prompt: Optional[str] = None,
+) -> Any:
+    """Prepend observed group context to the API-only current user turn."""
 
     if not observed_context:
         return message
 
     prefix = (
-        f"{_OBSERVED_GROUP_CONTEXT_HEADER}\n"
+        f"{_observed_group_context_header(channel_prompt)}\n"
         f"{observed_context}\n\n"
         f"{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
     )
@@ -9013,6 +9100,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        session_source = getattr(event, "session_source", None) or source
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -9088,6 +9176,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if isinstance(_new_text, str):
                         event = dataclasses.replace(event, text=_new_text)
                         source = event.source
+                        session_source = getattr(event, "session_source", None) or source
                     break
                 if _action == "allow":
                     break
@@ -9154,7 +9243,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # IMPORTANT: recognized slash commands must bypass this interception.
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
-        _quick_key = self._session_key_for_source(source)
+        _quick_key = self._session_key_for_source(session_source)
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -10423,7 +10512,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # same session — corrupting the transcript.
         _active_session_lease, _limit_message = self._claim_active_session_slot(
             _quick_key,
-            source,
+            session_source,
         )
         if _limit_message is not None:
             logger.info(
@@ -10441,7 +10530,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            _agent_result = await self._handle_message_with_agent(event, session_source, _quick_key, _run_generation)
+            if getattr(event, "_moa_disable_after_turn", False):
+                try:
+                    _restore = getattr(event, "_moa_restore_override", None)
+                    if _restore is None:
+                        self._session_model_overrides.pop(_quick_key, None)
+                    else:
+                        self._session_model_overrides[_quick_key] = _restore
+                    self._evict_cached_agent(_quick_key)
+                except Exception:
+                    pass
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -11803,6 +11902,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 context_prompt=context_prompt,
                 history=history,
                 source=source,
+                memory_source=getattr(event, "memory_source", None),
                 session_id=_run_start_session_id,
                 session_key=session_key,
                 run_generation=run_generation,
@@ -17113,7 +17213,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         config=_consumer_cfg,
                         metadata=_thread_metadata,
                         on_before_finalize=_pause_typing_before_finalize,
-                        initial_reply_to_id=event_message_id,
+                        initial_reply_to_id=_stream_initial_reply_to_id(source, event_message_id),
                         run_still_current=_run_still_current,
                     )
             except Exception as _sc_err:
@@ -17270,6 +17370,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         history: List[Dict[str, Any]],
         source: SessionSource,
         session_id: str,
+        memory_source: Optional[SessionSource] = None,
         session_key: str = None,
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
@@ -17291,6 +17392,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
+                memory_source=memory_source,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
@@ -17302,6 +17404,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         with _profile_runtime_scope(profile_home):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
+                memory_source=memory_source,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
@@ -17420,6 +17523,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         history: List[Dict[str, Any]],
         source: SessionSource,
         session_id: str,
+        memory_source: Optional[SessionSource] = None,
         session_key: str = None,
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
@@ -18541,7 +18645,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 else None
                             ),
                             on_before_finalize=_pause_typing_before_finalize,
-                            initial_reply_to_id=event_message_id,
+                            initial_reply_to_id=_stream_initial_reply_to_id(source, event_message_id),
                             run_still_current=_run_still_current,
                         )
                         if _want_stream_deltas:
@@ -18817,6 +18921,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            _memory_source = memory_source or source
+            agent._memory_turn_context = build_memory_turn_context(
+                _memory_source,
+                session_id=session_id,
+                gateway_session_key=session_key or "",
+            )
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
@@ -18980,6 +19090,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 history,
                 channel_prompt=channel_prompt,
                 inject_timestamps=_message_timestamps_enabled(_load_gateway_config()),
+            )
+            observed_group_memory_messages = _observed_group_messages_for_memory(
+                history,
+                channel_prompt=channel_prompt,
             )
 
             # FTS write-corruption guard (#50502): when message persistence
@@ -19320,6 +19434,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _api_run_message = _wrap_current_message_with_observed_context(
                     _run_message,
                     observed_group_context,
+                    channel_prompt=channel_prompt,
                 )
                 _conversation_kwargs = {
                     "conversation_history": agent_history,
@@ -19333,8 +19448,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+                agent._memory_observed_context_messages = observed_group_memory_messages
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
+                try:
+                    agent._memory_observed_context_messages = []
+                except Exception:
+                    pass
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
@@ -20315,8 +20435,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_memory_source = memory_source
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    next_memory_source = getattr(pending_event, "memory_source", None) or next_source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
@@ -20381,6 +20503,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=next_source,
+                    memory_source=next_memory_source,
                     session_id=session_id,
                     session_key=next_session_key,
                     run_generation=run_generation,

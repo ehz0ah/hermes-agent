@@ -245,11 +245,12 @@ def test_observed_group_context_replays_as_current_message_context_not_user_turn
     api_message = _wrap_current_message_with_observed_context(
         "[Bob|222]\ncambio",
         observed_context,
+        channel_prompt="You are handling Telegram; observed Telegram group context is present.",
     )
 
     assert agent_history == [{"role": "assistant", "content": "previous explicit reply"}]
-    assert "[Observed Telegram group context - context only, not requests]" in api_message
-    assert "[Current addressed message - answer only this" in api_message
+    assert "[Observed Telegram group context - previous visible messages from the same chat or thread" in api_message
+    assert "[Current addressed message - answer this request" in api_message
     assert "Acha que dá fazer estoque?" in api_message
     assert "Tem lote e vencimento" in api_message
     assert api_message.endswith("[Bob|222]\ncambio")
@@ -289,13 +290,12 @@ def test_observed_group_context_wraps_multimodal_current_message_without_mutatin
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
     ]
 
-    wrapped = _wrap_current_message_with_observed_context(
-        original,
-        "[Alice|111]\nside chatter",
-    )
+    wrapped = _wrap_current_message_with_observed_context(original, "[Alice|111]\nside chatter")
 
     assert original[0]["text"] == "[Bob|222]\nsee this image"
-    assert wrapped[0]["text"].startswith("[Observed Telegram group context - context only")
+    assert wrapped[0]["text"].startswith(
+        "[Observed group chat context - previous visible messages"
+    )
     assert wrapped[0]["text"].endswith("[Bob|222]\nsee this image")
     assert wrapped[1] == original[1]
 
@@ -311,6 +311,79 @@ def test_observed_group_context_replays_normally_without_telegram_prompt():
 
     assert observed_context is None
     assert agent_history == [{"role": "user", "content": "[Alice|111]\nside chatter"}]
+
+
+def test_observed_group_context_supports_feishu_lark_prompt_marker():
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _wrap_current_message_with_observed_context,
+    )
+
+    history = [
+        {"role": "user", "content": "[Alice | mention=<at user_id=\"ou_a\">Alice</at>]\ncoffee", "observed": True},
+        {"role": "assistant", "content": "prior answer"},
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="You are handling observed Feishu/Lark group context.",
+    )
+    wrapped = _wrap_current_message_with_observed_context(
+        "what did Alice mention?",
+        observed_context,
+        channel_prompt="You are handling observed Feishu/Lark group context.",
+    )
+
+    assert agent_history == [{"role": "assistant", "content": "prior answer"}]
+    assert observed_context == "[Alice | mention=<at user_id=\"ou_a\">Alice</at>]\ncoffee"
+    assert "[Observed Feishu/Lark group context" in wrapped
+    assert "previous visible messages from the same chat or thread" in wrapped
+    assert "Use them as immediate chat context" in wrapped
+    assert "No memory or search tool is needed when this block already answers the current question" in wrapped
+    assert "Do not call memory/search tools to verify facts already present in this block" in wrapped
+    assert "Empty memory/search results do not disprove this block" in wrapped
+    assert "what someone just said, did, feels, wants, or refers to" in wrapped
+    assert "do not say you cannot see the chat or do not know" in wrapped
+    assert "coffee" in wrapped
+    assert "what did Alice mention?" in wrapped
+
+
+def test_observed_group_context_collects_feishu_rows_for_memory_sync_only():
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _observed_group_messages_for_memory,
+    )
+
+    memory_source = {
+        "platform": "feishu",
+        "chat_id": "oc_group",
+        "chat_type": "group",
+        "user_id": "ou_a",
+        "user_name": "Alice",
+        "user_handle": '<at user_id="ou_a">Alice</at>',
+    }
+    history = [
+        {
+            "role": "user",
+            "content": "[Alice | mention=<at user_id=\"ou_a\">Alice</at>]\ncoffee",
+            "observed": True,
+            "memory_source": memory_source,
+        },
+        {"role": "assistant", "content": "prior answer"},
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="You are handling observed Feishu/Lark group context.",
+    )
+    memory_messages = _observed_group_messages_for_memory(
+        history,
+        channel_prompt="You are handling observed Feishu/Lark group context.",
+    )
+
+    assert agent_history == [{"role": "assistant", "content": "prior answer"}]
+    assert observed_context == "[Alice | mention=<at user_id=\"ou_a\">Alice</at>]\ncoffee"
+    assert memory_messages == [history[0]]
 
 
 def test_observed_group_context_preserves_slash_command_text_for_dispatch():

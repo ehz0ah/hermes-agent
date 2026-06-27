@@ -590,7 +590,15 @@ def build_turn_context(
     if agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
-            agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
+            _memory_turn_context = getattr(agent, "_memory_turn_context", None)
+            if _memory_turn_context is not None:
+                agent._memory_manager.on_turn_start(
+                    agent._user_turn_count,
+                    _turn_msg,
+                    context=_memory_turn_context,
+                )
+            else:
+                agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
         except Exception:
             pass
 
@@ -599,7 +607,11 @@ def build_turn_context(
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            ext_prefetch_cache = agent._memory_manager.prefetch_all(
+                _query,
+                session_id=getattr(agent, "session_id", "") or "",
+                context=getattr(agent, "_memory_turn_context", None),
+            ) or ""
         except Exception:
             pass
 

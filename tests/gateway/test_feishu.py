@@ -722,6 +722,23 @@ def _admits_group(adapter, message, sender_id, chat_id=""):
     return adapter._admit(sender, message) is None
 
 
+class _FakeFeishuSessionEntry:
+    session_id = "feishu-group-session"
+
+
+class _FakeFeishuSessionStore:
+    def __init__(self):
+        self.sources = []
+        self.messages = []
+
+    def get_or_create_session(self, source):
+        self.sources.append(source)
+        return _FakeFeishuSessionEntry()
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self.messages.append((session_id, message, skip_db))
+
+
 class TestAdapterBehavior(unittest.TestCase):
     @patch.dict(os.environ, {}, clear=True)
     def test_build_event_handler_registers_reaction_and_card_processors(self):
@@ -944,6 +961,177 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertFalse(
             _admits_group(adapter, SimpleNamespace(mentions=[other_mention]), sender_id, "")
         )
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_unmentioned_group_messages_can_be_observed_without_dispatching(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "require_mention": True,
+                    "observe_unmentioned_group_messages": True,
+                }
+            )
+        )
+        adapter._session_store = _FakeFeishuSessionStore()
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Team Chat", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={
+                "user_id": "u_alice",
+                "user_name": "Alice",
+                "user_id_alt": "on_alice",
+                "user_handle": '<at user_id="ou_alice">Alice</at>',
+            }
+        )
+        observed_message_id = f"om_observed_{time.time_ns()}"
+        message = SimpleNamespace(
+            message_id=observed_message_id,
+            chat_type="group",
+            chat_id="oc_group",
+            message_type="text",
+            content='{"text":"favorite snack is oreo"}',
+            mentions=[],
+            thread_id=None,
+            root_id=None,
+            parent_id=None,
+            upper_message_id=None,
+        )
+        sender_id = SimpleNamespace(open_id="ou_alice", user_id="u_alice", union_id="on_alice")
+        data = SimpleNamespace(
+            event=SimpleNamespace(
+                message=message,
+                sender=SimpleNamespace(sender_type="user", sender_id=sender_id),
+            )
+        )
+
+        asyncio.run(adapter._handle_message_event_data(data))
+
+        adapter._dispatch_inbound_event.assert_not_awaited()
+        self.assertEqual(len(adapter._session_store.messages), 1)
+        session_id, entry, skip_db = adapter._session_store.messages[0]
+        self.assertEqual(session_id, "feishu-group-session")
+        self.assertFalse(skip_db)
+        self.assertTrue(entry["observed"])
+        self.assertEqual(entry["message_id"], observed_message_id)
+        self.assertIn("Alice", entry["content"])
+        self.assertIn('<at user_id="ou_alice">Alice</at>', entry["content"])
+        self.assertIn("favorite snack is oreo", entry["content"])
+        self.assertNotIn("user_id=u_alice", entry["content"])
+        self.assertNotIn("on_alice", entry["content"])
+        memory_source = entry["memory_source"]
+        self.assertEqual(memory_source["platform"], "feishu")
+        self.assertEqual(memory_source["chat_id"], "oc_group")
+        self.assertEqual(memory_source["chat_name"], "Team Chat")
+        self.assertEqual(memory_source["chat_type"], "group")
+        self.assertEqual(memory_source["user_id"], "u_alice")
+        self.assertEqual(memory_source["user_name"], "Alice")
+        self.assertEqual(memory_source["user_id_alt"], "on_alice")
+        self.assertEqual(memory_source["user_handle"], '<at user_id="ou_alice">Alice</at>')
+        self.assertEqual(memory_source["message_id"], observed_message_id)
+        source = adapter._session_store.sources[0]
+        self.assertEqual(source.chat_id, "oc_group")
+        self.assertEqual(source.chat_name, "Team Chat")
+        self.assertEqual(source.chat_type, "group")
+        self.assertIsNone(source.user_id)
+        self.assertIsNone(source.user_name)
+        self.assertIsNone(source.user_id_alt)
+
+    def test_addressed_group_message_keeps_delivery_source_and_uses_shared_session_source(self):
+        from gateway.session import build_session_key
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "require_mention": True,
+                    "observe_unmentioned_group_messages": True,
+                }
+            )
+        )
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Team Chat", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={
+                "user_id": "u_alice",
+                "user_name": "Alice",
+                "user_id_alt": "on_alice",
+                "user_handle": '<at user_id="ou_alice">Alice</at>',
+            }
+        )
+        message = SimpleNamespace(
+            message_id="om_addressed",
+            chat_type="group",
+            chat_id="oc_group",
+            message_type="text",
+            content='{"text":"what is my favorite snack"}',
+            mentions=[],
+            thread_id=None,
+            root_id=None,
+            parent_id=None,
+            upper_message_id=None,
+        )
+        sender_id = SimpleNamespace(open_id="ou_alice", user_id="u_alice", union_id="on_alice")
+        data = SimpleNamespace(
+            event=SimpleNamespace(
+                message=message,
+                sender=SimpleNamespace(sender_type="user", sender_id=sender_id),
+            )
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=data,
+                message=message,
+                sender_id=sender_id,
+                chat_type="group",
+                message_id="om_addressed",
+                is_bot=False,
+            )
+        )
+
+        adapter._dispatch_inbound_event.assert_awaited_once()
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.chat_id, "oc_group")
+        self.assertEqual(event.source.chat_name, "Team Chat")
+        self.assertEqual(event.source.chat_type, "group")
+        self.assertEqual(event.source.user_id, "u_alice")
+        self.assertEqual(event.source.user_name, "Alice")
+        self.assertEqual(event.source.user_id_alt, "on_alice")
+        self.assertEqual(event.source.user_handle, '<at user_id="ou_alice">Alice</at>')
+        self.assertEqual(event.source.message_id, "om_addressed")
+        self.assertIsNotNone(event.session_source)
+        self.assertEqual(event.session_source.chat_id, "oc_group")
+        self.assertEqual(event.session_source.chat_name, "Team Chat")
+        self.assertEqual(event.session_source.chat_type, "group")
+        self.assertIsNone(event.session_source.user_id)
+        self.assertIsNone(event.session_source.user_name)
+        self.assertIsNone(event.session_source.user_id_alt)
+        self.assertIsNone(event.session_source.user_handle)
+        self.assertEqual(event.session_source.message_id, "om_addressed")
+        self.assertIsNotNone(event.memory_source)
+        self.assertEqual(event.memory_source.user_id, "u_alice")
+        self.assertEqual(event.memory_source.user_name, "Alice")
+        self.assertEqual(event.memory_source.user_id_alt, "on_alice")
+        self.assertEqual(event.memory_source.user_handle, '<at user_id="ou_alice">Alice</at>')
+        observed_source = adapter._feishu_group_observe_shared_source(event.memory_source)
+        self.assertEqual(
+            build_session_key(event.session_source),
+            build_session_key(observed_source),
+        )
+        self.assertIn("observed Feishu/Lark group context", event.channel_prompt)
+        self.assertIn("Alice", event.text)
+        self.assertIn('<at user_id="ou_alice">Alice</at>', event.text)
+        self.assertIn("what is my favorite snack", event.text)
 
     @patch.dict(
         os.environ,
@@ -2183,6 +2371,117 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(captured["request"].message_id, "om_trigger")
         self.assertTrue(captured["request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_top_level_group_message_uses_create_not_reply(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"create": None, "reply": None}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["create"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_created"),
+                )
+
+            def reply(self, request):
+                captured["reply"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_replied"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="top-level answer",
+                    metadata={"notify": True},
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_created")
+        self.assertIsNotNone(captured["create"])
+        self.assertIsNone(captured["reply"])
+
+    def test_top_level_group_mention_has_no_reply_anchor(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, MessageType, SessionSource, _reply_anchor_for_event
+
+        event = MessageEvent(
+            source=SessionSource(
+                platform=Platform.FEISHU,
+                chat_id="oc_group",
+                chat_type="group",
+                user_id="u_alice",
+            ),
+            text="@Hermes hi",
+            message_type=MessageType.TEXT,
+            message_id="om_top_level",
+        )
+
+        self.assertIsNone(_reply_anchor_for_event(event))
+
+    def test_top_level_group_mention_streaming_has_no_initial_reply_anchor(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import SessionSource
+        from gateway.run import _stream_initial_reply_to_id
+
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group",
+            chat_type="group",
+            user_id="u_alice",
+        )
+
+        self.assertIsNone(_stream_initial_reply_to_id(source, "om_top_level"))
+
+    def test_threaded_group_mention_keeps_reply_anchor(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, MessageType, SessionSource, _reply_anchor_for_event
+
+        event = MessageEvent(
+            source=SessionSource(
+                platform=Platform.FEISHU,
+                chat_id="oc_group",
+                chat_type="group",
+                thread_id="omt_thread",
+                user_id="u_alice",
+            ),
+            text="@Hermes hi",
+            message_type=MessageType.TEXT,
+            message_id="om_thread_child",
+            reply_to_message_id="om_thread_parent",
+        )
+
+        self.assertEqual(_reply_anchor_for_event(event), "om_thread_parent")
+
+    def test_threaded_group_mention_streaming_keeps_initial_reply_anchor(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import SessionSource
+        from gateway.run import _stream_initial_reply_to_id
+
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group",
+            chat_type="group",
+            thread_id="omt_thread",
+            user_id="u_alice",
+        )
+
+        self.assertEqual(_stream_initial_reply_to_id(source, "om_thread_child"), "om_thread_child")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_retries_transient_failure(self):
@@ -4677,6 +4976,79 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         self.assertEqual(event.message_type, MessageType.TEXT)
         self.assertIn("[Mentioned: Alice (open_id=ou_alice), Bob (open_id=ou_bob)]", event.text)
         self.assertIn("@Alice @Bob make a group", event.text)
+
+    def test_top_level_root_id_equal_message_id_does_not_create_thread_reply(self):
+        adapter = self._build_adapter()
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "@_user_1 what am I happy about"}),
+            message_type="text",
+            message_id="om_top",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+            root_id="om_top",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="om_top",
+            )
+        )
+
+        adapter.build_source.assert_called_once()
+        self.assertIsNone(adapter.build_source.call_args.kwargs["thread_id"])
+        adapter._fetch_message_text.assert_not_awaited()
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertIsNone(event.source.thread_id)
+        self.assertIsNone(event.reply_to_message_id)
+        self.assertIsNone(event.reply_to_text)
+
+    def test_thread_reply_preserves_root_thread_and_parent_reply(self):
+        adapter = self._build_adapter()
+        adapter._fetch_message_text.return_value = "root message"
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "@_user_1 are you sure"}),
+            message_type="text",
+            message_id="om_child",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id="om_parent",
+            upper_message_id=None,
+            thread_id=None,
+            root_id="om_root",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="om_child",
+            )
+        )
+
+        self.assertEqual(adapter.build_source.call_args.kwargs["thread_id"], "om_root")
+        adapter._fetch_message_text.assert_awaited_once_with("om_parent")
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertEqual(event.reply_to_message_id, "om_parent")
+        self.assertEqual(event.reply_to_text, "root message")
 
     def test_command_message_never_injects_hint(self):
         adapter = self._build_adapter()

@@ -122,6 +122,7 @@ from .setup import (
     _mirror_manual_config_to_openviking_store,
     _print_openviking_ready,
     _print_validation_progress,
+    _prompt_identity_mode,
     _profile_description,
     _profile_display_name,
     _prompt_manual_connection_values,

@@ -5,7 +5,7 @@ import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, build_memory_turn_context
 from agent.memory_manager import MemoryManager, inject_memory_provider_tools
 
 # ---------------------------------------------------------------------------
@@ -120,6 +120,51 @@ class TestMemoryProviderABC:
         p.queue_prefetch("query")
         p.sync_turn("user", "assistant")
         p.shutdown()
+
+    def test_memory_turn_context_ignores_message_id_as_identity(self):
+        source = SimpleNamespace(
+            platform="feishu",
+            chat_id="",
+            chat_name=None,
+            chat_type="group",
+            user_id=None,
+            user_id_alt=None,
+            user_name=None,
+            user_handle=None,
+            thread_id=None,
+            message_id="om_only",
+        )
+
+        assert build_memory_turn_context(source, session_id="sid") is None
+
+    def test_memory_turn_context_includes_message_id_when_source_identity_exists(self):
+        source = SimpleNamespace(
+            platform="feishu",
+            chat_id="oc_group",
+            chat_name="Team",
+            chat_type="group",
+            user_id="ou_user",
+            user_id_alt="on_user",
+            user_name="Alice",
+            user_handle='<at user_id="ou_user">Alice</at>',
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        context = build_memory_turn_context(
+            source,
+            session_id="sid",
+            gateway_session_key="gw-key",
+        )
+
+        assert context is not None
+        assert context.platform == "feishu"
+        assert context.chat_id == "oc_group"
+        assert context.user_id == "ou_user"
+        assert context.user_handle == '<at user_id="ou_user">Alice</at>'
+        assert context.message_id == "om_1"
+        assert context.session_id == "sid"
+        assert context.gateway_session_key == "gw-key"
 
 
 # ---------------------------------------------------------------------------

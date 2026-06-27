@@ -83,6 +83,16 @@ class OpenVikingTranscriptMixin:
         if start_idx is None:
             return []
 
+        while start_idx > 0:
+            prior = messages[start_idx - 1]
+            if not (
+                isinstance(prior, dict)
+                and prior.get("role") == "user"
+                and prior.get("observed")
+            ):
+                break
+            start_idx -= 1
+
         return [message for message in messages[start_idx : end_idx + 1] if isinstance(message, dict)]
 
     @staticmethod
@@ -156,9 +166,11 @@ class OpenVikingTranscriptMixin:
         cls,
         messages: List[Dict[str, Any]],
         *,
+        user_peer_id: str = "",
         assistant_peer_id: str = "",
     ) -> List[Dict[str, Any]]:
         """Convert Hermes canonical messages into OpenViking batch payloads."""
+        user_peer_id = str(user_peer_id or "").strip()
         assistant_peer_id = str(assistant_peer_id or "").strip()
         tool_calls_by_id: Dict[str, Dict[str, Any]] = {}
         completed_tool_ids: set[str] = set()
@@ -191,9 +203,20 @@ class OpenVikingTranscriptMixin:
         payload_messages: List[Dict[str, Any]] = []
         pending_tool_parts: List[Dict[str, Any]] = []
 
-        def payload_message(role: str, parts: List[Dict[str, Any]]) -> Dict[str, Any]:
+        def payload_message(
+            role: str,
+            parts: List[Dict[str, Any]],
+            message: Optional[Dict[str, Any]] = None,
+        ) -> Dict[str, Any]:
             payload: Dict[str, Any] = {"role": role, "parts": parts}
-            if role == "assistant" and assistant_peer_id:
+            if role == "user":
+                message_peer_id = ""
+                if isinstance(message, dict):
+                    message_peer_id = str(message.get("_openviking_peer_id") or "").strip()
+                resolved_user_peer_id = message_peer_id or user_peer_id
+                if resolved_user_peer_id:
+                    payload["peer_id"] = resolved_user_peer_id
+            elif role == "assistant" and assistant_peer_id:
                 payload["peer_id"] = assistant_peer_id
             return payload
 
@@ -265,7 +288,7 @@ class OpenVikingTranscriptMixin:
                     })
 
             if parts:
-                payload_messages.append(payload_message(role, parts))
+                payload_messages.append(payload_message(role, parts, message))
 
         flush_tool_parts()
         return payload_messages
