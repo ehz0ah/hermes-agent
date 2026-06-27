@@ -2777,6 +2777,55 @@ def test_sync_turn_team_mode_syncs_observed_rows_to_their_original_peer(monkeypa
     assert batch[2]["peer_id"] == "hermes"
 
 
+def test_sync_turn_solo_mode_drops_observed_rows_before_posting(monkeypatch):
+    posts = []
+
+    class StubClient:
+        def post(self, path, payload=None, **kwargs):
+            posts.append((path, payload))
+            return {"result": {"written_bytes": 12}}
+
+    provider = OpenVikingMemoryProvider()
+    provider._client = StubClient()
+    provider._endpoint = "http://ov"
+    provider._api_key = "key"
+    provider._agent = "hermes"
+    provider._session_id = "sid"
+    provider._identity_mode = "solo"
+    provider._spawn_writer = lambda _sid, target, name: target()
+    provider._client_for_context = lambda _context: provider._client
+
+    provider.sync_turn(
+        "what did Alice mention?",
+        "Alice mentioned oreos.",
+        session_id="sid",
+        messages=[
+            {
+                "role": "user",
+                "content": "[Alice]\nfavorite snack is oreo",
+                "observed": True,
+                "memory_source": {"platform": "feishu", "user_id": "ou_alice"},
+            },
+            {"role": "user", "content": "what did Alice mention?"},
+            {"role": "assistant", "content": "Alice mentioned oreos."},
+        ],
+        context=MemoryTurnContext(
+            platform="feishu",
+            chat_id="oc_group",
+            chat_type="group",
+            user_id="ou_bob",
+            user_name="Bob",
+        ),
+    )
+
+    batch_posts = [post for post in posts if post[0] == "/api/v1/sessions/sid/messages/batch"]
+    assert len(batch_posts) == 1
+    batch = batch_posts[0][1]["messages"]
+    assert [message["role"] for message in batch] == ["user", "assistant"]
+    assert batch[0]["parts"][0]["text"] == "what did Alice mention?"
+    assert batch[1]["parts"][0]["text"] == "Alice mentioned oreos."
+
+
 def test_sync_turn_retries_batch_write_with_fresh_client():
     provider = OpenVikingMemoryProvider()
     provider._client = MagicMock()

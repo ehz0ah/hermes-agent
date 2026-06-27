@@ -1353,6 +1353,15 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         )
         if turn_messages:
             turn_messages = [dict(message) for message in turn_messages]
+            if not self._team_mode():
+                turn_messages = [
+                    message
+                    for message in turn_messages
+                    if not (
+                        message.get("role") == "user"
+                        and message.get("observed")
+                    )
+                ]
             replaced_user_content = False
             for message in reversed(turn_messages):
                 if message.get("role") == "user" and not message.get("observed"):

@@ -869,6 +869,33 @@ def _uses_observed_group_context(channel_prompt: Optional[str]) -> bool:
     )
 
 
+def _is_observed_user_message(message: Any) -> bool:
+    return (
+        isinstance(message, dict)
+        and message.get("role") == "user"
+        and bool(message.get("observed"))
+        and bool(message.get("content"))
+    )
+
+
+def _trailing_observed_group_messages(
+    history: List[Dict[str, Any]],
+    *,
+    channel_prompt: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return observed group rows since the last addressed turn."""
+    if not _uses_observed_group_context(channel_prompt):
+        return []
+
+    trailing: List[Dict[str, Any]] = []
+    for message in reversed(history or []):
+        if not _is_observed_user_message(message):
+            break
+        trailing.append(message)
+    trailing.reverse()
+    return trailing
+
+
 def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
     """True when gateway.message_timestamps.enabled is opted in.
 
@@ -917,6 +944,17 @@ def _build_gateway_agent_history(
     agent_history: List[Dict[str, Any]] = []
     observed_group_context: List[str] = []
     separate_observed_context = _uses_observed_group_context(channel_prompt)
+    trailing_observed_ids = (
+        {
+            id(message)
+            for message in _trailing_observed_group_messages(
+                history,
+                channel_prompt=channel_prompt,
+            )
+        }
+        if separate_observed_context
+        else set()
+    )
 
     for msg in history or []:
         role = msg.get("role")
@@ -935,8 +973,9 @@ def _build_gateway_agent_history(
         content = msg.get("content")
         if inject_timestamps and role == "user" and isinstance(content, str):
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
-        if separate_observed_context and msg.get("observed") and role == "user" and content:
-            observed_group_context.append(str(content).strip())
+        if separate_observed_context and _is_observed_user_message(msg):
+            if id(msg) in trailing_observed_ids and content:
+                observed_group_context.append(str(content).strip())
             continue
 
         # Rich agent messages (tool_calls, tool results) must be passed through
@@ -1006,10 +1045,8 @@ def _observed_group_messages_for_memory(
     chatter with the original speaker metadata while keeping the model focused
     on the current addressed turn.
     """
-    if not _uses_observed_group_context(channel_prompt):
-        return []
     observed_messages: List[Dict[str, Any]] = []
-    for msg in history or []:
+    for msg in _trailing_observed_group_messages(history, channel_prompt=channel_prompt):
         if not isinstance(msg, dict):
             continue
         if msg.get("role") != "user" or not msg.get("observed"):

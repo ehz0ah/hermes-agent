@@ -233,9 +233,9 @@ def test_observed_group_context_replays_as_current_message_context_not_user_turn
 
     history = [
         {"role": "session_meta", "content": "tool defs"},
+        {"role": "assistant", "content": "previous explicit reply"},
         {"role": "user", "content": "[Alice|111]\nAcha que dá fazer estoque?", "observed": True},
         {"role": "user", "content": "[Alice|111]\nTem lote e vencimento", "observed": True},
-        {"role": "assistant", "content": "previous explicit reply"},
     ]
 
     agent_history, observed_context = _build_gateway_agent_history(
@@ -254,6 +254,48 @@ def test_observed_group_context_replays_as_current_message_context_not_user_turn
     assert "Acha que dá fazer estoque?" in api_message
     assert "Tem lote e vencimento" in api_message
     assert api_message.endswith("[Bob|222]\ncambio")
+
+
+def test_observed_group_context_uses_only_trailing_rows_for_prompt_and_memory():
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _observed_group_messages_for_memory,
+    )
+
+    old_observed = {
+        "role": "user",
+        "content": "[Alice|111]\nolder side chatter",
+        "observed": True,
+        "memory_source": {"platform": "telegram", "user_id": "111"},
+    }
+    fresh_observed = {
+        "role": "user",
+        "content": "[Alice|111]\nfresh side chatter",
+        "observed": True,
+        "memory_source": {"platform": "telegram", "user_id": "111"},
+    }
+    history = [
+        old_observed,
+        {"role": "user", "content": "[Bob|222]\nfirst mention"},
+        {"role": "assistant", "content": "first answer"},
+        fresh_observed,
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="observed Telegram group context",
+    )
+    memory_messages = _observed_group_messages_for_memory(
+        history,
+        channel_prompt="observed Telegram group context",
+    )
+
+    assert agent_history == [
+        {"role": "user", "content": "[Bob|222]\nfirst mention"},
+        {"role": "assistant", "content": "first answer"},
+    ]
+    assert observed_context == "[Alice|111]\nfresh side chatter"
+    assert memory_messages == [fresh_observed]
 
 
 def test_observed_group_context_does_not_hide_current_user_turn_behind_history_offset():
@@ -320,8 +362,8 @@ def test_observed_group_context_supports_feishu_lark_prompt_marker():
     )
 
     history = [
-        {"role": "user", "content": "[Alice | mention=<at user_id=\"ou_a\">Alice</at>]\ncoffee", "observed": True},
         {"role": "assistant", "content": "prior answer"},
+        {"role": "user", "content": "[Alice | mention=<at user_id=\"ou_a\">Alice</at>]\ncoffee", "observed": True},
     ]
 
     agent_history, observed_context = _build_gateway_agent_history(
@@ -363,13 +405,13 @@ def test_observed_group_context_collects_feishu_rows_for_memory_sync_only():
         "user_handle": '<at user_id="ou_a">Alice</at>',
     }
     history = [
+        {"role": "assistant", "content": "prior answer"},
         {
             "role": "user",
             "content": "[Alice | mention=<at user_id=\"ou_a\">Alice</at>]\ncoffee",
             "observed": True,
             "memory_source": memory_source,
         },
-        {"role": "assistant", "content": "prior answer"},
     ]
 
     agent_history, observed_context = _build_gateway_agent_history(
@@ -383,7 +425,7 @@ def test_observed_group_context_collects_feishu_rows_for_memory_sync_only():
 
     assert agent_history == [{"role": "assistant", "content": "prior answer"}]
     assert observed_context == "[Alice | mention=<at user_id=\"ou_a\">Alice</at>]\ncoffee"
-    assert memory_messages == [history[0]]
+    assert memory_messages == [history[1]]
 
 
 def test_observed_group_context_preserves_slash_command_text_for_dispatch():
