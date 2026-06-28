@@ -958,6 +958,7 @@ class MemoryManager:
         target: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Notify external providers when the built-in memory tool writes.
 
@@ -968,14 +969,36 @@ class MemoryManager:
                 continue
             try:
                 metadata_mode = self._provider_memory_write_metadata_mode(provider)
+                accepts_context = (
+                    context is not None
+                    and self._call_accepts_keyword(provider.on_memory_write, "context")
+                )
                 if metadata_mode == "keyword":
-                    provider.on_memory_write(
-                        action, target, content, metadata=dict(metadata or {})
-                    )
+                    kwargs: Dict[str, Any] = {"metadata": dict(metadata or {})}
+                    if accepts_context:
+                        kwargs["context"] = context
+                    provider.on_memory_write(action, target, content, **kwargs)
                 elif metadata_mode == "positional":
-                    provider.on_memory_write(action, target, content, dict(metadata or {}))
+                    if accepts_context:
+                        provider.on_memory_write(
+                            action,
+                            target,
+                            content,
+                            dict(metadata or {}),
+                            context=context,
+                        )
+                    else:
+                        provider.on_memory_write(
+                            action,
+                            target,
+                            content,
+                            dict(metadata or {}),
+                        )
                 else:
-                    provider.on_memory_write(action, target, content)
+                    if accepts_context:
+                        provider.on_memory_write(action, target, content, context=context)
+                    else:
+                        provider.on_memory_write(action, target, content)
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_memory_write failed: %s",
@@ -1012,6 +1035,7 @@ class MemoryManager:
         tool_args: Dict[str, Any],
         *,
         build_metadata: Optional[Callable[[], Dict[str, Any]]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Mirror a built-in memory tool call to external providers.
 
@@ -1059,6 +1083,7 @@ class MemoryManager:
                     target,
                     str(op.get("content") or ""),
                     metadata=metadata,
+                    context=context,
                 )
             except Exception as e:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)

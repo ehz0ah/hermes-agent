@@ -1062,6 +1062,13 @@ def _observed_group_messages_for_memory(
     return observed_messages
 
 
+def _join_observed_context_blocks(*blocks: Optional[str]) -> Optional[str]:
+    parts = [str(block).strip() for block in blocks if str(block or "").strip()]
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
 def _select_cached_agent_history(
     persisted_history: List[Dict[str, Any]],
     live_history: Any,
@@ -1082,37 +1089,6 @@ def _select_cached_agent_history(
     if isinstance(live_history, list) and len(live_history) > len(persisted_history):
         return list(live_history)
     return persisted_history
-
-
-def _wrap_current_message_with_observed_context(
-    message: Any,
-    observed_context: Optional[str],
-    *,
-    channel_prompt: Optional[str] = None,
-) -> Any:
-    """Prepend observed group context to the API-only current user turn."""
-
-    if not observed_context:
-        return message
-
-    prefix = (
-        f"{_observed_group_context_header(channel_prompt)}\n"
-        f"{observed_context}\n\n"
-        f"{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
-    )
-
-    if isinstance(message, str):
-        return f"{prefix}{message}"
-
-    if isinstance(message, list):
-        wrapped = [dict(part) if isinstance(part, dict) else part for part in message]
-        for part in wrapped:
-            if isinstance(part, dict) and part.get("type") == "text":
-                part["text"] = f"{prefix}{part.get('text', '')}"
-                return wrapped
-        return [{"type": "text", "text": prefix.rstrip()}] + wrapped
-
-    return message
 
 
 def _with_observed_group_context_ephemeral_prompt(
@@ -3733,6 +3709,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile,
         )
+
+    def _feishu_parent_observed_context_for_thread(
+        self,
+        source: SessionSource,
+        *,
+        channel_prompt: Optional[str],
+        inject_timestamps: bool = False,
+    ) -> Optional[str]:
+        """Return read-only parent chat context for a real Feishu thread turn."""
+        platform_value = (
+            source.platform.value
+            if hasattr(source.platform, "value")
+            else str(source.platform)
+        )
+        if platform_value != Platform.FEISHU.value or not source.thread_id:
+            return None
+        if not _uses_observed_group_context(channel_prompt):
+            return None
+
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return None
+
+        parent_source = dataclasses.replace(
+            source,
+            thread_id=None,
+            user_id=None,
+            user_name=None,
+            user_id_alt=None,
+            user_handle=None,
+            message_id=None,
+        )
+        try:
+            parent_session_key = self._session_key_for_source(parent_source)
+        except Exception:
+            logger.debug("Failed to derive Feishu parent session key", exc_info=True)
+            return None
+
+        try:
+            ensure_loaded = getattr(store, "_ensure_loaded", None)
+            if callable(ensure_loaded):
+                ensure_loaded()
+        except Exception:
+            logger.debug("Failed to load session index for Feishu parent context", exc_info=True)
+
+        entry = None
+        entries = getattr(store, "_entries", None)
+        if isinstance(entries, dict):
+            entry = entries.get(parent_session_key)
+        if entry is None:
+            return None
+
+        try:
+            parent_history = store.load_transcript(entry.session_id)
+        except Exception:
+            logger.debug("Failed to load Feishu parent transcript", exc_info=True)
+            return None
+        _, parent_observed_context = _build_gateway_agent_history(
+            parent_history,
+            channel_prompt=channel_prompt,
+            inject_timestamps=inject_timestamps,
+        )
+        if not parent_observed_context:
+            return None
+        return f"[Recent parent chat context before this thread]\n{parent_observed_context}"
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -19154,10 +19195,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # history and attached to the current addressed message as
             # API-only context, so persisted history stores only the real
             # addressed user turn.
+            _inject_message_timestamps = _message_timestamps_enabled(_load_gateway_config())
             agent_history, observed_group_context = _build_gateway_agent_history(
                 history,
                 channel_prompt=channel_prompt,
-                inject_timestamps=_message_timestamps_enabled(_load_gateway_config()),
+                inject_timestamps=_inject_message_timestamps,
+            )
+            parent_observed_context = self._feishu_parent_observed_context_for_thread(
+                source,
+                channel_prompt=channel_prompt,
+                inject_timestamps=_inject_message_timestamps,
+            )
+            observed_group_context = _join_observed_context_blocks(
+                parent_observed_context,
+                observed_group_context,
             )
             observed_group_memory_messages = _observed_group_messages_for_memory(
                 history,
@@ -19509,25 +19560,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     _run_message = message
 
-                _api_run_message = _wrap_current_message_with_observed_context(
-                    _run_message,
-                    observed_group_context,
-                    channel_prompt=channel_prompt,
-                )
                 _conversation_kwargs = {
                     "conversation_history": agent_history,
                     "task_id": session_id,
                 }
                 if _persist_user_message_override is not None:
                     _conversation_kwargs["persist_user_message"] = _persist_user_message_override
-                elif observed_group_context:
-                    _conversation_kwargs["persist_user_message"] = message
                 if moa_config is not None:
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 agent._memory_observed_context_messages = observed_group_memory_messages
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                result = agent.run_conversation(_run_message, **_conversation_kwargs)
             finally:
                 try:
                     agent._memory_observed_context_messages = []

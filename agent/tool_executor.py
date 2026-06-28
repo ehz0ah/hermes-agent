@@ -1315,6 +1315,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             task_id=effective_task_id,
                             tool_call_id=getattr(tool_call, "id", None),
                         ),
+                        context=getattr(agent, "_memory_turn_context", None),
                     )
                 return result
             function_result, function_args = _run_agent_tool_execution_middleware(

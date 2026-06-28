@@ -5014,7 +5014,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         self.assertIsNone(event.reply_to_message_id)
         self.assertIsNone(event.reply_to_text)
 
-    def test_thread_reply_preserves_root_thread_and_parent_reply(self):
+    def test_plain_reply_preserves_parent_reply_without_thread_session(self):
         adapter = self._build_adapter()
         adapter._fetch_message_text.return_value = "root message"
         bot_mention = SimpleNamespace(
@@ -5044,9 +5044,10 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
             )
         )
 
-        self.assertEqual(adapter.build_source.call_args.kwargs["thread_id"], "om_root")
+        self.assertIsNone(adapter.build_source.call_args.kwargs["thread_id"])
         adapter._fetch_message_text.assert_awaited_once_with("om_parent")
         event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertIsNone(event.source.thread_id)
         self.assertEqual(event.reply_to_message_id, "om_parent")
         self.assertEqual(event.reply_to_text, "root message")
 

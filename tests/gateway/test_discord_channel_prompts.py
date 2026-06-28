@@ -331,3 +331,94 @@ async def test_run_agent_promotes_observed_feishu_context_to_ephemeral_prompt(mo
     assert "Observed Feishu/Lark group context" in _CapturingAgent.last_run_ephemeral
     assert "I am too tired to watch the morning match portugal vs columbia" in _CapturingAgent.last_run_ephemeral
     assert "First answer from this block when it contains the answer" in _CapturingAgent.last_run_ephemeral
+    assert _CapturingAgent.last_run_user_message == (
+        "[Hao | mention=<at user_id=\"ou_a\">Hao</at>]\nwhat am i too tired for"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_feishu_thread_injects_parent_observed_tail(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    (tmp_path / "config.yaml").write_text("agent:\n  system_prompt: Global prompt\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    parent_key = "agent:main:feishu:group:oc_group"
+    parent_session_id = "parent-session"
+
+    def _generate_session_key(source):
+        if source.thread_id:
+            return f"agent:main:feishu:group:{source.chat_id}:{source.thread_id}"
+        return f"agent:main:feishu:group:{source.chat_id}"
+
+    def _load_transcript(session_id):
+        if session_id == parent_session_id:
+            return [
+                {
+                    "role": "user",
+                    "content": (
+                        "[Hao | mention=<at user_id=\"ou_a\">Hao</at>]\n"
+                        "I am happy because France beat Norway 4-1"
+                    ),
+                    "observed": True,
+                }
+            ]
+        return []
+
+    runner.session_store = SimpleNamespace(
+        _generate_session_key=_generate_session_key,
+        _entries={parent_key: SimpleNamespace(session_id=parent_session_id)},
+        _ensure_loaded=lambda: None,
+        get_or_create_session=lambda source: SimpleNamespace(session_id="thread-session"),
+        load_transcript=_load_transcript,
+    )
+
+    _CapturingAgent.last_init = None
+    _CapturingAgent.last_run_ephemeral = None
+    _CapturingAgent.last_run_user_message = None
+    channel_prompt = "You are handling observed Feishu/Lark group context."
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_group",
+        chat_type="group",
+        user_id="ou_a",
+        user_name="Hao",
+        thread_id="omt_thread",
+    )
+
+    result = await runner._run_agent(
+        message="[Hao | mention=<at user_id=\"ou_a\">Hao</at>]\nwhat am i happy about",
+        context_prompt="Context prompt",
+        history=[],
+        source=source,
+        session_id="thread-session",
+        session_key="agent:main:feishu:group:oc_group:omt_thread",
+        channel_prompt=channel_prompt,
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_run_ephemeral is not None
+    assert "Recent parent chat context before this thread" in _CapturingAgent.last_run_ephemeral
+    assert "I am happy because France beat Norway 4-1" in _CapturingAgent.last_run_ephemeral
+    assert _CapturingAgent.last_run_user_message == (
+        "[Hao | mention=<at user_id=\"ou_a\">Hao</at>]\nwhat am i happy about"
+    )

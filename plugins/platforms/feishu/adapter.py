@@ -1310,10 +1310,11 @@ def _clean_message_ref(value: Any, *, current_message_id: Optional[str] = None) 
 def _feishu_thread_context(message: Any, message_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """Return ``(thread_id, reply_to_message_id)`` for a Feishu/Lark message.
 
-    Some Feishu/Lark payloads include ``root_id`` on a normal top-level group
-    message with the same value as the message's own id. Treating that as a
-    thread root makes Hermes answer in a thread when the user mentioned it in
-    the main group. Only non-self linkage should create thread/reply metadata.
+    Feishu/Lark distinguishes topic/thread messages from plain quote replies:
+    ``thread_id`` is set for real threads, while ``root_id``/``parent_id`` may
+    be present for normal quote replies in the main group. Preserve quote
+    metadata for context, but only an explicit ``thread_id`` creates a Hermes
+    thread session.
     """
 
     current = str(message_id) if message_id else None
@@ -1326,7 +1327,7 @@ def _feishu_thread_context(message: Any, message_id: Optional[str]) -> tuple[Opt
     )
 
     reply_to_message_id = parent_id or upper_message_id or root_id
-    thread_id = explicit_thread_id or (root_id if reply_to_message_id else None)
+    thread_id = explicit_thread_id
     return thread_id, reply_to_message_id
 
 
