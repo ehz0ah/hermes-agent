@@ -228,7 +228,7 @@ def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions
 def test_observed_group_context_replays_as_current_message_context_not_user_turns():
     from gateway.run import (
         _build_gateway_agent_history,
-        _wrap_current_message_with_observed_context,
+        _with_observed_group_context_ephemeral_prompt,
     )
 
     history = [
@@ -242,18 +242,19 @@ def test_observed_group_context_replays_as_current_message_context_not_user_turn
         history,
         channel_prompt="You are handling Telegram; observed Telegram group context is present.",
     )
-    api_message = _wrap_current_message_with_observed_context(
-        "[Bob|222]\ncambio",
+    ephemeral_prompt = _with_observed_group_context_ephemeral_prompt(
+        None,
         observed_context,
         channel_prompt="You are handling Telegram; observed Telegram group context is present.",
     )
 
     assert agent_history == [{"role": "assistant", "content": "previous explicit reply"}]
-    assert "[Observed Telegram group context - previous visible messages from the same chat or thread" in api_message
-    assert "[Current addressed message - answer this request" in api_message
-    assert "Acha que dá fazer estoque?" in api_message
-    assert "Tem lote e vencimento" in api_message
-    assert api_message.endswith("[Bob|222]\ncambio")
+    assert ephemeral_prompt is not None
+    assert "[Observed Telegram group context - previous visible messages from the same chat or thread" in ephemeral_prompt
+    assert "[Current addressed message - answer this request" in ephemeral_prompt
+    assert "Acha que dá fazer estoque?" in ephemeral_prompt
+    assert "Tem lote e vencimento" in ephemeral_prompt
+    assert "[Bob|222]\ncambio" not in ephemeral_prompt
 
 
 def test_observed_group_context_uses_only_trailing_rows_for_prompt_and_memory():
@@ -302,7 +303,7 @@ def test_observed_group_context_does_not_hide_current_user_turn_behind_history_o
     from agent.agent_runtime_helpers import repair_message_sequence
     from gateway.run import (
         _build_gateway_agent_history,
-        _wrap_current_message_with_observed_context,
+        _with_observed_group_context_ephemeral_prompt,
     )
 
     history = [
@@ -312,34 +313,36 @@ def test_observed_group_context_does_not_hide_current_user_turn_behind_history_o
         history,
         channel_prompt="observed Telegram group context",
     )
-    api_message = _wrap_current_message_with_observed_context("[Bob|222]\ncambio", observed_context)
-    messages = list(agent_history) + [{"role": "user", "content": api_message}]
+    ephemeral_prompt = _with_observed_group_context_ephemeral_prompt(None, observed_context)
+    messages = list(agent_history) + [{"role": "user", "content": "[Bob|222]\ncambio"}]
 
     repair_message_sequence(object(), messages)
 
     history_offset = len(agent_history)
     new_messages = messages[history_offset:]
     assert len(agent_history) == 0
+    assert ephemeral_prompt is not None
+    assert "Acha que dá fazer estoque?" in ephemeral_prompt
     assert new_messages[0]["role"] == "user"
-    assert new_messages[0]["content"].endswith("[Bob|222]\ncambio")
+    assert new_messages[0]["content"] == "[Bob|222]\ncambio"
 
 
-def test_observed_group_context_wraps_multimodal_current_message_without_mutating_parts():
-    from gateway.run import _wrap_current_message_with_observed_context
+def test_observed_group_context_leaves_multimodal_current_message_unmutated():
+    from gateway.run import _with_observed_group_context_ephemeral_prompt
 
     original = [
         {"type": "text", "text": "[Bob|222]\nsee this image"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
     ]
 
-    wrapped = _wrap_current_message_with_observed_context(original, "[Alice|111]\nside chatter")
+    prompt = _with_observed_group_context_ephemeral_prompt(None, "[Alice|111]\nside chatter")
 
     assert original[0]["text"] == "[Bob|222]\nsee this image"
-    assert wrapped[0]["text"].startswith(
-        "[Observed group chat context - previous visible messages"
-    )
-    assert wrapped[0]["text"].endswith("[Bob|222]\nsee this image")
-    assert wrapped[1] == original[1]
+    assert original[1] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+    assert prompt is not None
+    assert prompt.startswith("[Observed group chat context - previous visible messages")
+    assert "[Alice|111]\nside chatter" in prompt
+    assert "[Bob|222]\nsee this image" not in prompt
 
 
 def test_observed_group_context_replays_normally_without_telegram_prompt():
@@ -358,7 +361,7 @@ def test_observed_group_context_replays_normally_without_telegram_prompt():
 def test_observed_group_context_supports_feishu_lark_prompt_marker():
     from gateway.run import (
         _build_gateway_agent_history,
-        _wrap_current_message_with_observed_context,
+        _with_observed_group_context_ephemeral_prompt,
     )
 
     history = [
@@ -370,24 +373,26 @@ def test_observed_group_context_supports_feishu_lark_prompt_marker():
         history,
         channel_prompt="You are handling observed Feishu/Lark group context.",
     )
-    wrapped = _wrap_current_message_with_observed_context(
-        "what did Alice mention?",
+    prompt = _with_observed_group_context_ephemeral_prompt(
+        "base prompt",
         observed_context,
         channel_prompt="You are handling observed Feishu/Lark group context.",
     )
 
     assert agent_history == [{"role": "assistant", "content": "prior answer"}]
     assert observed_context == "[Alice | mention=<at user_id=\"ou_a\">Alice</at>]\ncoffee"
-    assert "[Observed Feishu/Lark group context" in wrapped
-    assert "previous visible messages from the same chat or thread" in wrapped
-    assert "Use them as immediate chat context" in wrapped
-    assert "No memory or search tool is needed when this block already answers the current question" in wrapped
-    assert "Do not call memory/search tools to verify facts already present in this block" in wrapped
-    assert "Empty memory/search results do not disprove this block" in wrapped
-    assert "what someone just said, did, feels, wants, or refers to" in wrapped
-    assert "do not say you cannot see the chat or do not know" in wrapped
-    assert "coffee" in wrapped
-    assert "what did Alice mention?" in wrapped
+    assert prompt is not None
+    assert prompt.startswith("base prompt")
+    assert "[Observed Feishu/Lark group context" in prompt
+    assert "previous visible messages from the same chat or thread" in prompt
+    assert "Use them as immediate chat context" in prompt
+    assert "No memory or search tool is needed when this block already answers the current question" in prompt
+    assert "Do not call memory/search tools to verify facts already present in this block" in prompt
+    assert "Empty memory/search results do not disprove this block" in prompt
+    assert "what someone just said, did, feels, wants, or refers to" in prompt
+    assert "do not say you cannot see the chat or do not know" in prompt
+    assert "coffee" in prompt
+    assert "what did Alice mention?" not in prompt
 
 
 def test_observed_group_context_collects_feishu_rows_for_memory_sync_only():
