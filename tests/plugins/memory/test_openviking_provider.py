@@ -2926,6 +2926,68 @@ def test_sync_turn_debounces_idle_commit_for_same_session(monkeypatch):
     ] == [("/api/v1/sessions/sid/commit", {"keep_recent_count": 0})]
 
 
+def test_idle_commit_retry_after_drain_timeout_is_bounded_and_debounced(monkeypatch):
+    _FakeIdleTimer.instances = []
+    monkeypatch.setattr(openviking_provider_module.threading, "Timer", _FakeIdleTimer)
+    provider = _team_sync_provider_for_idle_tests()
+    context = MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice")
+    drain_results = [False, True]
+
+    def fake_drain(_sid, timeout):
+        assert timeout > 0
+        return drain_results.pop(0)
+
+    provider._drain_writers = fake_drain
+
+    provider.sync_turn("first fact", "noted", session_id="sid", context=context)
+    first_timer = _FakeIdleTimer.instances[0]
+    first_timer.fire()
+
+    assert len(_FakeIdleTimer.instances) == 2
+    retry_timer = _FakeIdleTimer.instances[1]
+    assert [
+        post for post in provider._client.posts
+        if post[0] == "/api/v1/sessions/sid/commit"
+    ] == []
+
+    provider.sync_turn("second fact", "noted", session_id="sid", context=context)
+    latest_timer = _FakeIdleTimer.instances[2]
+
+    assert retry_timer.cancelled is True
+    retry_timer.fire()
+    assert [
+        post for post in provider._client.posts
+        if post[0] == "/api/v1/sessions/sid/commit"
+    ] == []
+
+    latest_timer.fire()
+    assert [
+        post for post in provider._client.posts
+        if post[0] == "/api/v1/sessions/sid/commit"
+    ] == [("/api/v1/sessions/sid/commit", {"keep_recent_count": 0})]
+
+
+def test_idle_commit_stops_after_bounded_drain_timeouts(monkeypatch):
+    _FakeIdleTimer.instances = []
+    monkeypatch.setattr(openviking_provider_module.threading, "Timer", _FakeIdleTimer)
+    provider = _team_sync_provider_for_idle_tests()
+    context = MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice")
+    provider._drain_writers = lambda _sid, timeout: False
+
+    provider.sync_turn("favorite snack is oreo", "noted", session_id="sid", context=context)
+
+    fired = 0
+    while fired < len(_FakeIdleTimer.instances):
+        _FakeIdleTimer.instances[fired].fire()
+        fired += 1
+
+    assert len(_FakeIdleTimer.instances) == 3
+    assert [
+        post for post in provider._client.posts
+        if post[0] == "/api/v1/sessions/sid/commit"
+    ] == []
+
+
 def test_idle_commit_seconds_zero_disables_idle_timer(monkeypatch):
     _FakeIdleTimer.instances = []
     monkeypatch.setattr(openviking_provider_module.threading, "Timer", _FakeIdleTimer)

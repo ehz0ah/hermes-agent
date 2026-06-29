@@ -78,6 +78,7 @@ _OPENVIKING_IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9_.@-]+$")
 _IDENTITY_MODE_SOLO = "solo"
 _IDENTITY_MODE_TEAM = "team"
 _IDENTITY_MODES = {_IDENTITY_MODE_SOLO, _IDENTITY_MODE_TEAM}
+_IDLE_COMMIT_DRAIN_RETRY_LIMIT = 2
 
 
 def _facade_attr(name: str, default: Any) -> Any:
@@ -207,6 +208,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         self._idle_commit_lock = threading.Lock()
         self._idle_commit_timers: Dict[str, threading.Timer] = {}
         self._idle_commit_generations: Dict[str, int] = {}
+        self._idle_commit_drain_retries: Dict[str, int] = {}
         self._runtime_start_lock = threading.Lock()
         self._runtime_start_thread: Optional[threading.Thread] = None
         self._memory_write_lock = threading.Lock()
@@ -1013,6 +1015,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
             return
         with self._idle_commit_lock:
             self._idle_commit_generations[sid] = self._idle_commit_generations.get(sid, 0) + 1
+            self._idle_commit_drain_retries.pop(sid, None)
             timer = self._idle_commit_timers.pop(sid, None)
         if timer is not None:
             timer.cancel()
@@ -1023,13 +1026,27 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
             for sid in list(self._idle_commit_generations):
                 self._idle_commit_generations[sid] = self._idle_commit_generations.get(sid, 0) + 1
             self._idle_commit_timers.clear()
+            self._idle_commit_drain_retries.clear()
         for timer in timers:
             timer.cancel()
 
-    def _schedule_idle_commit(self, sid: str) -> None:
+    def _schedule_idle_commit(
+        self,
+        sid: str,
+        *,
+        retry: bool = False,
+        expected_generation: Optional[int] = None,
+    ) -> None:
         if not sid or not self._idle_commit_enabled():
             return
         with self._idle_commit_lock:
+            if (
+                expected_generation is not None
+                and self._idle_commit_generations.get(sid) != expected_generation
+            ):
+                return
+            if not retry:
+                self._idle_commit_drain_retries[sid] = 0
             generation = self._idle_commit_generations.get(sid, 0) + 1
             self._idle_commit_generations[sid] = generation
             previous = self._idle_commit_timers.pop(sid, None)
@@ -1043,6 +1060,27 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         if previous is not None:
             previous.cancel()
         timer.start()
+
+    def _reschedule_idle_commit_after_drain_timeout(self, sid: str, generation: int) -> None:
+        if not sid:
+            return
+        with self._idle_commit_lock:
+            if (
+                self._shutting_down
+                or self._idle_commit_generations.get(sid) != generation
+            ):
+                return
+            retries = self._idle_commit_drain_retries.get(sid, 0)
+            if retries >= _IDLE_COMMIT_DRAIN_RETRY_LIMIT:
+                logger.warning(
+                    "OpenViking writer for %s still alive after %d idle drain retries; "
+                    "leaving checkpoint to terminal commit",
+                    sid,
+                    retries,
+                )
+                return
+            self._idle_commit_drain_retries[sid] = retries + 1
+        self._schedule_idle_commit(sid, retry=True, expected_generation=generation)
 
     def _commit_session_checkpoint(
         self,
@@ -1080,17 +1118,21 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         if not self._drain_writers(sid, timeout=_DEFERRED_COMMIT_TIMEOUT):
             logger.warning(
                 "OpenViking writer for %s still alive after idle drain — "
-                "skipping idle checkpoint",
+                "retrying idle checkpoint",
                 sid,
             )
+            self._reschedule_idle_commit_after_drain_timeout(sid, generation)
             return
         if self._shutting_down or self._has_committed_session(sid):
             return
-        self._commit_session_checkpoint(
+        committed = self._commit_session_checkpoint(
             sid,
             keep_recent_count=self._idle_commit_keep_recent,
             context="after idle",
         )
+        if committed:
+            with self._idle_commit_lock:
+                self._idle_commit_drain_retries.pop(sid, None)
 
     def _session_needs_commit(self, sid: str, turn_count: int) -> bool:
         # Already-committed sessions never need a second commit, regardless of
