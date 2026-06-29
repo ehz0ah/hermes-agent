@@ -10,6 +10,7 @@ import pytest
 
 from agent.memory_provider import MemoryTurnContext
 import plugins.memory.openviking as openviking_module
+import plugins.memory.openviking.provider as openviking_provider_module
 from plugins.memory.openviking import (
     OpenVikingMemoryProvider,
     _DEFERRED_COMMIT_TIMEOUT,
@@ -38,6 +39,8 @@ def _clear_openviking_env(monkeypatch):
         "OPENVIKING_AGENT",
         "OPENVIKING_CLI_CONFIG_FILE",
         "OPENVIKING_IDENTITY_MODE",
+        "OPENVIKING_IDLE_COMMIT_SECONDS",
+        "OPENVIKING_IDLE_COMMIT_KEEP_RECENT",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -2824,6 +2827,119 @@ def test_sync_turn_solo_mode_drops_observed_rows_before_posting(monkeypatch):
     assert [message["role"] for message in batch] == ["user", "assistant"]
     assert batch[0]["parts"][0]["text"] == "what did Alice mention?"
     assert batch[1]["parts"][0]["text"] == "Alice mentioned oreos."
+
+
+class _FakeIdleTimer:
+    instances = []
+
+    def __init__(self, interval, function, args=None, kwargs=None):
+        self.interval = interval
+        self.function = function
+        self.args = args or ()
+        self.kwargs = kwargs or {}
+        self.cancelled = False
+        self.daemon = False
+        self.started = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        self.function(*self.args, **self.kwargs)
+
+
+def _team_sync_provider_for_idle_tests():
+    class StubClient:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, payload=None, **kwargs):
+            self.posts.append((path, payload))
+            return {"result": {"written_bytes": 12}}
+
+    provider = OpenVikingMemoryProvider()
+    provider._client = StubClient()
+    provider._endpoint = "http://ov"
+    provider._api_key = "key"
+    provider._account = "acct"
+    provider._user = "gateway_admin"
+    provider._agent = "hermes"
+    provider._session_id = "sid"
+    provider._identity_mode = "team"
+    provider._idle_commit_seconds = 1
+    provider._idle_commit_keep_recent = 0
+    provider._spawn_writer = lambda _sid, target, name: target()
+    provider._client_for_context = lambda _context: provider._client
+    return provider
+
+
+def test_sync_turn_schedules_idle_commit_without_marking_session_committed(monkeypatch):
+    _FakeIdleTimer.instances = []
+    monkeypatch.setattr(openviking_provider_module.threading, "Timer", _FakeIdleTimer)
+    provider = _team_sync_provider_for_idle_tests()
+    context = MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice")
+
+    provider.sync_turn("favorite snack is oreo", "noted", session_id="sid", context=context)
+
+    assert len(_FakeIdleTimer.instances) == 1
+    timer = _FakeIdleTimer.instances[0]
+    assert timer.interval == 1
+    assert timer.daemon is True
+    assert timer.started is True
+
+    timer.fire()
+
+    assert provider._client.posts[-1] == (
+        "/api/v1/sessions/sid/commit",
+        {"keep_recent_count": 0},
+    )
+    assert provider._has_committed_session("sid") is False
+    assert provider._session_needs_commit("sid", provider._turn_count) is True
+
+
+def test_sync_turn_debounces_idle_commit_for_same_session(monkeypatch):
+    _FakeIdleTimer.instances = []
+    monkeypatch.setattr(openviking_provider_module.threading, "Timer", _FakeIdleTimer)
+    provider = _team_sync_provider_for_idle_tests()
+    context = MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice")
+
+    provider.sync_turn("first fact", "noted", session_id="sid", context=context)
+    first_timer = _FakeIdleTimer.instances[0]
+    provider.sync_turn("second fact", "noted", session_id="sid", context=context)
+    second_timer = _FakeIdleTimer.instances[1]
+
+    assert first_timer.cancelled is True
+    first_timer.fire()
+    assert [
+        post for post in provider._client.posts
+        if post[0] == "/api/v1/sessions/sid/commit"
+    ] == []
+
+    second_timer.fire()
+    assert [
+        post for post in provider._client.posts
+        if post[0] == "/api/v1/sessions/sid/commit"
+    ] == [("/api/v1/sessions/sid/commit", {"keep_recent_count": 0})]
+
+
+def test_idle_commit_seconds_zero_disables_idle_timer(monkeypatch):
+    _FakeIdleTimer.instances = []
+    monkeypatch.setattr(openviking_provider_module.threading, "Timer", _FakeIdleTimer)
+    provider = _team_sync_provider_for_idle_tests()
+    provider._idle_commit_seconds = 0
+    context = MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice")
+
+    provider.sync_turn("favorite snack is oreo", "noted", session_id="sid", context=context)
+
+    assert _FakeIdleTimer.instances == []
+    assert [
+        post for post in provider._client.posts
+        if post[0] == "/api/v1/sessions/sid/commit"
+    ] == []
 
 
 def test_sync_turn_retries_batch_write_with_fresh_client():

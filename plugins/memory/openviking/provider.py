@@ -41,6 +41,8 @@ from .config import (
 from .constants import (
     _DEFAULT_AGENT,
     _DEFAULT_ENDPOINT,
+    _DEFAULT_IDLE_COMMIT_KEEP_RECENT,
+    _DEFAULT_IDLE_COMMIT_SECONDS,
     _DEFAULT_RECALL_FULL_READ_LIMIT,
     _DEFAULT_RECALL_LIMIT,
     _DEFAULT_RECALL_MAX_INJECTED_CHARS,
@@ -198,6 +200,13 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         self._deferred_commit_lock = threading.Lock()
         self._committed_session_ids: Set[str] = set()
         self._committed_session_lock = threading.Lock()
+        # Idle checkpoints are OpenViking-local extraction refreshes. They do
+        # not mark the Hermes session final; terminal hooks still own that.
+        self._idle_commit_seconds = 0
+        self._idle_commit_keep_recent = 0
+        self._idle_commit_lock = threading.Lock()
+        self._idle_commit_timers: Dict[str, threading.Timer] = {}
+        self._idle_commit_generations: Dict[str, int] = {}
         self._runtime_start_lock = threading.Lock()
         self._runtime_start_thread: Optional[threading.Thread] = None
         self._memory_write_lock = threading.Lock()
@@ -262,6 +271,24 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
                 "description": "OpenViking identity mode: solo for one human, team for gateway group/team use",
                 "default": _IDENTITY_MODE_SOLO,
                 "env_var": "OPENVIKING_IDENTITY_MODE",
+            },
+            {
+                "key": "idle_commit_seconds",
+                "description": (
+                    "Commit/extract an idle OpenViking session after this many seconds; "
+                    "0 disables idle checkpoints"
+                ),
+                "default": _DEFAULT_IDLE_COMMIT_SECONDS,
+                "env_var": "OPENVIKING_IDLE_COMMIT_SECONDS",
+            },
+            {
+                "key": "idle_commit_keep_recent",
+                "description": (
+                    "Recent messages to leave unarchived during idle checkpoints; "
+                    "0 extracts short quiet sessions immediately"
+                ),
+                "default": _DEFAULT_IDLE_COMMIT_KEEP_RECENT,
+                "env_var": "OPENVIKING_IDLE_COMMIT_KEEP_RECENT",
             },
             {
                 "key": "recall_limit",
@@ -532,6 +559,22 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
             os.environ.get("OPENVIKING_IDENTITY_MODE")
             or provider_config.get("identity_mode")
             or _IDENTITY_MODE_SOLO
+        )
+        self._idle_commit_seconds = self._env_or_config_int(
+            "OPENVIKING_IDLE_COMMIT_SECONDS",
+            provider_config,
+            "idle_commit_seconds",
+            _DEFAULT_IDLE_COMMIT_SECONDS,
+            minimum=0,
+            maximum=86400,
+        )
+        self._idle_commit_keep_recent = self._env_or_config_int(
+            "OPENVIKING_IDLE_COMMIT_KEEP_RECENT",
+            provider_config,
+            "idle_commit_keep_recent",
+            _DEFAULT_IDLE_COMMIT_KEEP_RECENT,
+            minimum=0,
+            maximum=1000,
         )
         if self._identity_mode == _IDENTITY_MODE_TEAM and kwargs.get("platform") == "cli":
             raise RuntimeError(
@@ -958,6 +1001,97 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         with self._committed_session_lock:
             self._committed_session_ids.add(sid)
 
+    def _idle_commit_enabled(self) -> bool:
+        return bool(
+            self._client
+            and not self._shutting_down
+            and self._idle_commit_seconds > 0
+        )
+
+    def _cancel_idle_commit_timer(self, sid: str) -> None:
+        if not sid:
+            return
+        with self._idle_commit_lock:
+            self._idle_commit_generations[sid] = self._idle_commit_generations.get(sid, 0) + 1
+            timer = self._idle_commit_timers.pop(sid, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _cancel_idle_commit_timers(self) -> None:
+        with self._idle_commit_lock:
+            timers = list(self._idle_commit_timers.values())
+            for sid in list(self._idle_commit_generations):
+                self._idle_commit_generations[sid] = self._idle_commit_generations.get(sid, 0) + 1
+            self._idle_commit_timers.clear()
+        for timer in timers:
+            timer.cancel()
+
+    def _schedule_idle_commit(self, sid: str) -> None:
+        if not sid or not self._idle_commit_enabled():
+            return
+        with self._idle_commit_lock:
+            generation = self._idle_commit_generations.get(sid, 0) + 1
+            self._idle_commit_generations[sid] = generation
+            previous = self._idle_commit_timers.pop(sid, None)
+            timer = threading.Timer(
+                self._idle_commit_seconds,
+                self._run_idle_commit,
+                args=(sid, generation),
+            )
+            timer.daemon = True
+            self._idle_commit_timers[sid] = timer
+        if previous is not None:
+            previous.cancel()
+        timer.start()
+
+    def _commit_session_checkpoint(
+        self,
+        sid: str,
+        *,
+        keep_recent_count: int,
+        context: str,
+    ) -> bool:
+        if not sid or not self._client or self._has_committed_session(sid):
+            return False
+        try:
+            self._client.post(
+                f"/api/v1/sessions/{sid}/commit",
+                {"keep_recent_count": max(0, int(keep_recent_count))},
+            )
+            logger.info(
+                "OpenViking session %s checkpoint committed %s (keep_recent_count=%d)",
+                sid,
+                context,
+                keep_recent_count,
+            )
+            return True
+        except Exception as e:
+            logger.warning("OpenViking session checkpoint failed for %s: %s", sid, e)
+            return False
+
+    def _run_idle_commit(self, sid: str, generation: int) -> None:
+        with self._idle_commit_lock:
+            if (
+                self._shutting_down
+                or self._idle_commit_generations.get(sid) != generation
+            ):
+                return
+            self._idle_commit_timers.pop(sid, None)
+        if not self._drain_writers(sid, timeout=_DEFERRED_COMMIT_TIMEOUT):
+            logger.warning(
+                "OpenViking writer for %s still alive after idle drain — "
+                "skipping idle checkpoint",
+                sid,
+            )
+            return
+        if self._shutting_down or self._has_committed_session(sid):
+            return
+        self._commit_session_checkpoint(
+            sid,
+            keep_recent_count=self._idle_commit_keep_recent,
+            context="after idle",
+        )
+
     def _session_needs_commit(self, sid: str, turn_count: int) -> bool:
         # Already-committed sessions never need a second commit, regardless of
         # the turn counter — a racing sync_turn can re-increment _turn_count
@@ -975,6 +1109,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
                 {"keep_recent_count": 0},
             )
             self._mark_session_committed(sid)
+            self._cancel_idle_commit_timer(sid)
             logger.info("OpenViking session %s committed %s (%d turns)", sid, context, turn_count)
             return True
         except Exception as e:
@@ -1104,6 +1239,25 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
     @staticmethod
     def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
         raw = os.environ.get(name)
+        try:
+            value = int(float(raw)) if raw not in {None, ""} else default
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    @staticmethod
+    def _env_or_config_int(
+        env_name: str,
+        provider_config: Dict[str, Any],
+        config_key: str,
+        default: int,
+        *,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        raw = os.environ.get(env_name)
+        if raw in {None, ""}:
+            raw = provider_config.get(config_key)
         try:
             value = int(float(raw)) if raw not in {None, ""} else default
         except (TypeError, ValueError):
@@ -1459,6 +1613,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
                 for profile_context in profile_contexts or ([context] if context is not None else []):
                     self._write_peer_profile(client, profile_context)
                 _post_turn(client)
+                self._schedule_idle_commit(sid)
             except Exception as e:
                 logger.debug("OpenViking sync_turn failed, reconnecting: %s", e)
                 try:
@@ -1466,6 +1621,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
                     for profile_context in profile_contexts or ([context] if context is not None else []):
                         self._write_peer_profile(client, profile_context)
                     _post_turn(client)
+                    self._schedule_idle_commit(sid)
                 except Exception as retry_error:
                     logger.warning("OpenViking sync_turn failed: %s", retry_error)
 
@@ -1672,6 +1828,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         # Stop deferred finalizers from issuing new commits against a
         # torn-down client, then drain everything still in flight.
         self._shutting_down = True
+        self._cancel_idle_commit_timers()
         # Wait for every in-flight writer across all tracked sessions.
         with self._inflight_lock:
             all_workers = [

@@ -36,6 +36,8 @@ All config via environment variables in `.env`:
 | `OPENVIKING_USER` | `default` | Tenant user for local/trusted mode |
 | `OPENVIKING_AGENT` | `hermes` | Hermes peer ID in OpenViking, used for peer-scoped memories |
 | `OPENVIKING_IDENTITY_MODE` | `solo` | `solo` for one human, `team` for messaging gateways where multiple humans share one Hermes agent |
+| `OPENVIKING_IDLE_COMMIT_SECONDS` | `900` | Commit/extract an idle OpenViking session after this many seconds; `0` disables idle checkpoints |
+| `OPENVIKING_IDLE_COMMIT_KEEP_RECENT` | `0` | Recent messages to leave unarchived during idle checkpoints; `0` extracts short quiet sessions immediately |
 
 When `OPENVIKING_API_KEY` is set, Hermes lets OpenViking derive account/user
 identity from the key. In local or trusted deployments without an API key,
@@ -55,6 +57,13 @@ peer so the agent can recall what it has learned across the team.
 
 Team mode is not valid for direct CLI sessions. Run `hermes memory setup
 openviking` again and choose `solo` for CLI-only profiles.
+
+OpenViking also supports idle checkpoints. Terminal session boundaries such as
+shutdown, `/new`, and compression still commit normally. Separately, when a
+session has been quiet for `OPENVIKING_IDLE_COMMIT_SECONDS`, Hermes asks
+OpenViking to commit/extract that session without ending the Hermes session.
+The default leaves no recent messages unarchived so short quiet gateway
+conversations become searchable promptly.
 
 ## Tools
 
