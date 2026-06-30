@@ -2471,6 +2471,39 @@ def test_on_session_switch_commits_old_session_and_rotates_id():
     assert provider._turn_count == 0
 
 
+def test_on_session_switch_team_mode_commits_with_empty_actor_peer(monkeypatch):
+    constructed_clients = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key, *, account="", user="", agent=""):
+            self.agent = agent
+            self.posts = []
+            constructed_clients.append(self)
+
+        def post(self, path, payload=None, **kwargs):
+            self.posts.append((path, payload))
+            return {}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+    provider = _make_provider_with_session("old-sid", turn_count=3)
+    hermes_client = StubClient("http://ov", "key", account="acct", user="gateway_admin", agent="hermes")
+    constructed_clients.clear()
+    provider._client = hermes_client
+    provider._endpoint = "http://ov"
+    provider._api_key = "key"
+    provider._account = "acct"
+    provider._user = "gateway_admin"
+    provider._agent = "hermes"
+    provider._identity_mode = "team"
+
+    provider.on_session_switch("new-sid", parent_session_id="old-sid")
+
+    assert hermes_client.posts == []
+    assert [(client.agent, client.posts) for client in constructed_clients] == [
+        ("", [("/api/v1/sessions/old-sid/commit", {"keep_recent_count": 0})])
+    ]
+
+
 def test_on_session_switch_skips_commit_for_empty_old_session():
     """No turns accumulated → nothing to extract → no commit call."""
     provider = _make_provider_with_session("old-sid", turn_count=0)
@@ -2640,6 +2673,54 @@ def test_transcript_batch_can_attribute_user_messages_to_peer():
     ]
 
 
+def test_transcript_batch_can_leave_assistant_unattributed_and_drop_tools():
+    batch = OpenVikingMemoryProvider._messages_to_openviking_batch(
+        [
+            {"role": "user", "content": "favorite snack is oreo"},
+            {
+                "role": "assistant",
+                "content": "Checking.",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {"name": "terminal", "arguments": json.dumps({"cmd": "pwd"})},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "name": "terminal", "content": "ok"},
+            {"role": "assistant", "content": "noted"},
+        ],
+        user_peer_id="feishu_user_alice",
+        assistant_peer_id="",
+        include_tool_messages=False,
+    )
+
+    assert batch == [
+        {
+            "role": "user",
+            "parts": [{"type": "text", "text": "favorite snack is oreo"}],
+            "peer_id": "feishu_user_alice",
+        },
+        {
+            "role": "assistant",
+            "parts": [{"type": "text", "text": "Checking."}],
+        },
+        {
+            "role": "assistant",
+            "parts": [{"type": "text", "text": "noted"}],
+        },
+    ]
+
+
+def test_team_session_memory_policy_excludes_agent_self_templates():
+    policy = OpenVikingMemoryProvider._team_session_memory_policy()
+
+    assert policy["self"] == {"enabled": False}
+    assert policy["peer"] == {"enabled": True}
+    memory_types = policy["memory_types"]
+    assert set(memory_types) == {"entities", "events", "preferences", "profile"}
+
+
 def test_sync_turn_team_mode_writes_human_peer_and_profile(monkeypatch):
     posts = []
 
@@ -2696,9 +2777,19 @@ def test_sync_turn_team_mode_writes_human_peer_and_profile(monkeypatch):
         },
     )
     assert posts[1][0] == ""
-    assert posts[1][1] == "/api/v1/sessions/sid/messages/batch"
-    assert posts[1][2]["messages"][0]["peer_id"] == peer_id
-    assert posts[1][2]["messages"][1]["peer_id"] == "hermes"
+    assert posts[1][1] == "/api/v1/sessions"
+    assert posts[1][2] == {
+        "session_id": "sid",
+        "memory_policy": {
+            "self": {"enabled": False},
+            "peer": {"enabled": True},
+            "memory_types": ["entities", "events", "preferences", "profile"],
+        },
+    }
+    assert posts[2][0] == ""
+    assert posts[2][1] == "/api/v1/sessions/sid/messages/batch"
+    assert posts[2][2]["messages"][0]["peer_id"] == peer_id
+    assert "peer_id" not in posts[2][2]["messages"][1]
 
 
 def test_sync_turn_team_mode_syncs_observed_rows_to_their_original_peer(monkeypatch):
@@ -2767,17 +2858,94 @@ def test_sync_turn_team_mode_syncs_observed_rows_to_their_original_peer(monkeypa
     bob_peer = provider._peer_id_for_context(current_context)
     profile_posts = [post for post in posts if post[1] == "/api/v1/content/write"]
     batch_posts = [post for post in posts if post[1] == "/api/v1/sessions/sid/messages/batch"]
+    session_posts = [post for post in posts if post[1] == "/api/v1/sessions"]
     assert {post[2]["uri"] for post in profile_posts} == {
         f"viking://user/peers/{alice_peer}/resources/profile.md",
         f"viking://user/peers/{bob_peer}/resources/profile.md",
     }
+    assert session_posts == [
+        (
+            "",
+            "/api/v1/sessions",
+            {
+                "session_id": "sid",
+                "memory_policy": {
+                    "self": {"enabled": False},
+                    "peer": {"enabled": True},
+                    "memory_types": ["entities", "events", "preferences", "profile"],
+                },
+            },
+        )
+    ]
     assert len(batch_posts) == 1
     batch = batch_posts[0][2]["messages"]
     assert batch[0]["parts"][0]["text"].endswith("favorite snack is oreo")
     assert batch[0]["peer_id"] == alice_peer
     assert batch[1]["parts"][0]["text"] == "what did Alice mention?"
     assert batch[1]["peer_id"] == bob_peer
-    assert batch[2]["peer_id"] == "hermes"
+    assert "peer_id" not in batch[2]
+
+
+def test_sync_turn_team_mode_drops_internal_tool_outputs(monkeypatch):
+    posts = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key, *, account="", user="", agent=""):
+            self.agent = agent
+
+        def post(self, path, payload=None, **kwargs):
+            posts.append((self.agent, path, payload))
+            return {"result": {"written_bytes": 12}}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://ov"
+    provider._api_key = "key"
+    provider._account = "acct"
+    provider._user = "gateway_admin"
+    provider._agent = "hermes"
+    provider._session_id = "sid"
+    provider._identity_mode = "team"
+    provider._spawn_writer = lambda _sid, target, name: target()
+    context = MemoryTurnContext(
+        platform="feishu",
+        chat_id="oc_group",
+        user_id="ou_alice",
+        user_name="Alice",
+    )
+
+    provider.sync_turn(
+        "what did the command show?",
+        "It showed ok.",
+        session_id="sid",
+        messages=[
+            {"role": "user", "content": "what did the command show?"},
+            {
+                "role": "assistant",
+                "content": "Checking.",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {"name": "terminal", "arguments": json.dumps({"cmd": "pwd"})},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "name": "terminal", "content": "SECRET"},
+            {"role": "assistant", "content": "It showed ok."},
+        ],
+        context=context,
+    )
+
+    batch_posts = [post for post in posts if post[1] == "/api/v1/sessions/sid/messages/batch"]
+    assert len(batch_posts) == 1
+    batch = batch_posts[0][2]["messages"]
+    assert [message["role"] for message in batch] == ["user", "assistant", "assistant"]
+    assert all(
+        not any(part.get("type") == "tool" for part in message.get("parts", []))
+        for message in batch
+    )
+    assert "SECRET" not in json.dumps(batch)
 
 
 def test_sync_turn_solo_mode_drops_observed_rows_before_posting(monkeypatch):
@@ -2881,6 +3049,7 @@ def test_sync_turn_schedules_idle_commit_without_marking_session_committed(monke
     _FakeIdleTimer.instances = []
     monkeypatch.setattr(openviking_provider_module.threading, "Timer", _FakeIdleTimer)
     provider = _team_sync_provider_for_idle_tests()
+    provider._client_for_commit = lambda: provider._client
     context = MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice")
 
     provider.sync_turn("favorite snack is oreo", "noted", session_id="sid", context=context)
@@ -2901,10 +3070,44 @@ def test_sync_turn_schedules_idle_commit_without_marking_session_committed(monke
     assert provider._session_needs_commit("sid", provider._turn_count) is True
 
 
+def test_idle_commit_team_mode_uses_empty_actor_peer(monkeypatch):
+    _FakeIdleTimer.instances = []
+    monkeypatch.setattr(openviking_provider_module.threading, "Timer", _FakeIdleTimer)
+    constructed_clients = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key, *, account="", user="", agent=""):
+            self.agent = agent
+            self.posts = []
+            constructed_clients.append(self)
+
+        def post(self, path, payload=None, **kwargs):
+            self.posts.append((path, payload))
+            return {}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+    provider = _team_sync_provider_for_idle_tests()
+    hermes_client = provider._client
+    context = MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice")
+
+    provider.sync_turn("favorite snack is oreo", "noted", session_id="sid", context=context)
+    _FakeIdleTimer.instances[0].fire()
+
+    assert [path for path, _payload in hermes_client.posts] == [
+        "/api/v1/content/write",
+        "/api/v1/sessions",
+        "/api/v1/sessions/sid/messages/batch",
+    ]
+    assert [(client.agent, client.posts) for client in constructed_clients] == [
+        ("", [("/api/v1/sessions/sid/commit", {"keep_recent_count": 0})])
+    ]
+
+
 def test_sync_turn_debounces_idle_commit_for_same_session(monkeypatch):
     _FakeIdleTimer.instances = []
     monkeypatch.setattr(openviking_provider_module.threading, "Timer", _FakeIdleTimer)
     provider = _team_sync_provider_for_idle_tests()
+    provider._client_for_commit = lambda: provider._client
     context = MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice")
 
     provider.sync_turn("first fact", "noted", session_id="sid", context=context)
@@ -2930,6 +3133,7 @@ def test_idle_commit_retry_after_drain_timeout_is_bounded_and_debounced(monkeypa
     _FakeIdleTimer.instances = []
     monkeypatch.setattr(openviking_provider_module.threading, "Timer", _FakeIdleTimer)
     provider = _team_sync_provider_for_idle_tests()
+    provider._client_for_commit = lambda: provider._client
     context = MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice")
     drain_results = [False, True]
 

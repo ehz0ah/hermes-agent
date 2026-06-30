@@ -168,10 +168,12 @@ class OpenVikingTranscriptMixin:
         *,
         user_peer_id: str = "",
         assistant_peer_id: str = "",
+        include_tool_messages: bool = True,
     ) -> List[Dict[str, Any]]:
         """Convert Hermes canonical messages into OpenViking batch payloads."""
         user_peer_id = str(user_peer_id or "").strip()
         assistant_peer_id = str(assistant_peer_id or "").strip()
+        include_tool_messages = bool(include_tool_messages)
         tool_calls_by_id: Dict[str, Dict[str, Any]] = {}
         completed_tool_ids: set[str] = set()
         skipped_tool_ids: set[str] = set()
@@ -235,6 +237,8 @@ class OpenVikingTranscriptMixin:
                 continue
 
             if role == "tool":
+                if not include_tool_messages:
+                    continue
                 tool_id = str(message.get("tool_call_id") or message.get("id") or "")
                 prior_call = tool_calls_by_id.get(tool_id, {})
                 tool_name = str(message.get("name") or prior_call.get("tool_name") or "")
@@ -261,31 +265,32 @@ class OpenVikingTranscriptMixin:
                 parts.append({"type": "text", "text": text})
 
             if role == "assistant":
-                for tool_call in message.get("tool_calls") or []:
-                    if not isinstance(tool_call, dict):
-                        continue
-                    tool_id = cls._tool_call_id(tool_call)
-                    tool_name = cls._tool_call_name(tool_call)
-                    if tool_id in skipped_tool_ids or cls._is_openviking_recall_tool_name(tool_name):
-                        continue
-                    if tool_id in completed_tool_ids:
-                        continue
-                    # Reuse the tool_input parsed in the pre-scan when available
-                    # (non-empty ids are cached); fall back to parsing for the
-                    # uncached empty-id case so we never drop arguments.
-                    prior_call = tool_calls_by_id.get(tool_id) if tool_id else None
-                    tool_input = (
-                        prior_call["tool_input"]
-                        if prior_call is not None
-                        else cls._tool_call_input(tool_call)
-                    )
-                    parts.append({
-                        "type": "tool",
-                        "tool_id": tool_id,
-                        "tool_name": tool_name,
-                        "tool_input": tool_input,
-                        "tool_status": _TOOL_STATUS_PENDING,
-                    })
+                if include_tool_messages:
+                    for tool_call in message.get("tool_calls") or []:
+                        if not isinstance(tool_call, dict):
+                            continue
+                        tool_id = cls._tool_call_id(tool_call)
+                        tool_name = cls._tool_call_name(tool_call)
+                        if tool_id in skipped_tool_ids or cls._is_openviking_recall_tool_name(tool_name):
+                            continue
+                        if tool_id in completed_tool_ids:
+                            continue
+                        # Reuse the tool_input parsed in the pre-scan when available
+                        # (non-empty ids are cached); fall back to parsing for the
+                        # uncached empty-id case so we never drop arguments.
+                        prior_call = tool_calls_by_id.get(tool_id) if tool_id else None
+                        tool_input = (
+                            prior_call["tool_input"]
+                            if prior_call is not None
+                            else cls._tool_call_input(tool_call)
+                        )
+                        parts.append({
+                            "type": "tool",
+                            "tool_id": tool_id,
+                            "tool_name": tool_name,
+                            "tool_input": tool_input,
+                            "tool_status": _TOOL_STATUS_PENDING,
+                        })
 
             if parts:
                 payload_messages.append(payload_message(role, parts, message))

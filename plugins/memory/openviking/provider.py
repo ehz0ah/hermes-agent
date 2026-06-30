@@ -79,6 +79,12 @@ _IDENTITY_MODE_SOLO = "solo"
 _IDENTITY_MODE_TEAM = "team"
 _IDENTITY_MODES = {_IDENTITY_MODE_SOLO, _IDENTITY_MODE_TEAM}
 _IDLE_COMMIT_DRAIN_RETRY_LIMIT = 2
+_TEAM_SESSION_MEMORY_TYPES = (
+    "entities",
+    "events",
+    "preferences",
+    "profile",
+)
 
 
 def _facade_attr(name: str, default: Any) -> Any:
@@ -182,6 +188,8 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         self._identity_mode = _IDENTITY_MODE_SOLO
         self._profile_lock = threading.Lock()
         self._profiled_peers: Set[str] = set()
+        self._team_session_policy_lock = threading.Lock()
+        self._team_session_policy_sids: Set[str] = set()
         self._session_id = ""
         self._turn_count = 0
         # Guards the (_session_id, _turn_count) pair. sync_turn runs on the
@@ -835,6 +843,39 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
             return self._new_client(agent="")
         return self._new_client()
 
+    def _client_for_commit(self) -> _VikingClient:
+        if self._team_mode():
+            return self._new_client(agent="")
+        if self._client is None:
+            raise RuntimeError("OpenViking client is not connected")
+        return self._client
+
+    @staticmethod
+    def _team_session_memory_policy() -> Dict[str, Any]:
+        return {
+            "self": {"enabled": False},
+            "peer": {"enabled": True},
+            "memory_types": list(_TEAM_SESSION_MEMORY_TYPES),
+        }
+
+    def _ensure_team_session_policy(self, client: _VikingClient, sid: str) -> None:
+        if not self._team_mode() or not sid:
+            return
+        with self._team_session_policy_lock:
+            if sid in self._team_session_policy_sids:
+                return
+        payload = {
+            "session_id": sid,
+            "memory_policy": self._team_session_memory_policy(),
+        }
+        try:
+            client.post("/api/v1/sessions", payload)
+        except _OpenVikingHTTPError as e:
+            if e.status_code != 409 and "already exists" not in str(e).lower():
+                raise
+        with self._team_session_policy_lock:
+            self._team_session_policy_sids.add(sid)
+
     @staticmethod
     def _context_stable_identity(context: Optional[MemoryTurnContext]) -> str:
         if context is None:
@@ -1092,7 +1133,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         if not sid or not self._client or self._has_committed_session(sid):
             return False
         try:
-            self._client.post(
+            self._client_for_commit().post(
                 f"/api/v1/sessions/{sid}/commit",
                 {"keep_recent_count": max(0, int(keep_recent_count))},
             )
@@ -1146,7 +1187,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
 
     def _commit_session(self, sid: str, turn_count: int, *, context: str) -> bool:
         try:
-            self._client.post(
+            self._client_for_commit().post(
                 f"/api/v1/sessions/{sid}/commit",
                 {"keep_recent_count": 0},
             )
@@ -1588,10 +1629,12 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
             except ValueError as e:
                 logger.warning("%s", e)
                 return
+        session_assistant_peer_id = "" if self._team_mode() else self._assistant_peer_id()
         batch_messages = self._messages_to_openviking_batch(
             turn_messages,
             user_peer_id=user_peer_id,
-            assistant_peer_id=self._assistant_peer_id(),
+            assistant_peer_id=session_assistant_peer_id,
+            include_tool_messages=not self._team_mode(),
         )
 
         if _sync_trace_enabled():
@@ -1624,6 +1667,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
 
         def _sync():
             def _post_turn(client: _VikingClient) -> None:
+                self._ensure_team_session_policy(client, sid)
                 if batch_messages:
                     payload = {"messages": batch_messages}
                     if _sync_trace_enabled():
@@ -1647,7 +1691,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
                     user_content[:4000],
                     self._message_text(assistant_content)[:4000],
                     user_peer_id=user_peer_id,
-                    assistant_peer_id=self._assistant_peer_id(),
+                    assistant_peer_id=session_assistant_peer_id,
                 )
 
             try:
