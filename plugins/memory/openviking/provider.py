@@ -1852,6 +1852,12 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         resolved_peer_id = peer_id or self._agent or _DEFAULT_AGENT
         return f"viking://user/peers/{resolved_peer_id}/memories/{subdir}/mem_{slug}.md"
 
+    @staticmethod
+    def _build_root_memory_uri(subdir: str) -> str:
+        """Build a viking:// memory URI under the current user's root namespace."""
+        slug = uuid.uuid4().hex[:12]
+        return f"viking://user/memories/{subdir}/mem_{slug}.md"
+
     def _memory_write_peer_id(
         self,
         target: str,

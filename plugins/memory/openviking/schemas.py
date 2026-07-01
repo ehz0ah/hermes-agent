@@ -97,6 +97,16 @@ REMEMBER_SCHEMA = {
                 "enum": ["preference", "entity", "event", "case", "pattern"],
                 "description": "Memory category (default: auto-detected).",
             },
+            "owner": {
+                "type": "string",
+                "enum": ["human", "assistant", "global"],
+                "description": (
+                    "Who owns this memory in team mode. Use human for facts, "
+                    "preferences, and events about the active speaker; assistant "
+                    "for Hermes's own reusable procedures or commitments; global "
+                    "only for team/project facts shared by everyone. Defaults to human."
+                ),
+            },
         },
         "required": ["content"],
     },

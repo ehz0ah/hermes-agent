@@ -1476,7 +1476,45 @@ def test_team_peer_profile_replaces_existing_profile():
     assert posts[1][1]["mode"] == "replace"
 
 
-def test_viking_remember_team_mode_routes_cases_to_assistant_peer(monkeypatch):
+def test_viking_remember_team_mode_defaults_case_category_to_human_peer(monkeypatch):
+    posts = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key, *, account="", user="", agent=""):
+            self.agent = agent
+
+        def post(self, path, payload=None, **kwargs):
+            posts.append((self.agent, path, payload))
+            return {"result": {"written_bytes": 42}}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://ov"
+    provider._api_key = "key"
+    provider._account = "acct"
+    provider._user = "gateway_admin"
+    provider._agent = "hermes"
+    provider._identity_mode = "team"
+
+    context = MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice")
+
+    result = json.loads(provider.handle_tool_call(
+        "viking_remember",
+        {"content": "When asked for release notes, summarize commits first", "category": "case"},
+        context=context,
+    ))
+
+    peer_id = provider._peer_id_for_context(context)
+    assert result["status"] == "stored"
+    assert posts[0][2]["uri"] == f"viking://user/peers/{peer_id}/resources/profile.md"
+    assert posts[1][0] == ""
+    assert posts[1][2]["uri"].startswith(
+        f"viking://user/peers/{peer_id}/memories/cases/mem_"
+    )
+
+
+def test_viking_remember_team_mode_owner_assistant_routes_to_assistant_peer(monkeypatch):
     posts = []
 
     class StubClient:
@@ -1499,14 +1537,91 @@ def test_viking_remember_team_mode_routes_cases_to_assistant_peer(monkeypatch):
 
     result = json.loads(provider.handle_tool_call(
         "viking_remember",
-        {"content": "When asked for release notes, summarize commits first", "category": "case"},
+        {
+            "content": "When shell output is truncated, ask for the exact file path",
+            "category": "pattern",
+            "owner": "assistant",
+        },
         context=MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice"),
     ))
 
     assert result["status"] == "stored"
     assert len(posts) == 1
     assert posts[0][0] == ""
-    assert posts[0][2]["uri"].startswith("viking://user/peers/hermes/memories/cases/mem_")
+    assert posts[0][2]["uri"].startswith("viking://user/peers/hermes/memories/patterns/mem_")
+
+
+def test_viking_remember_team_mode_owner_global_routes_to_user_root(monkeypatch):
+    posts = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key, *, account="", user="", agent=""):
+            self.agent = agent
+
+        def post(self, path, payload=None, **kwargs):
+            posts.append((self.agent, path, payload))
+            return {"result": {"written_bytes": 42}}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://ov"
+    provider._api_key = "key"
+    provider._account = "acct"
+    provider._user = "gateway_admin"
+    provider._agent = "hermes"
+    provider._identity_mode = "team"
+
+    result = json.loads(provider.handle_tool_call(
+        "viking_remember",
+        {
+            "content": "The OpenViking gateway project uses Feishu for team testing",
+            "category": "entity",
+            "owner": "global",
+        },
+        context=MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice"),
+    ))
+
+    assert result["status"] == "stored"
+    assert len(posts) == 1
+    assert posts[0][0] == ""
+    assert posts[0][2]["uri"].startswith("viking://user/memories/entities/mem_")
+
+
+def test_viking_remember_solo_mode_ignores_owner_and_uses_agent_peer(monkeypatch):
+    posts = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key, *, account="", user="", agent=""):
+            self.agent = agent
+
+        def post(self, path, payload=None, **kwargs):
+            posts.append((self.agent, path, payload))
+            return {"result": {"written_bytes": 42}}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+    provider = OpenVikingMemoryProvider()
+    provider._client = StubClient("http://ov", "key", account="acct", user="gateway_admin", agent="hermes")
+    provider._endpoint = "http://ov"
+    provider._api_key = "key"
+    provider._account = "acct"
+    provider._user = "gateway_admin"
+    provider._agent = "hermes"
+    provider._identity_mode = "solo"
+
+    result = json.loads(provider.handle_tool_call(
+        "viking_remember",
+        {
+            "content": "Remember this in the configured solo agent namespace",
+            "category": "entity",
+            "owner": "global",
+        },
+        context=MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice"),
+    ))
+
+    assert result["status"] == "stored"
+    assert len(posts) == 1
+    assert posts[0][2]["uri"].startswith("viking://user/peers/hermes/memories/entities/mem_")
 
 
 def test_tool_add_resource_uploads_existing_local_file(tmp_path):

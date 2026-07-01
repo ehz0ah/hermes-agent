@@ -406,23 +406,35 @@ class OpenVikingToolMixin:
         category = args.get("category", "")
         subdir = _CATEGORY_SUBDIR_MAP.get(category, _DEFAULT_MEMORY_SUBDIR)
         try:
+            peer_id = ""
             if getattr(self, "_team_mode", lambda: False)():
-                if category in {"case", "pattern"}:
-                    peer_id = self._assistant_peer_id()
-                else:
+                owner = str(args.get("owner") or "human").strip().lower()
+                if owner == "human":
                     peer_id = self._peer_id_for_context(context)
+                    uri = self._build_memory_uri(subdir, peer_id=peer_id)
+                elif owner == "assistant":
+                    peer_id = self._assistant_peer_id()
+                    uri = self._build_memory_uri(subdir, peer_id=peer_id)
+                elif owner == "global":
+                    uri = self._build_root_memory_uri(subdir)
+                else:
+                    return tool_error("owner must be one of: human, assistant, global")
             else:
                 peer_id = self._assistant_peer_id()
+                uri = self._build_memory_uri(subdir, peer_id=peer_id)
         except ValueError as e:
             return tool_error(str(e))
-        uri = self._build_memory_uri(subdir, peer_id=peer_id)
 
         # Write directly via content/write API.
         # This creates the file, stores the content, and queues vector indexing
         # in a single call — no dependency on session commit / VLM extraction.
         try:
             client = self._tool_client(context)
-            if getattr(self, "_team_mode", lambda: False)() and peer_id != self._assistant_peer_id():
+            if (
+                getattr(self, "_team_mode", lambda: False)()
+                and peer_id
+                and peer_id != self._assistant_peer_id()
+            ):
                 self._write_peer_profile(client, context)
             result = client.post("/api/v1/content/write", {
                 "uri": uri,

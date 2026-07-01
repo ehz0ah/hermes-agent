@@ -85,11 +85,14 @@ canonical user-scoped form such as
 `viking://user/default/peers/${OPENVIKING_AGENT}/memories/...` in API-key mode.
 Explicit remembers do not depend on session commit extraction.
 
-In `team` mode, human preferences/entities/events/default memories are written
-under the active sender's peer. `case` and `pattern` memories are written under
-the Hermes peer because they describe assistant behavior rather than a human
-participant. Hermes also maintains a small `resources/profile.md` file for each
-observed human peer with readable display/mention metadata for attribution.
+In `team` mode, `viking_remember` uses the optional `owner` argument to choose
+the namespace: `human` writes under the active sender's peer, `assistant` writes
+under the Hermes peer, and `global` writes under `viking://user/memories/...`.
+When omitted, `owner` defaults to `human`; `category` only chooses the memory
+subdirectory such as `preferences`, `entities`, `events`, `cases`, or
+`patterns`. Hermes also maintains a small best-effort `resources/profile.md`
+file for each observed human peer with readable display/mention metadata for
+attribution.
 
 Hermes built-in `memory` tool additions are mirrored to OpenViking after the
 local memory operation succeeds:
