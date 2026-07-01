@@ -188,6 +188,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         self._identity_mode = _IDENTITY_MODE_SOLO
         self._profile_lock = threading.Lock()
         self._profiled_peers: Set[str] = set()
+        self._peer_profile_writes_disabled = False
         self._team_session_policy_lock = threading.Lock()
         self._team_session_policy_sids: Set[str] = set()
         self._session_id = ""
@@ -930,12 +931,34 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
             lines.append(f"- Last thread: {context.thread_id}")
         return "\n".join(lines).rstrip() + "\n"
 
+    @staticmethod
+    def _is_unsupported_peer_profile_write_error(error: Exception) -> bool:
+        if not isinstance(error, _OpenVikingHTTPError):
+            return False
+        message = str(error).lower()
+        return (
+            error.status_code == 400
+            and "write only supports memory" in message
+            and "/resources/profile.md" in message
+        )
+
+    def _disable_peer_profile_writes(self, error: Exception) -> None:
+        with self._profile_lock:
+            if self._peer_profile_writes_disabled:
+                return
+            self._peer_profile_writes_disabled = True
+        logger.warning(
+            "OpenViking peer profile resources are not supported by this server; "
+            "continuing without profile.md writes: %s",
+            error,
+        )
+
     def _write_peer_profile(self, client: _VikingClient, context: Optional[MemoryTurnContext]) -> None:
         if not self._team_mode() or context is None:
             return
         peer_id = self._peer_id_for_context(context)
         with self._profile_lock:
-            if peer_id in self._profiled_peers:
+            if self._peer_profile_writes_disabled or peer_id in self._profiled_peers:
                 return
         payload = {
             "uri": f"viking://user/peers/{peer_id}/resources/profile.md",
@@ -945,9 +968,24 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         try:
             client.post("/api/v1/content/write", payload)
         except _OpenVikingHTTPError as e:
-            if "ALREADY_EXISTS" not in str(e) and "already exists" not in str(e).lower():
-                raise
-            client.post("/api/v1/content/write", {**payload, "mode": "replace"})
+            if "ALREADY_EXISTS" in str(e) or "already exists" in str(e).lower():
+                try:
+                    client.post("/api/v1/content/write", {**payload, "mode": "replace"})
+                except Exception as replace_error:
+                    if self._is_unsupported_peer_profile_write_error(replace_error):
+                        self._disable_peer_profile_writes(replace_error)
+                    else:
+                        logger.debug("OpenViking peer profile replace skipped: %s", replace_error)
+                    return
+            elif self._is_unsupported_peer_profile_write_error(e):
+                self._disable_peer_profile_writes(e)
+                return
+            else:
+                logger.debug("OpenViking peer profile write skipped: %s", e)
+                return
+        except Exception as e:
+            logger.debug("OpenViking peer profile write skipped: %s", e)
+            return
         with self._profile_lock:
             self._profiled_peers.add(peer_id)
 

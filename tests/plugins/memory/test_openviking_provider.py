@@ -2792,6 +2792,111 @@ def test_sync_turn_team_mode_writes_human_peer_and_profile(monkeypatch):
     assert "peer_id" not in posts[2][2]["messages"][1]
 
 
+def test_sync_turn_team_mode_continues_when_peer_profile_resource_is_rejected(monkeypatch):
+    posts = []
+
+    class StubClient:
+        def __init__(self, endpoint, api_key, *, account="", user="", agent=""):
+            self.agent = agent
+
+        def post(self, path, payload=None, **kwargs):
+            posts.append((self.agent, path, payload))
+            if (
+                path == "/api/v1/content/write"
+                and isinstance(payload, dict)
+                and str(payload.get("uri", "")).endswith("/resources/profile.md")
+            ):
+                raise _OpenVikingHTTPError(
+                    "INVALID_ARGUMENT: write only supports memory files under user scope: "
+                    f"{payload['uri']}",
+                    status_code=400,
+                )
+            return {"result": {"written_bytes": 12}}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://ov"
+    provider._api_key = "key"
+    provider._account = "acct"
+    provider._user = "gateway_admin"
+    provider._agent = "hermes"
+    provider._session_id = "sid"
+    provider._identity_mode = "team"
+    provider._spawn_writer = lambda _sid, target, name: target()
+    context = MemoryTurnContext(
+        platform="feishu",
+        chat_id="oc_group",
+        chat_name="Alerts",
+        chat_type="group",
+        user_id="ou_alice",
+        user_id_alt="on_alice",
+        user_name="Alice",
+        user_handle='<at user_id="ou_alice">Alice</at>',
+        message_id="om_1",
+    )
+
+    provider.sync_turn(
+        "favorite snack is oreo",
+        "noted",
+        session_id="sid",
+        messages=[
+            {"role": "user", "content": "favorite snack is oreo"},
+            {"role": "assistant", "content": "noted"},
+        ],
+        context=context,
+    )
+
+    peer_id = provider._peer_id_for_context(context)
+    profile_posts = [post for post in posts if post[1] == "/api/v1/content/write"]
+    session_posts = [post for post in posts if post[1] == "/api/v1/sessions"]
+    batch_posts = [post for post in posts if post[1] == "/api/v1/sessions/sid/messages/batch"]
+    assert profile_posts == [
+        (
+            "",
+            "/api/v1/content/write",
+            {
+                "uri": f"viking://user/peers/{peer_id}/resources/profile.md",
+                "content": provider._peer_profile_content(context),
+                "mode": "create",
+            },
+        )
+    ]
+    assert session_posts == [
+        (
+            "",
+            "/api/v1/sessions",
+            {
+                "session_id": "sid",
+                "memory_policy": {
+                    "self": {"enabled": False},
+                    "peer": {"enabled": True},
+                    "memory_types": ["entities", "events", "preferences", "profile"],
+                },
+            },
+        )
+    ]
+    assert len(batch_posts) == 1
+    batch = batch_posts[0][2]["messages"]
+    assert batch[0]["parts"][0]["text"] == "favorite snack is oreo"
+    assert batch[0]["peer_id"] == peer_id
+    assert "peer_id" not in batch[1]
+    assert provider._peer_profile_writes_disabled is True
+
+    provider.sync_turn(
+        "favorite drink is tea",
+        "noted",
+        session_id="sid",
+        messages=[
+            {"role": "user", "content": "favorite drink is tea"},
+            {"role": "assistant", "content": "noted"},
+        ],
+        context=context,
+    )
+
+    assert [post for post in posts if post[1] == "/api/v1/content/write"] == profile_posts
+
+
 def test_sync_turn_team_mode_syncs_observed_rows_to_their_original_peer(monkeypatch):
     posts = []
 
