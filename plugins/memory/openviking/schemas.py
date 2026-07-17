@@ -99,12 +99,12 @@ REMEMBER_SCHEMA = {
             },
             "owner": {
                 "type": "string",
-                "enum": ["human", "assistant", "global"],
+                "enum": ["human", "self"],
                 "description": (
                     "Who owns this memory in team mode. Use human for facts, "
-                    "preferences, and events about the active speaker; assistant "
-                    "for Hermes's own reusable procedures or commitments; global "
-                    "only for team/project facts shared by everyone. Defaults to human."
+                    "preferences, and events about the active speaker; use self "
+                    "for Hermes's own reusable procedures or commitments. Defaults "
+                    "to human."
                 ),
             },
         },

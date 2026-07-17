@@ -1053,6 +1053,7 @@ class TestAdapterBehavior(unittest.TestCase):
                     "group_policy": "open",
                     "require_mention": True,
                     "observe_unmentioned_group_messages": True,
+                    "channel_prompts": {"oc_group": "Use the team channel policy."},
                 }
             )
         )
@@ -1128,6 +1129,7 @@ class TestAdapterBehavior(unittest.TestCase):
             build_session_key(event.session_source),
             build_session_key(observed_source),
         )
+        self.assertIn("Use the team channel policy.", event.channel_prompt)
         self.assertIn("observed Feishu/Lark group context", event.channel_prompt)
         self.assertIn("Alice", event.text)
         self.assertIn('<at user_id="ou_alice">Alice</at>', event.text)

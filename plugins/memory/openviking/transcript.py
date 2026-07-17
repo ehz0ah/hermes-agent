@@ -204,6 +204,7 @@ class OpenVikingTranscriptMixin:
 
         payload_messages: List[Dict[str, Any]] = []
         pending_tool_parts: List[Dict[str, Any]] = []
+        tool_origin_messages: Dict[str, Dict[str, Any]] = {}
 
         def payload_message(
             role: str,
@@ -252,7 +253,11 @@ class OpenVikingTranscriptMixin:
                     "tool_output": cls._message_text(message.get("content")),
                     "tool_status": cls._tool_result_status(message),
                 }
-                pending_tool_parts.append(tool_part)
+                origin_message = tool_origin_messages.get(tool_id)
+                if origin_message is not None:
+                    origin_message["parts"].append(tool_part)
+                else:
+                    pending_tool_parts.append(tool_part)
                 continue
 
             if role not in {"user", "assistant"}:
@@ -265,6 +270,7 @@ class OpenVikingTranscriptMixin:
                 parts.append({"type": "text", "text": text})
 
             if role == "assistant":
+                completed_calls: List[str] = []
                 if include_tool_messages:
                     for tool_call in message.get("tool_calls") or []:
                         if not isinstance(tool_call, dict):
@@ -274,6 +280,7 @@ class OpenVikingTranscriptMixin:
                         if tool_id in skipped_tool_ids or cls._is_openviking_recall_tool_name(tool_name):
                             continue
                         if tool_id in completed_tool_ids:
+                            completed_calls.append(tool_id)
                             continue
                         # Reuse the tool_input parsed in the pre-scan when available
                         # (non-empty ids are cached); fall back to parsing for the
@@ -292,8 +299,15 @@ class OpenVikingTranscriptMixin:
                             "tool_status": _TOOL_STATUS_PENDING,
                         })
 
+                if parts or completed_calls:
+                    payload = payload_message(role, parts, message)
+                    payload_messages.append(payload)
+                    for tool_id in completed_calls:
+                        tool_origin_messages[tool_id] = payload
+                continue
+
             if parts:
                 payload_messages.append(payload_message(role, parts, message))
 
         flush_tool_parts()
-        return payload_messages
+        return [message for message in payload_messages if message["parts"]]

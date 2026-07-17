@@ -1514,7 +1514,7 @@ def test_viking_remember_team_mode_defaults_case_category_to_human_peer(monkeypa
     )
 
 
-def test_viking_remember_team_mode_owner_assistant_routes_to_assistant_peer(monkeypatch):
+def test_viking_remember_team_mode_owner_self_routes_to_user_root(monkeypatch):
     posts = []
 
     class StubClient:
@@ -1540,7 +1540,7 @@ def test_viking_remember_team_mode_owner_assistant_routes_to_assistant_peer(monk
         {
             "content": "When shell output is truncated, ask for the exact file path",
             "category": "pattern",
-            "owner": "assistant",
+            "owner": "self",
         },
         context=MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice"),
     ))
@@ -1548,10 +1548,10 @@ def test_viking_remember_team_mode_owner_assistant_routes_to_assistant_peer(monk
     assert result["status"] == "stored"
     assert len(posts) == 1
     assert posts[0][0] == ""
-    assert posts[0][2]["uri"].startswith("viking://user/peers/hermes/memories/patterns/mem_")
+    assert posts[0][2]["uri"].startswith("viking://user/memories/patterns/mem_")
 
 
-def test_viking_remember_team_mode_owner_global_routes_to_user_root(monkeypatch):
+def test_viking_remember_team_mode_rejects_removed_global_owner(monkeypatch):
     posts = []
 
     class StubClient:
@@ -1572,7 +1572,7 @@ def test_viking_remember_team_mode_owner_global_routes_to_user_root(monkeypatch)
     provider._agent = "hermes"
     provider._identity_mode = "team"
 
-    result = json.loads(provider.handle_tool_call(
+    result = provider.handle_tool_call(
         "viking_remember",
         {
             "content": "The OpenViking gateway project uses Feishu for team testing",
@@ -1580,12 +1580,10 @@ def test_viking_remember_team_mode_owner_global_routes_to_user_root(monkeypatch)
             "owner": "global",
         },
         context=MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice"),
-    ))
+    )
 
-    assert result["status"] == "stored"
-    assert len(posts) == 1
-    assert posts[0][0] == ""
-    assert posts[0][2]["uri"].startswith("viking://user/memories/entities/mem_")
+    assert "owner must be one of: human, self" in result
+    assert posts == []
 
 
 def test_viking_remember_solo_mode_ignores_owner_and_uses_agent_peer(monkeypatch):
@@ -1614,7 +1612,7 @@ def test_viking_remember_solo_mode_ignores_owner_and_uses_agent_peer(monkeypatch
         {
             "content": "Remember this in the configured solo agent namespace",
             "category": "entity",
-            "owner": "global",
+            "owner": "self",
         },
         context=MemoryTurnContext(platform="feishu", chat_id="oc_group", user_id="ou_alice"),
     ))
@@ -2827,13 +2825,37 @@ def test_transcript_batch_can_leave_assistant_unattributed_and_drop_tools():
     ]
 
 
-def test_team_session_memory_policy_excludes_agent_self_templates():
+def test_text_fallback_can_explicitly_leave_assistant_unattributed():
+    provider = OpenVikingMemoryProvider()
+    provider._agent = "hermes"
+
+    payload = provider._turn_batch_payload(
+        "favorite snack is oreo",
+        "noted",
+        user_peer_id="feishu_user_alice",
+        assistant_peer_id="",
+    )
+
+    assert payload["messages"] == [
+        {
+            "role": "user",
+            "parts": [{"type": "text", "text": "favorite snack is oreo"}],
+            "peer_id": "feishu_user_alice",
+        },
+        {
+            "role": "assistant",
+            "parts": [{"type": "text", "text": "noted"}],
+        },
+    ]
+
+
+def test_team_session_memory_policy_enables_all_server_memory_types():
     policy = OpenVikingMemoryProvider._team_session_memory_policy()
 
-    assert policy["self"] == {"enabled": False}
-    assert policy["peer"] == {"enabled": True}
-    memory_types = policy["memory_types"]
-    assert set(memory_types) == {"entities", "events", "preferences", "profile"}
+    assert policy == {
+        "self": {"enabled": True},
+        "peer": {"enabled": True},
+    }
 
 
 def test_sync_turn_team_mode_writes_human_peer_and_profile(monkeypatch):
@@ -2896,9 +2918,8 @@ def test_sync_turn_team_mode_writes_human_peer_and_profile(monkeypatch):
     assert posts[1][2] == {
         "session_id": "sid",
         "memory_policy": {
-            "self": {"enabled": False},
+            "self": {"enabled": True},
             "peer": {"enabled": True},
-            "memory_types": ["entities", "events", "preferences", "profile"],
         },
     }
     assert posts[2][0] == ""
@@ -2984,9 +3005,8 @@ def test_sync_turn_team_mode_continues_when_peer_profile_resource_is_rejected(mo
             {
                 "session_id": "sid",
                 "memory_policy": {
-                    "self": {"enabled": False},
+                    "self": {"enabled": True},
                     "peer": {"enabled": True},
-                    "memory_types": ["entities", "events", "preferences", "profile"],
                 },
             },
         )
@@ -3090,9 +3110,8 @@ def test_sync_turn_team_mode_syncs_observed_rows_to_their_original_peer(monkeypa
             {
                 "session_id": "sid",
                 "memory_policy": {
-                    "self": {"enabled": False},
+                    "self": {"enabled": True},
                     "peer": {"enabled": True},
-                    "memory_types": ["entities", "events", "preferences", "profile"],
                 },
             },
         )
@@ -3106,7 +3125,7 @@ def test_sync_turn_team_mode_syncs_observed_rows_to_their_original_peer(monkeypa
     assert "peer_id" not in batch[2]
 
 
-def test_sync_turn_team_mode_drops_internal_tool_outputs(monkeypatch):
+def test_sync_turn_team_mode_preserves_agent_tool_trace_without_peer(monkeypatch):
     posts = []
 
     class StubClient:
@@ -3160,12 +3179,58 @@ def test_sync_turn_team_mode_drops_internal_tool_outputs(monkeypatch):
     batch_posts = [post for post in posts if post[1] == "/api/v1/sessions/sid/messages/batch"]
     assert len(batch_posts) == 1
     batch = batch_posts[0][2]["messages"]
-    assert [message["role"] for message in batch] == ["user", "assistant", "assistant"]
-    assert all(
-        not any(part.get("type") == "tool" for part in message.get("parts", []))
-        for message in batch
+    assert [message["role"] for message in batch] == [
+        "user",
+        "assistant",
+        "assistant",
+    ]
+    assert batch[1]["parts"] == [
+        {"type": "text", "text": "Checking."},
+        {
+            "type": "tool",
+            "tool_id": "call-1",
+            "tool_name": "terminal",
+            "tool_input": {"cmd": "pwd"},
+            "tool_output": "SECRET",
+            "tool_status": "completed",
+        }
+    ]
+    assert "peer_id" not in batch[1]
+    assert "peer_id" not in batch[2]
+
+
+def test_transcript_batch_attaches_completed_tool_to_empty_assistant_message():
+    batch = OpenVikingMemoryProvider._messages_to_openviking_batch(
+        [
+            {"role": "user", "content": "check the directory"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {"name": "terminal", "arguments": json.dumps({"cmd": "pwd"})},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "name": "terminal", "content": "/tmp"},
+            {"role": "assistant", "content": "The directory is /tmp."},
+        ],
+        user_peer_id="feishu_user_alice",
+        assistant_peer_id="",
     )
-    assert "SECRET" not in json.dumps(batch)
+
+    assert [message["role"] for message in batch] == ["user", "assistant", "assistant"]
+    assert batch[1]["parts"] == [
+        {
+            "type": "tool",
+            "tool_id": "call-1",
+            "tool_name": "terminal",
+            "tool_input": {"cmd": "pwd"},
+            "tool_output": "/tmp",
+            "tool_status": "completed",
+        }
+    ]
 
 
 def test_sync_turn_solo_mode_drops_observed_rows_before_posting(monkeypatch):
@@ -3524,10 +3589,10 @@ def test_sync_turn_structured_messages_include_assistant_peer_id():
         {
             "messages": [
                 {"role": "user", "parts": [{"type": "text", "text": "u"}]},
-                {"role": "assistant", "parts": [{"type": "text", "text": "Looking."}], "peer_id": "hermes"},
                 {
                     "role": "assistant",
                     "parts": [
+                        {"type": "text", "text": "Looking."},
                         {
                             "type": "tool",
                             "tool_id": "call-1",
@@ -4013,7 +4078,7 @@ def test_on_memory_write_team_mode_routes_user_target_to_human_peer(monkeypatch)
     assert posts[1][2]["content"] == "remember this"
 
 
-def test_on_memory_write_team_mode_routes_memory_target_to_assistant_peer(monkeypatch):
+def test_on_memory_write_team_mode_routes_memory_target_to_user_root(monkeypatch):
     import threading
 
     posts = []
@@ -4050,7 +4115,7 @@ def test_on_memory_write_team_mode_routes_memory_target_to_assistant_peer(monkey
 
     assert len(posts) == 1
     assert posts[0][0] == ""
-    assert posts[0][2]["uri"].startswith("viking://user/peers/hermes/memories/patterns/mem_")
+    assert posts[0][2]["uri"].startswith("viking://user/memories/patterns/mem_")
     assert posts[0][2]["content"] == "assistant should keep replies concise"
 
 

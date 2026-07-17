@@ -4158,6 +4158,86 @@ class SessionDB:
             result.append(msg)
         return result
 
+    def get_recent_gateway_dialogue(
+        self,
+        *,
+        exclude_session_id: str,
+        profile_name: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Return recent active dialogue from other gateway sessions.
+
+        This is a bounded, read-only view for turn-local context. It excludes
+        CLI sessions, the current session, inactive/rewound rows, and
+        tool/system traffic. Results are returned oldest-first so callers can
+        present them as a coherent chronological excerpt.
+        """
+        try:
+            bounded_limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            bounded_limit = 50
+
+        clauses = [
+            "s.session_key IS NOT NULL",
+            "m.session_id != ?",
+            "m.active = 1",
+            "m.role IN ('user', 'assistant')",
+            "m.content IS NOT NULL",
+            "TRIM(m.content) != ''",
+        ]
+        params: List[Any] = [exclude_session_id or ""]
+        normalized_profile = str(profile_name or "").strip()
+        if normalized_profile:
+            clauses.append("s.profile_name = ?")
+            params.append(normalized_profile)
+        else:
+            # A non-multiplexed gateway may persist NULL or "default". Do not
+            # leak rows from named profiles if this DB also serves a
+            # multiplexed gateway.
+            clauses.append(
+                "(s.profile_name IS NULL OR s.profile_name = '' OR s.profile_name = 'default')"
+            )
+        params.append(bounded_limit)
+
+        sql = f"""
+            SELECT
+                m.id,
+                m.session_id,
+                m.role,
+                m.content,
+                m.timestamp,
+                m.observed,
+                m.memory_source,
+                s.source AS platform,
+                s.chat_type,
+                s.thread_id,
+                s.display_name AS chat_name,
+                s.origin_json
+            FROM messages AS m
+            JOIN sessions AS s ON s.id = m.session_id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY m.id DESC
+            LIMIT ?
+        """
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+
+        result: List[Dict[str, Any]] = []
+        for row in reversed(rows):
+            item = dict(row)
+            item["content"] = self._decode_content(item.get("content"))
+            for field in ("memory_source", "origin_json"):
+                raw = item.get(field)
+                if not raw:
+                    item[field] = None
+                    continue
+                try:
+                    item[field] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    item[field] = None
+            result.append(item)
+        return result
+
     def get_messages_around(
         self,
         session_id: str,

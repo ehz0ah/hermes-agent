@@ -65,6 +65,24 @@ OpenViking to commit/extract that session without ending the Hermes session.
 The default leaves no recent messages unarchived so short quiet gateway
 conversations become searchable promptly.
 
+Team mode also provides an immediate, prompt-only bridge across Hermes gateway
+sessions. Before an addressed turn, Hermes reads up to 50 recent user/assistant
+messages from other chats, DMs, or threads in the same profile and includes the
+newest excerpt that fits a 10,000-token budget. The excerpt carries readable
+platform, chat, thread, sender, and timestamp provenance. It is not persisted,
+added to the agent cache key, or synchronized to OpenViking.
+
+The bridge is enabled by default only for OpenViking Team mode. Operators can
+override it in `config.yaml`:
+
+```yaml
+gateway:
+  cross_session_context:
+    enabled: true
+    max_messages: 50
+    max_tokens: 10000
+```
+
 ## Tools
 
 | Tool | Description |
@@ -86,13 +104,13 @@ canonical user-scoped form such as
 Explicit remembers do not depend on session commit extraction.
 
 In `team` mode, `viking_remember` uses the optional `owner` argument to choose
-the namespace: `human` writes under the active sender's peer, `assistant` writes
-under the Hermes peer, and `global` writes under `viking://user/memories/...`.
-When omitted, `owner` defaults to `human`; `category` only chooses the memory
-subdirectory such as `preferences`, `entities`, `events`, `cases`, or
-`patterns`. Hermes also maintains a small best-effort `resources/profile.md`
-file for each observed human peer with readable display/mention metadata for
-attribution.
+the namespace: `human` writes under the active sender's peer, while `self`
+writes under `viking://user/memories/...` for Hermes's own reusable procedures
+or commitments. When omitted, `owner` defaults to `human`; `category` only
+chooses the memory subdirectory such as `preferences`, `entities`, `events`,
+`cases`, or `patterns`. Hermes also maintains a small best-effort
+`resources/profile.md` file for each observed human peer with readable
+display/mention metadata for attribution.
 
 Hermes built-in `memory` tool additions are mirrored to OpenViking after the
 local memory operation succeeds:

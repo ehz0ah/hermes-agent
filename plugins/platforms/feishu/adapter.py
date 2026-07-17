@@ -3473,7 +3473,7 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         memory_source = None
         session_source = None
-        channel_prompt = None
+        channel_prompt = self._resolve_channel_prompt(chat_id, thread_id or None)
         if (
             self._observe_unmentioned_group_messages_enabled()
             and source.chat_type != "dm"
@@ -3481,7 +3481,10 @@ class FeishuAdapter(BasePlatformAdapter):
             memory_source = source
             text = self._feishu_group_observe_attributed_text(text, memory_source)
             session_source = self._feishu_group_observe_shared_source(source)
-            channel_prompt = self._feishu_group_observe_channel_prompt()
+            observe_prompt = self._feishu_group_observe_channel_prompt()
+            channel_prompt = "\n\n".join(
+                prompt for prompt in (channel_prompt, observe_prompt) if prompt
+            )
         normalized = MessageEvent(
             text=text,
             message_type=inbound_type,
@@ -3494,7 +3497,6 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
-            channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
             timestamp=datetime.now(),
             channel_prompt=channel_prompt,
         )

@@ -1222,6 +1222,64 @@ class TestMessageStorage:
         assert conv[1]["content"] == "Hi!"
         assert isinstance(conv[1]["timestamp"], float)
 
+    def test_get_recent_gateway_dialogue_is_profile_local_and_bounded(self, db):
+        db.create_session(
+            session_id="current",
+            source="feishu",
+            session_key="feishu:current",
+            profile_name="work",
+        )
+        db.create_session(
+            session_id="other",
+            source="feishu",
+            session_key="feishu:other",
+            chat_type="group",
+            thread_id="thread-1",
+            profile_name="work",
+        )
+        db.record_gateway_session_peer(
+            "other",
+            source="feishu",
+            session_key="feishu:other",
+            chat_id="chat-1",
+            chat_type="group",
+            thread_id="thread-1",
+            display_name="Football",
+            origin_json=json.dumps({"user_name": "Alice"}),
+        )
+        db.create_session(
+            session_id="other-profile",
+            source="feishu",
+            session_key="feishu:private",
+            profile_name="private",
+        )
+        db.create_session(session_id="cli", source="cli", profile_name="work")
+
+        db.append_message("current", role="user", content="current turn")
+        db.append_message(
+            "other",
+            role="user",
+            content="first",
+            memory_source={"user_name": "Alice"},
+            timestamp=100.0,
+        )
+        db.append_message("other", role="tool", content="tool output", timestamp=101.0)
+        db.append_message("other", role="assistant", content="second", timestamp=102.0)
+        db.append_message("other-profile", role="user", content="private row")
+        db.append_message("cli", role="user", content="cli row")
+
+        recent = db.get_recent_gateway_dialogue(
+            exclude_session_id="current",
+            profile_name="work",
+            limit=2,
+        )
+
+        assert [message["content"] for message in recent] == ["first", "second"]
+        assert recent[0]["memory_source"] == {"user_name": "Alice"}
+        assert recent[0]["origin_json"] == {"user_name": "Alice"}
+        assert recent[0]["chat_name"] == "Football"
+        assert recent[0]["thread_id"] == "thread-1"
+
     def test_get_messages_as_conversation_orders_by_id_not_timestamp(self, db):
         """Replay must follow AUTOINCREMENT id (insertion order), never the
         wall-clock timestamp.

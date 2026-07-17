@@ -79,12 +79,6 @@ _IDENTITY_MODE_SOLO = "solo"
 _IDENTITY_MODE_TEAM = "team"
 _IDENTITY_MODES = {_IDENTITY_MODE_SOLO, _IDENTITY_MODE_TEAM}
 _IDLE_COMMIT_DRAIN_RETRY_LIMIT = 2
-_TEAM_SESSION_MEMORY_TYPES = (
-    "entities",
-    "events",
-    "preferences",
-    "profile",
-)
 
 
 def _facade_attr(name: str, default: Any) -> Any:
@@ -853,10 +847,12 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
 
     @staticmethod
     def _team_session_memory_policy() -> Dict[str, Any]:
+        # Let the connected OpenViking server select every enabled memory type.
+        # Its registry evolves independently, so a Hermes-side whitelist would
+        # reject newer/older servers when type names change.
         return {
-            "self": {"enabled": False},
+            "self": {"enabled": True},
             "peer": {"enabled": True},
-            "memory_types": list(_TEAM_SESSION_MEMORY_TYPES),
         }
 
     def _ensure_team_session_policy(self, client: _VikingClient, sid: str) -> None:
@@ -1019,7 +1015,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         assistant_content: str,
         *,
         user_peer_id: str = "",
-        assistant_peer_id: str = "",
+        assistant_peer_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         user_message: Dict[str, Any] = {
             "role": "user",
@@ -1031,7 +1027,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         }
         if user_peer_id:
             user_message["peer_id"] = user_peer_id
-        resolved_assistant_peer_id = assistant_peer_id or self._agent
+        resolved_assistant_peer_id = self._agent if assistant_peer_id is None else assistant_peer_id
         if resolved_assistant_peer_id:
             assistant_message["peer_id"] = resolved_assistant_peer_id
         return {
@@ -1049,7 +1045,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         assistant_content: str,
         *,
         user_peer_id: str = "",
-        assistant_peer_id: str = "",
+        assistant_peer_id: Optional[str] = None,
     ) -> None:
         client.post(
             f"/api/v1/sessions/{sid}/messages/batch",
@@ -1672,7 +1668,7 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
             turn_messages,
             user_peer_id=user_peer_id,
             assistant_peer_id=session_assistant_peer_id,
-            include_tool_messages=not self._team_mode(),
+            include_tool_messages=True,
         )
 
         if _sync_trace_enabled():
@@ -1862,11 +1858,11 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         self,
         target: str,
         context: Optional[MemoryTurnContext],
-    ) -> str:
+    ) -> Optional[str]:
         if not self._team_mode():
             return self._assistant_peer_id()
         if target == "memory":
-            return self._assistant_peer_id()
+            return None
         return self._peer_id_for_context(context)
 
     def on_memory_write(
@@ -1887,12 +1883,16 @@ class OpenVikingMemoryProvider(OpenVikingToolMixin, OpenVikingTranscriptMixin, M
         except ValueError as e:
             logger.warning("%s", e)
             return
-        uri = self._build_memory_uri(subdir, peer_id=peer_id)
+        uri = (
+            self._build_root_memory_uri(subdir)
+            if peer_id is None
+            else self._build_memory_uri(subdir, peer_id=peer_id)
+        )
 
         def _write():
             try:
                 client = self._client_for_context(context)
-                if self._team_mode() and peer_id != self._assistant_peer_id():
+                if self._team_mode() and peer_id:
                     self._write_peer_profile(client, context)
                 client.post("/api/v1/content/write", {
                     "uri": uri,

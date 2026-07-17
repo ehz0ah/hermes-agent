@@ -2494,6 +2494,29 @@ class SessionStore:
             logger.debug("Could not load messages from DB: %s", e)
             return []
 
+    def load_recent_gateway_dialogue(
+        self,
+        *,
+        exclude_session_id: str,
+        profile_name: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Load a bounded profile-local excerpt from other gateway sessions."""
+        if not self._db:
+            return []
+        loader = getattr(self._db, "get_recent_gateway_dialogue", None)
+        if not callable(loader):
+            return []
+        try:
+            return loader(
+                exclude_session_id=exclude_session_id,
+                profile_name=profile_name,
+                limit=limit,
+            )
+        except Exception as exc:
+            logger.debug("Could not load recent gateway dialogue: %s", exc)
+            return []
+
     def rewind_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
         """Back up ``n`` user turns via soft-delete, keeping rows for audit.
 

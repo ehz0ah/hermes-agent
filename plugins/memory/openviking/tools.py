@@ -412,13 +412,10 @@ class OpenVikingToolMixin:
                 if owner == "human":
                     peer_id = self._peer_id_for_context(context)
                     uri = self._build_memory_uri(subdir, peer_id=peer_id)
-                elif owner == "assistant":
-                    peer_id = self._assistant_peer_id()
-                    uri = self._build_memory_uri(subdir, peer_id=peer_id)
-                elif owner == "global":
+                elif owner == "self":
                     uri = self._build_root_memory_uri(subdir)
                 else:
-                    return tool_error("owner must be one of: human, assistant, global")
+                    return tool_error("owner must be one of: human, self")
             else:
                 peer_id = self._assistant_peer_id()
                 uri = self._build_memory_uri(subdir, peer_id=peer_id)
@@ -433,7 +430,6 @@ class OpenVikingToolMixin:
             if (
                 getattr(self, "_team_mode", lambda: False)()
                 and peer_id
-                and peer_id != self._assistant_peer_id()
             ):
                 self._write_peer_profile(client, context)
             result = client.post("/api/v1/content/write", {
