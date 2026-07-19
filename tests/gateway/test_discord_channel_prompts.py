@@ -340,7 +340,7 @@ async def test_run_agent_loads_cross_session_context_for_current_session(
         limit=50,
     )
     assert _CapturingAgent.last_run_ephemeral is not None
-    assert "Recent context from other Hermes conversations" in _CapturingAgent.last_run_ephemeral
+    assert "Recent messages from other Hermes conversations" in _CapturingAgent.last_run_ephemeral
     assert "The launch is on Friday." in _CapturingAgent.last_run_ephemeral
 
 
@@ -409,9 +409,10 @@ async def test_run_agent_promotes_observed_feishu_context_to_ephemeral_prompt(mo
         "Global prompt"
     )
     assert _CapturingAgent.last_run_ephemeral is not None
-    assert "Observed Feishu/Lark group context" in _CapturingAgent.last_run_ephemeral
+    assert "Recent messages from this Feishu/Lark chat or thread" in _CapturingAgent.last_run_ephemeral
     assert "I am too tired to watch the morning match portugal vs columbia" in _CapturingAgent.last_run_ephemeral
-    assert "First answer from this block when it contains the answer" in _CapturingAgent.last_run_ephemeral
+    assert "Use relevant messages as conversational evidence" in _CapturingAgent.last_run_ephemeral
+    assert "Ask for clarification only when multiple interpretations remain genuinely plausible" in _CapturingAgent.last_run_ephemeral
     assert _CapturingAgent.last_run_user_message == (
         "[Hao | mention=<at user_id=\"ou_a\">Hao</at>]\nwhat am i too tired for"
     )

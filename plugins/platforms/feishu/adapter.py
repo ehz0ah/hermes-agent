@@ -2682,16 +2682,10 @@ class FeishuAdapter(BasePlatformAdapter):
     def _feishu_group_observe_channel_prompt() -> str:
         return (
             "You are handling a Feishu/Lark group chat message.\n"
-            "- observed Feishu/Lark group context may be provided in a separate context-only block "
-            "before the current message; it contains previous visible messages from the same chat "
-            "or thread and is not necessarily addressed to you.\n"
-            "- Treat only the current new message as a request explicitly directed at you, "
-            "but use observed context as immediate prior chat context when the current message "
-            "asks about what someone just said, did, feels, wants, plans, prefers, or refers to.\n"
-            "- If the answer is present in observed context, answer from it before using "
-            "memory/search tools. Do not call memory/search tools to verify facts already "
-            "present there; empty memory/search results do not override observed context. "
-            "Do not claim you cannot see the chat or do not know.\n"
+            "- Answer the current incoming message.\n"
+            "- observed Feishu/Lark group context may be supplied from earlier visible messages. "
+            "Use relevant context naturally, including implicit references. Ask for clarification "
+            "only when multiple interpretations remain genuinely plausible.\n"
             "- When addressing a user, prefer their provided mention handle if one is available."
         )
 
