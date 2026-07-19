@@ -19378,7 +19378,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cross_session_context = None
             if _cross_context_enabled:
                 recent_dialogue = self.session_store.load_recent_gateway_dialogue(
-                    exclude_session_id=session_entry.session_id,
+                    exclude_session_id=session_id,
                     profile_name=getattr(source, "profile", None),
                     limit=_cross_context_messages,
                 )

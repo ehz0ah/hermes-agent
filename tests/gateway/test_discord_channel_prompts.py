@@ -264,6 +264,87 @@ async def test_run_agent_appends_channel_prompt_to_ephemeral_system_prompt(monke
 
 
 @pytest.mark.asyncio
+async def test_run_agent_loads_cross_session_context_for_current_session(
+    monkeypatch, tmp_path
+):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    runner.session_store.load_recent_gateway_dialogue = MagicMock(
+        return_value=[
+            {
+                "role": "user",
+                "content": "The launch is on Friday.",
+                "timestamp": 1_750_000_000,
+                "platform": "feishu",
+                "chat_type": "dm",
+                "memory_source": {"user_name": "Alice"},
+            }
+        ]
+    )
+
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  system_prompt: Global prompt\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "memory": {
+                "provider": "openviking",
+                "openviking": {"identity_mode": "team"},
+            }
+        },
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(
+        tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"}
+    )
+
+    _CapturingAgent.last_run_ephemeral = None
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_dm",
+        chat_type="dm",
+        user_id="ou_alice",
+        user_name="Alice",
+    )
+    result = await runner._run_agent(
+        message="When is the launch?",
+        context_prompt=None,
+        history=[],
+        source=source,
+        session_id="current-session",
+        session_key="agent:main:feishu:dm:oc_dm",
+    )
+
+    assert result["final_response"] == "ok"
+    runner.session_store.load_recent_gateway_dialogue.assert_called_once_with(
+        exclude_session_id="current-session",
+        profile_name=None,
+        limit=50,
+    )
+    assert _CapturingAgent.last_run_ephemeral is not None
+    assert "Recent context from other Hermes conversations" in _CapturingAgent.last_run_ephemeral
+    assert "The launch is on Friday." in _CapturingAgent.last_run_ephemeral
+
+
+@pytest.mark.asyncio
 async def test_run_agent_promotes_observed_feishu_context_to_ephemeral_prompt(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
