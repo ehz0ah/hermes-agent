@@ -162,6 +162,11 @@ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
+_OUTBOUND_AT_TAG_RE = re.compile(
+    r'<at\s+user_id=(?P<quote>["\'])(?P<user_id>[A-Za-z0-9_-]+)(?P=quote)\s*>'
+    r"(?P<user_name>.*?)</at>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
 # ---------------------------------------------------------------------------
@@ -565,6 +570,7 @@ def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
 
 def _build_markdown_post_payload(content: str) -> str:
     rows = _build_markdown_post_rows(content)
+    rows = _render_outbound_mentions_in_post(rows)
     return json.dumps(
         {
             "zh_cn": {
@@ -622,6 +628,46 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
 
     _flush_current()
     return rows or [[{"tag": "md", "text": content}]]
+
+
+def _render_outbound_mentions_in_post(
+    rows: List[List[Dict[str, str]]],
+) -> List[List[Dict[str, str]]]:
+    """Convert exact Feishu mention handles in prose into native post elements.
+
+    Feishu text messages accept ``<at user_id=...>`` directly, but rich-text
+    posts require an ``at`` element. Fenced code rows stay untouched so sample
+    tags never notify real users.
+    """
+    rendered_rows: List[List[Dict[str, str]]] = []
+    for row in rows:
+        rendered_row: List[Dict[str, str]] = []
+        for element in row:
+            text = str(element.get("text") or "")
+            if element.get("tag") != "md" or "```" in text:
+                rendered_row.append(element)
+                continue
+
+            cursor = 0
+            for match in _OUTBOUND_AT_TAG_RE.finditer(text):
+                if match.start() > cursor:
+                    rendered_row.append({"tag": "md", "text": text[cursor:match.start()]})
+                user_id = match.group("user_id")
+                user_name = match.group("user_name").strip() or user_id
+                rendered_row.append(
+                    {
+                        "tag": "at",
+                        "user_id": user_id,
+                        "user_name": user_name,
+                    }
+                )
+                cursor = match.end()
+            if cursor < len(text):
+                rendered_row.append({"tag": "md", "text": text[cursor:]})
+            elif cursor == 0:
+                rendered_row.append(element)
+        rendered_rows.append(rendered_row or row)
+    return rendered_rows
 
 
 def parse_feishu_post_payload(
@@ -2685,9 +2731,23 @@ class FeishuAdapter(BasePlatformAdapter):
             "- Answer the current incoming message.\n"
             "- observed Feishu/Lark group context may be supplied from earlier visible messages. "
             "Use relevant context naturally, including implicit references. Ask for clarification "
-            "only when multiple interpretations remain genuinely plausible.\n"
-            "- When addressing a user, prefer their provided mention handle if one is available."
+            "only when multiple interpretations remain genuinely plausible."
         )
+
+    @staticmethod
+    def _feishu_platform_channel_prompt(source) -> str:
+        """Return Feishu-specific reply guidance for the current sender."""
+        prompt = (
+            "You are replying through Feishu/Lark. A plain @DisplayName is only text and does "
+            "not notify a user."
+        )
+        mention_handle = str(getattr(source, "user_handle", None) or "").strip()
+        if mention_handle:
+            prompt += (
+                " When you intend to notify or tag the current sender, copy this verified mention "
+                f"handle exactly, including its markup: {mention_handle}"
+            )
+        return prompt
 
     def _on_p2p_chat_entered(self, data: Any) -> None:
         logger.debug("[Feishu] User entered P2P chat with bot")
@@ -3468,6 +3528,10 @@ class FeishuAdapter(BasePlatformAdapter):
         memory_source = None
         session_source = None
         channel_prompt = self._resolve_channel_prompt(chat_id, thread_id or None)
+        platform_prompt = self._feishu_platform_channel_prompt(source)
+        channel_prompt = "\n\n".join(
+            prompt for prompt in (channel_prompt, platform_prompt) if prompt
+        )
         if (
             self._observe_unmentioned_group_messages_enabled()
             and source.chat_type != "dm"

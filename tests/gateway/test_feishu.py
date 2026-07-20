@@ -1131,9 +1131,64 @@ class TestAdapterBehavior(unittest.TestCase):
         )
         self.assertIn("Use the team channel policy.", event.channel_prompt)
         self.assertIn("observed Feishu/Lark group context", event.channel_prompt)
+        self.assertIn("A plain @DisplayName is only text", event.channel_prompt)
+        self.assertIn('<at user_id="ou_alice">Alice</at>', event.channel_prompt)
         self.assertIn("Alice", event.text)
         self.assertIn('<at user_id="ou_alice">Alice</at>', event.text)
         self.assertIn("what is my favorite snack", event.text)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_dm_message_includes_verified_outbound_mention_guidance(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_dm", "name": "Alice", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={
+                "user_id": "u_alice",
+                "user_name": "Alice",
+                "user_id_alt": "on_alice",
+                "user_handle": '<at user_id="ou_alice">Alice</at>',
+            }
+        )
+        message = SimpleNamespace(
+            message_id="om_dm",
+            chat_type="p2p",
+            chat_id="oc_dm",
+            message_type="text",
+            content='{"text":"please tag me in your answer"}',
+            mentions=[],
+            thread_id=None,
+            root_id=None,
+            parent_id=None,
+            upper_message_id=None,
+        )
+        sender_id = SimpleNamespace(open_id="ou_alice", user_id="u_alice", union_id="on_alice")
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(),
+                message=message,
+                sender_id=sender_id,
+                chat_type="p2p",
+                message_id="om_dm",
+                is_bot=False,
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.chat_type, "dm")
+        self.assertIn("A plain @DisplayName is only text", event.channel_prompt)
+        self.assertIn(
+            'copy this verified mention handle exactly, including its markup: '
+            '<at user_id="ou_alice">Alice</at>',
+            event.channel_prompt,
+        )
+        self.assertNotIn("observed Feishu/Lark group context", event.channel_prompt)
 
     @patch.dict(
         os.environ,
@@ -2992,6 +3047,93 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_build_post_payload_renders_exact_mentions_as_native_elements(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        payload = json.loads(
+            adapter._build_post_payload(
+                '**Heads up:** <at user_id="ou_alice">Alice</at> and '
+                '<at user_id="ou_bob">Bob</at>, deployment is complete.'
+            )
+        )
+
+        self.assertEqual(
+            payload["zh_cn"]["content"],
+            [[
+                {"tag": "md", "text": "**Heads up:** "},
+                {"tag": "at", "user_id": "ou_alice", "user_name": "Alice"},
+                {"tag": "md", "text": " and "},
+                {"tag": "at", "user_id": "ou_bob", "user_name": "Bob"},
+                {"tag": "md", "text": ", deployment is complete."},
+            ]],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_post_payload_does_not_render_mentions_inside_code_blocks(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        payload = json.loads(
+            adapter._build_post_payload(
+                'Example:\n```xml\n<at user_id="ou_alice">Alice</at>\n```\n'
+                '**Notify:** <at user_id="ou_alice">Alice</at>'
+            )
+        )
+
+        self.assertEqual(
+            payload["zh_cn"]["content"],
+            [
+                [{"tag": "md", "text": "Example:"}],
+                [{"tag": "md", "text": '```xml\n<at user_id="ou_alice">Alice</at>\n```'}],
+                [
+                    {"tag": "md", "text": "**Notify:** "},
+                    {"tag": "at", "user_id": "ou_alice", "user_name": "Alice"},
+                ],
+            ],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_text_preserves_exact_mention_handle(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_mention"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content='Hello <at user_id="ou_alice">Alice</at>',
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].request_body.msg_type, "text")
+        self.assertEqual(
+            json.loads(captured["request"].request_body.content),
+            {"text": 'Hello <at user_id="ou_alice">Alice</at>'},
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_uses_post_for_inline_markdown(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -3203,6 +3345,47 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(
             captured["calls"][1].request_body.content,
             json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_post_fallback_to_text_preserves_exact_mention_handle(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"calls": []}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["calls"].append(request)
+                if len(captured["calls"]) == 1:
+                    raise RuntimeError("content format of the post type is incorrect")
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_plain_mention"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content='**Hello** <at user_id="ou_alice">Alice</at>',
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
+        self.assertEqual(
+            json.loads(captured["calls"][1].request_body.content),
+            {"text": 'Hello <at user_id="ou_alice">Alice</at>'},
         )
 
     @patch.dict(os.environ, {}, clear=True)
