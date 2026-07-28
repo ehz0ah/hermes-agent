@@ -3884,6 +3884,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 item.get("role") == "assistant" for item in recent[-4:]
             ),
         }
+        _bridge_byteplus_participation_env()
         aux_prefix = "AUXILIARY_FEISHU_PARTICIPATION"
         response = await asyncio.wait_for(
             async_call_llm(
@@ -6557,6 +6558,18 @@ def _apply_yaml_config(yaml_cfg: dict, feishu_cfg: dict) -> dict | None:
     if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
         os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
 
+    _bridge_byteplus_participation_env()
+    return None
+
+
+def _bridge_byteplus_participation_env() -> None:
+    """Seed the Feishu classifier from the existing BytePlus fast-model config.
+
+    Feishu can be configured entirely through environment variables, in which
+    case the YAML bridge is never invoked. Resolve this compatibility mapping
+    at the classification boundary as well so adaptive participation cannot
+    silently fall back to the main agent model.
+    """
     # Reuse the operator's BytePlus fast-model credentials when the dedicated
     # auxiliary task has not been configured explicitly. The auxiliary client
     # remains the single routing/auth layer; this only provides a conservative
@@ -6574,7 +6587,6 @@ def _apply_yaml_config(yaml_cfg: dict, feishu_cfg: dict) -> dict | None:
         os.environ[f"{aux_prefix}_PROVIDER"] = "custom"
         for target, value in byteplus_values.items():
             os.environ.setdefault(target, value)
-    return None
 
 
 def _is_connected(config) -> bool:

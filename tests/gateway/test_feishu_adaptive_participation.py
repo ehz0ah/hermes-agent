@@ -319,6 +319,43 @@ class TestParticipationDecisionParsing:
         assert payload["hermes_recently_participated"] is True
 
     @pytest.mark.asyncio
+    @patch.dict(
+        os.environ,
+        {
+            "BYTEPLUS_FAST_LLM_MODEL": "deepseek-v4-flash",
+            "BYTEPLUS_API_BASE": "https://example.invalid/v1",
+            "BYTEPLUS_API_KEY": "secret-test-value",
+        },
+        clear=True,
+    )
+    async def test_classifier_bridges_byteplus_without_feishu_yaml(self):
+        adapter = _adaptive_adapter()
+        response = object()
+
+        with (
+            patch(
+                "agent.auxiliary_client.async_call_llm",
+                new=AsyncMock(return_value=response),
+            ) as call,
+            patch(
+                "agent.auxiliary_client.extract_content_or_reasoning",
+                return_value=(
+                    '{"decision":"silent","confidence":0.95,'
+                    '"reason_code":"casual_chatter"}'
+                ),
+            ),
+        ):
+            assert not await adapter._classify_participation(_candidate())
+
+        assert call.await_args.kwargs["provider"] == "custom"
+        assert call.await_args.kwargs["model"] == "deepseek-v4-flash"
+        assert (
+            call.await_args.kwargs["base_url"]
+            == "https://example.invalid/v1"
+        )
+        assert call.await_args.kwargs["api_key"] == "secret-test-value"
+
+    @pytest.mark.asyncio
     async def test_low_confidence_and_malformed_outputs_fail_silent(self):
         adapter = _adaptive_adapter()
         adapter._session_store = _TranscriptStore()
