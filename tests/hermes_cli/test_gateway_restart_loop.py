@@ -28,6 +28,11 @@ class TestGatewayLifecyclePattern:
     @pytest.mark.parametrize("text", [
         "hermes gateway restart",
         "hermes gateway stop",
+        "hermes gateway run --replace",
+        "hermes -p coder gateway run --replace",
+        "hermes --profile writer gateway run --replace",
+        "python -m hermes_cli.main gateway run --replace",
+        "/opt/hermes/venv/bin/python -m hermes_cli.main gateway run --replace",
         "hermes  gateway  restart",         # double spaces
         "Hermez Gateway Restart".lower().replace("z", "s"),  # case handled
         "HERMES GATEWAY RESTART",           # uppercase
@@ -68,6 +73,8 @@ class TestGatewayLifecyclePattern:
         # foot-gun (#30719 lists only those).
         "hermes gateway start",
         "hermes gateway start --all",
+        "hermes gateway run",
+        "python -m hermes_cli.main gateway run",
         # Tightened launchctl/systemctl branches: ops on NON-gateway hermes
         # services must not be falsely blocked (the old `.*hermes` matched any
         # hermes token).

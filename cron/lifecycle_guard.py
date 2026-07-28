@@ -51,15 +51,23 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # `start` is intentionally excluded: starting a gateway from inside a
     # gateway is benign (a no-op or "already running" error), and a
     # legitimate cron job might start a sibling profile's gateway.
-    r"(?:hermes\s+gateway\s+(?:restart|stop))"
-    # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
+    r"(?:hermes(?:\s+(?:-p|--profile)\s+\S+)?\s+gateway\s+(?:restart|stop)\b)"
+    # Branch B: `gateway run --replace` takes over the active gateway and
+    # terminates the caller just like a restart. Cover both the CLI entrypoint
+    # and the equivalent `python -m` invocation used by deployed gateways.
+    r"|(?:hermes(?:\s+(?:-p|--profile)\s+\S+)?\s+gateway\s+run\b"
+    r"[^\n;&|]*--replace(?!\S))"
+    r"|(?:(?:\S*/)?python(?:\d+(?:\.\d+)*)?\s+-m\s+hermes_cli\.main"
+    r"(?:\s+(?:-p|--profile)\s+\S+)?\s+gateway\s+run\b"
+    r"[^\n;&|]*--replace(?!\S))"
+    # Branch C: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
     # `launchctl unload ai.hermes.update-checker.plist`).
     r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart)\b[^\n]*\bhermes[.\-]?gateway)"
-    # Branch C: systemctl ops on a hermes-gateway unit.
+    # Branch D: systemctl ops on a hermes-gateway unit.
     r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
-    # Branch D: pkill / kill targeting the hermes gateway process. Both
+    # Branch E: pkill / kill targeting the hermes gateway process. Both
     # token orders because real reproductions show both.
     r"|(?:p?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
     r"|(?:p?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"

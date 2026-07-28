@@ -79,10 +79,24 @@ def test_resolve_channel_prompt_missing_config_is_safe():
 def test_inbound_event_carries_channel_prompt():
     adapter = _build_adapter({"channel_prompts": {"oc_chat": "Feishu role prompt."}})
     event = _run_inbound(adapter, chat_id="oc_chat")
-    assert event.channel_prompt == "Feishu role prompt."
+    assert event.channel_prompt.startswith("Feishu role prompt.\n\n")
+    assert "preserve the exact verified" in event.channel_prompt
 
 
 def test_inbound_event_no_prompt_when_unconfigured():
     adapter = _build_adapter({"channel_prompts": {"oc_other": "Different chat."}})
     event = _run_inbound(adapter, chat_id="oc_chat")
-    assert event.channel_prompt is None
+    assert event.channel_prompt.startswith("When mentioning a Feishu/Lark user")
+    assert "preserve the exact verified" in event.channel_prompt
+
+
+def test_observed_context_prompts_prioritize_same_chat():
+    from gateway.run import _observed_context_guidance
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    channel_prompt = FeishuAdapter._observed_group_channel_prompt()
+    turn_prompt = _observed_context_guidance(channel_prompt)
+
+    assert "newest relevant message in this same chat or thread" in channel_prompt
+    assert "newest relevant message in this same chat or thread" in turn_prompt
+    assert "before consulting other conversations or long-term memory" in turn_prompt

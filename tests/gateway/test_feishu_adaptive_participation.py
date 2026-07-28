@@ -294,6 +294,16 @@ class TestParticipationDecisionParsing:
             assert await adapter._classify_participation(_candidate())
 
         messages = call.await_args.kwargs["messages"]
+        classifier_prompt = messages[0]["content"]
+        assert "cross-conversation context" in classifier_prompt
+        assert "long-term memory" in classifier_prompt
+        assert "do not require the answer to appear" in classifier_prompt
+        assert "colleague preferences" in classifier_prompt
+        assert "do not dismiss it merely because it is personal" in classifier_prompt
+        assert "confidence that speaking would be useful" in classifier_prompt
+        assert "not confidence that this classifier knows the answer" in classifier_prompt
+        assert "confidence at least 0.8" in classifier_prompt
+        assert "which option Alice preferred" in classifier_prompt
         assert call.await_args.kwargs["provider"] == "custom"
         assert call.await_args.kwargs["model"] == "deepseek-v4-flash"
         assert (
