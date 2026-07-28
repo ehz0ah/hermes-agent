@@ -2602,11 +2602,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                         task_id=effective_task_id,
                         tool_call_id=tool_call_id,
                     ),
+                    context=getattr(agent, "_memory_turn_context", None),
                 )
             return _finish_agent_tool(result, next_args)
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
+            return _finish_agent_tool(
+                agent._memory_manager.handle_tool_call(
+                    function_name,
+                    next_args,
+                    context=getattr(agent, "_memory_turn_context", None),
+                ),
+                next_args,
+            )
     elif function_name == "clarify":
         def _execute(next_args: dict) -> Any:
             from tools.clarify_tool import clarify_tool as _clarify_tool

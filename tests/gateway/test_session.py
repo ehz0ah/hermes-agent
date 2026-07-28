@@ -34,7 +34,9 @@ class TestSessionSourceRoundtrip:
             chat_type="group",
             user_id="99",
             user_name="alice",
+            user_handle="@alice",
             thread_id="t1",
+            message_id="m1",
         )
         d = source.to_dict()
         restored = SessionSource.from_dict(d)
@@ -45,7 +47,9 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_type == "group"
         assert restored.user_id == "99"
         assert restored.user_name == "alice"
+        assert restored.user_handle == "@alice"
         assert restored.thread_id == "t1"
+        assert restored.message_id == "m1"
 
     def test_full_roundtrip_with_chat_topic(self):
         """chat_topic should survive to_dict/from_dict roundtrip."""
@@ -2273,6 +2277,12 @@ class TestRewriteTranscriptPreservesReasoning:
 
 
 class TestGatewaySessionDbRecovery:
+    @pytest.fixture(autouse=True)
+    def _isolated_db(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
     def test_compression_closed_parent_reroutes_without_retry_queue(self, tmp_path):
         import threading
         from types import SimpleNamespace

@@ -1216,6 +1216,7 @@ CREATE TABLE IF NOT EXISTS messages (
     codex_message_items TEXT,
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
+    memory_source TEXT,
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
@@ -6429,6 +6430,7 @@ class SessionDB:
         codex_message_items: Any = None,
         platform_message_id: str = None,
         observed: bool = False,
+        memory_source: Any = None,
         effect_disposition: Optional[str] = None,
         timestamp: Any = None,
         api_content: Optional[str] = None,
@@ -6481,6 +6483,7 @@ class SessionDB:
             except (json.JSONDecodeError, TypeError):
                 tool_calls = []
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        memory_source_json = json.dumps(memory_source) if memory_source else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
@@ -6527,8 +6530,9 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, memory_source, active,
+                   api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -6547,6 +6551,7 @@ class SessionDB:
                     codex_message_items_json,
                     platform_message_id,
                     1 if observed else 0,
+                    memory_source_json,
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
@@ -6646,6 +6651,11 @@ class SessionDB:
             codex_message_items_json = (
                 json.dumps(codex_message_items) if codex_message_items else None
             )
+            memory_source_json = (
+                json.dumps(msg.get("memory_source"))
+                if msg.get("memory_source")
+                else None
+            )
             # tool_calls may arrive as a Python list (from the live agent)
             # or as a JSON string (from import_sessions / export_session,
             # which store it as TEXT). json.dumps on an already-serialized
@@ -6668,8 +6678,9 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, memory_source, active,
+                   api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -6688,6 +6699,7 @@ class SessionDB:
                     codex_message_items_json,
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
+                    memory_source_json,
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
@@ -6908,6 +6920,78 @@ class SessionDB:
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
+        return result
+
+    def get_recent_gateway_dialogue(
+        self,
+        *,
+        exclude_session_id: str,
+        profile_name: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Return recent active dialogue from other sessions in one profile."""
+        try:
+            bounded_limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            bounded_limit = 50
+
+        clauses = [
+            "s.session_key IS NOT NULL",
+            "m.session_id != ?",
+            "m.active = 1",
+            "m.role IN ('user', 'assistant')",
+            "m.content IS NOT NULL",
+            "TRIM(m.content) != ''",
+        ]
+        params: List[Any] = [exclude_session_id or ""]
+        normalized_profile = str(profile_name or "").strip()
+        if normalized_profile:
+            clauses.append("s.profile_name = ?")
+            params.append(normalized_profile)
+        else:
+            clauses.append(
+                "(s.profile_name IS NULL OR s.profile_name = '' "
+                "OR s.profile_name = 'default')"
+            )
+        params.append(bounded_limit)
+
+        sql = f"""
+            SELECT
+                m.id,
+                m.session_id,
+                m.role,
+                m.content,
+                m.timestamp,
+                m.observed,
+                m.memory_source,
+                s.source AS platform,
+                s.chat_type,
+                s.thread_id,
+                s.display_name AS chat_name,
+                s.origin_json
+            FROM messages AS m
+            JOIN sessions AS s ON s.id = m.session_id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY m.id DESC
+            LIMIT ?
+        """
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+
+        result: List[Dict[str, Any]] = []
+        for row in reversed(rows):
+            item = dict(row)
+            item["content"] = self._decode_content(item.get("content"))
+            for field in ("memory_source", "origin_json"):
+                raw = item.get(field)
+                if not raw:
+                    item[field] = None
+                    continue
+                try:
+                    item[field] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    item[field] = None
+            result.append(item)
         return result
 
     def get_messages_around(
@@ -7236,7 +7320,7 @@ class SessionDB:
             rows = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
-                "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
+                "codex_reasoning_items, codex_message_items, platform_message_id, observed, memory_source, timestamp, "
                 "api_content, display_kind, display_metadata "
                 f"FROM messages WHERE session_id IN ({placeholders})"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
@@ -7264,7 +7348,7 @@ class SessionDB:
     _CONVERSATION_ROW_COLUMNS = (
         "role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
-        "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
+        "codex_reasoning_items, codex_message_items, platform_message_id, observed, memory_source, timestamp, "
         "api_content, display_kind, display_metadata"
     )
 
@@ -7326,6 +7410,16 @@ class SessionDB:
                 msg["message_id"] = row["platform_message_id"]
             if row["observed"]:
                 msg["observed"] = True
+            if row["memory_source"]:
+                try:
+                    memory_source = json.loads(row["memory_source"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize memory_source in conversation replay"
+                    )
+                else:
+                    if isinstance(memory_source, dict):
+                        msg["memory_source"] = memory_source
             # Restore reasoning fields on assistant messages so providers
             # that replay reasoning (OpenRouter, OpenAI, Nous) receive
             # coherent multi-turn reasoning context.

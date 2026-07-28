@@ -7,7 +7,12 @@ import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import (
+    MemoryProvider,
+    MemoryTurnContext,
+    build_memory_turn_context,
+    refresh_memory_turn_context,
+)
 from agent.memory_manager import MemoryManager, inject_memory_provider_tools
 
 # ---------------------------------------------------------------------------
@@ -94,6 +99,46 @@ class MessagesMemoryProvider(FakeMemoryProvider):
         self.synced_turns.append((user_content, assistant_content, session_id, messages))
 
 
+class ContextMemoryProvider(FakeMemoryProvider):
+    """Provider that opts into backend-neutral turn identity."""
+
+    def __init__(self, name="external"):
+        super().__init__(
+            name=name,
+            tools=[
+                {
+                    "name": "context_tool",
+                    "description": "Records the active turn context",
+                    "parameters": {},
+                }
+            ],
+        )
+        self.context_calls = []
+
+    def prefetch(self, query, *, session_id="", context=None):
+        self.context_calls.append(("prefetch", query, session_id, context))
+        return self._prefetch_result
+
+    def queue_prefetch(self, query, *, session_id="", context=None):
+        self.context_calls.append(("queue_prefetch", query, session_id, context))
+
+    def sync_turn(
+        self,
+        user_content,
+        assistant_content,
+        *,
+        session_id="",
+        messages=None,
+        context=None,
+    ):
+        self.context_calls.append(
+            ("sync", user_content, assistant_content, session_id, messages, context)
+        )
+
+    def handle_tool_call(self, tool_name, args):
+        return json.dumps({"handled": tool_name, "args": args})
+
+
 class BlockingPrefetchProvider(FakeMemoryProvider):
     """External provider whose prefetch call blocks until released."""
 
@@ -137,6 +182,93 @@ class TestMemoryProviderABC:
         p.queue_prefetch("query")
         p.sync_turn("user", "assistant")
         p.shutdown()
+
+    def test_memory_turn_context_ignores_message_id_as_identity(self):
+        source = SimpleNamespace(
+            platform="feishu",
+            chat_id="",
+            chat_name=None,
+            chat_type="group",
+            user_id=None,
+            user_id_alt=None,
+            user_name=None,
+            user_handle=None,
+            thread_id=None,
+            message_id="om_only",
+        )
+
+        assert build_memory_turn_context(source, session_id="sid") is None
+
+    def test_memory_turn_context_includes_message_id_with_sender_identity(self):
+        source = SimpleNamespace(
+            platform="feishu",
+            chat_id="oc_group",
+            chat_name="Team",
+            chat_type="group",
+            user_id="ou_user",
+            user_id_alt="on_user",
+            user_name="Alice",
+            user_handle='<at user_id="ou_user">Alice</at>',
+            thread_id="omt_thread",
+            message_id="om_1",
+        )
+
+        context = build_memory_turn_context(
+            source,
+            session_id="sid",
+            gateway_session_key="gw-key",
+        )
+
+        assert context == MemoryTurnContext(
+            platform="feishu",
+            chat_id="oc_group",
+            chat_name="Team",
+            chat_type="group",
+            user_id="ou_user",
+            user_id_alt="on_user",
+            user_name="Alice",
+            user_handle='<at user_id="ou_user">Alice</at>',
+            thread_id="omt_thread",
+            message_id="om_1",
+            session_id="sid",
+            gateway_session_key="gw-key",
+        )
+
+    def test_refresh_clears_stale_cached_agent_identity(self):
+        agent = SimpleNamespace(
+            _user_id="alice",
+            _user_name="Alice",
+            _chat_id="old-chat",
+            _memory_turn_context=MemoryTurnContext(user_id="alice"),
+        )
+        source = SimpleNamespace(
+            platform="feishu",
+            chat_id="",
+            chat_name="",
+            chat_type="group",
+            user_id="",
+            user_id_alt="",
+            user_name="",
+            user_handle="",
+            thread_id="",
+            message_id="om_missing_sender",
+        )
+
+        context = refresh_memory_turn_context(
+            agent,
+            source,
+            session_id="sid",
+            gateway_session_key="gw-key",
+        )
+
+        assert context is not None
+        assert context.user_id == ""
+        assert context.gateway_session_key == "gw-key"
+        assert agent._user_id == ""
+        assert agent._user_name == ""
+        assert agent._chat_id == ""
+        assert agent._message_id == "om_missing_sender"
+        assert agent._memory_turn_context is context
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +417,34 @@ class TestMemoryManager:
         mgr.flush_pending(timeout=5)
         assert p.synced_turns == [("user msg", "assistant msg")]
 
+    def test_context_threads_through_prefetch_queue_and_sync(self):
+        mgr = MemoryManager()
+        provider = ContextMemoryProvider()
+        mgr.add_provider(provider)
+        context = MemoryTurnContext(
+            platform="feishu",
+            chat_id="oc_chat",
+            user_id="ou_alice",
+        )
+        messages = [{"role": "user", "content": "hello"}]
+
+        mgr.prefetch_all("question", session_id="sid", context=context)
+        mgr.queue_prefetch_all("next", session_id="sid", context=context)
+        mgr.sync_all(
+            "hello",
+            "hi",
+            session_id="sid",
+            messages=messages,
+            context=context,
+        )
+        mgr.flush_pending(timeout=5)
+
+        assert provider.context_calls == [
+            ("prefetch", "question", "sid", context),
+            ("queue_prefetch", "next", "sid", context),
+            ("sync", "hello", "hi", "sid", messages, context),
+        ]
+
     def test_sync_failure_doesnt_block_others(self):
         """If one provider's sync fails, others still run."""
         mgr = MemoryManager()
@@ -352,6 +512,21 @@ class TestMemoryManager:
         assert r1["handled"] == "builtin_tool"
         r2 = json.loads(mgr.handle_tool_call("ext_tool", {"b": 2}))
         assert r2["handled"] == "ext_tool"
+
+    def test_tool_context_is_stripped_for_fixed_signature_provider(self):
+        mgr = MemoryManager()
+        provider = ContextMemoryProvider()
+        mgr.add_provider(provider)
+
+        result = json.loads(
+            mgr.handle_tool_call(
+                "context_tool",
+                {"q": "test"},
+                context=MemoryTurnContext(user_id="ou_alice"),
+            )
+        )
+
+        assert result == {"handled": "context_tool", "args": {"q": "test"}}
 
     # -- Lifecycle hooks -----------------------------------------------------
 

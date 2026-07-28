@@ -148,7 +148,14 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     },
     "mattermost":      _TIER_MEDIUM,
     "matrix":          _TIER_MEDIUM,
-    "feishu":          _TIER_MEDIUM,
+    # Feishu is a shared workplace surface. Intermediate reasoning, tool calls,
+    # heartbeats, and status lines become permanent channel noise; emit only the
+    # final answer unless an operator explicitly opts back in.
+    "feishu":          {
+        **_TIER_MINIMAL,
+        "busy_steer_ack_enabled": False,
+        "live_status": "off",
+    },
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,

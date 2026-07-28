@@ -1910,6 +1910,12 @@ class MessageEvent:
     
     # Source information
     source: SessionSource = None
+    # Optional routing/session identity. When absent, ``source`` owns both
+    # routing and session selection, preserving every existing adapter.
+    session_source: Optional[SessionSource] = None
+    # Optional speaker identity for memory attribution. This is deliberately
+    # independent from session routing for shared group/thread transcripts.
+    memory_source: Optional[SessionSource] = None
     
     # Original platform data
     raw_message: Any = None
@@ -5147,8 +5153,9 @@ class BasePlatformAdapter(ABC):
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        session_source = event.session_source or event.source
         session_key = build_session_key(
-            event.source,
+            session_source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
@@ -6095,6 +6102,7 @@ class BasePlatformAdapter(ABC):
         chat_type: str = "dm",
         user_id: Optional[str] = None,
         user_name: Optional[str] = None,
+        user_handle: Optional[str] = None,
         thread_id: Optional[str] = None,
         chat_topic: Optional[str] = None,
         user_id_alt: Optional[str] = None,
@@ -6133,6 +6141,7 @@ class BasePlatformAdapter(ABC):
                         chat_type=chat_type,
                         user_id=str(user_id) if user_id else None,
                         user_name=user_name,
+                        user_handle=user_handle,
                         thread_id=str(thread_id) if thread_id else None,
                         chat_topic=chat_topic.strip() if chat_topic else None,
                         user_id_alt=user_id_alt,
@@ -6157,6 +6166,7 @@ class BasePlatformAdapter(ABC):
             chat_type=chat_type,
             user_id=str(user_id) if user_id else None,
             user_name=user_name,
+            user_handle=user_handle,
             thread_id=str(thread_id) if thread_id else None,
             chat_topic=chat_topic.strip() if chat_topic else None,
             user_id_alt=user_id_alt,

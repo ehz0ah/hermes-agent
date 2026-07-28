@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent.memory_provider import MemoryTurnContext
 import plugins.memory.openviking as openviking_module
 from plugins.memory.openviking import (
     OpenVikingMemoryProvider,
@@ -408,7 +409,7 @@ def test_post_setup_existing_profile_picker_validates_and_links_saved_profile(tm
         validate_values,
         raising=False,
     )
-    choices = iter([0, 0])
+    choices = iter([0, 0, 1])
     monkeypatch.setattr(memory_setup, "_curses_select", lambda *args, **kwargs: next(choices))
     config = {"memory": {}}
 
@@ -424,6 +425,7 @@ def test_post_setup_existing_profile_picker_validates_and_links_saved_profile(tm
     }]
     assert config["memory"]["provider"] == "openviking"
     assert config["memory"]["openviking"] == {
+        "identity_mode": "team",
         "use_ovcli_config": True,
         "ovcli_config_path": str(saved_path),
     }
@@ -442,7 +444,7 @@ def test_post_setup_create_remote_user_profile_can_mirror_to_openviking_store(tm
 
     from hermes_cli import memory_setup
 
-    choices = iter([1, 0, 1])
+    choices = iter([1, 0, 0, 1])
     monkeypatch.setattr(memory_setup, "_curses_select", lambda *args, **kwargs: next(choices))
     monkeypatch.setattr(
         memory_setup,
@@ -467,6 +469,7 @@ def test_post_setup_create_remote_user_profile_can_mirror_to_openviking_store(tm
     }
     assert config["memory"]["provider"] == "openviking"
     assert config["memory"]["openviking"] == {
+        "identity_mode": "solo",
         "use_ovcli_config": True,
         "ovcli_config_path": str(mirrored_path),
     }
@@ -484,7 +487,7 @@ def test_post_setup_create_remote_user_can_keep_hermes_only(tmp_path, monkeypatc
 
     from hermes_cli import memory_setup
 
-    choices = iter([1, 0, 0])
+    choices = iter([1, 0, 0, 0])
     monkeypatch.setattr(memory_setup, "_curses_select", lambda *args, **kwargs: next(choices))
     monkeypatch.setattr(
         memory_setup,
@@ -500,7 +503,10 @@ def test_post_setup_create_remote_user_can_keep_hermes_only(tmp_path, monkeypatc
     OpenVikingMemoryProvider().post_setup(str(hermes_home), config)
 
     assert config["memory"]["provider"] == "openviking"
-    assert config["memory"]["openviking"] == {"use_ovcli_config": False}
+    assert config["memory"]["openviking"] == {
+        "identity_mode": "solo",
+        "use_ovcli_config": False,
+    }
     env_text = (hermes_home / ".env").read_text(encoding="utf-8")
     assert "OPENVIKING_ENDPOINT=https://openviking.example" in env_text
     assert "OPENVIKING_API_KEY=user-secret" in env_text
@@ -528,7 +534,7 @@ def test_post_setup_create_openviking_service_validates_after_api_key(tmp_path, 
         MagicMock(side_effect=AssertionError("service setup validates only after API key entry")),
     )
     monkeypatch.setattr(openviking_module, "_validate_openviking_setup_values", validate_values)
-    choices = iter([0, 0])
+    choices = iter([0, 0, 0])
     monkeypatch.setattr(memory_setup, "_curses_select", lambda *args, **kwargs: next(choices))
     monkeypatch.setattr(
         memory_setup,
@@ -608,7 +614,7 @@ def test_post_setup_user_key_path_can_route_detected_root_key_to_root_setup(tmp_
 
     monkeypatch.setattr(openviking_module, "_validate_openviking_reachability", lambda endpoint: (True, ""))
     monkeypatch.setattr(openviking_module, "_validate_openviking_setup_values", validate_values)
-    choices = iter([1, 0, 0, 0])
+    choices = iter([1, 0, 0, 0, 0])
     monkeypatch.setattr(memory_setup, "_curses_select", lambda *args, **kwargs: next(choices))
     prompt_events = []
 
@@ -652,7 +658,7 @@ def test_post_setup_root_key_path_can_route_detected_user_key_to_user_setup(tmp_
 
     monkeypatch.setattr(openviking_module, "_validate_openviking_reachability", lambda endpoint: (True, ""))
     monkeypatch.setattr(openviking_module, "_validate_openviking_setup_values", validate_values)
-    choices = iter([1, 1, 0, 0])
+    choices = iter([1, 1, 0, 0, 0])
     monkeypatch.setattr(memory_setup, "_curses_select", lambda *args, **kwargs: next(choices))
     monkeypatch.setattr(
         memory_setup,
@@ -1244,7 +1250,7 @@ def test_post_setup_local_server_down_can_offer_autostart(tmp_path, monkeypatch)
     monkeypatch.setattr(openviking_module, "_validate_openviking_reachability", validate_reachability)
     monkeypatch.setattr(openviking_module, "_start_local_openviking_server", lambda endpoint: (started.append(endpoint) or True, "started"))
     monkeypatch.setattr(openviking_module, "_wait_for_openviking_health", lambda endpoint, **kwargs: True)
-    choices = iter([1, 0, 0, 0])
+    choices = iter([1, 0, 0, 0, 0])
     monkeypatch.setattr(memory_setup, "_curses_select", lambda *args, **kwargs: next(choices))
     monkeypatch.setattr(
         memory_setup,
@@ -1278,7 +1284,7 @@ def test_post_setup_invalid_env_profile_can_create_new_config(tmp_path, monkeypa
 
     from hermes_cli import memory_setup
 
-    choices = iter([1, 0, 0])
+    choices = iter([1, 0, 0, 0])
     monkeypatch.setattr(memory_setup, "_curses_select", lambda *args, **kwargs: next(choices))
     monkeypatch.setattr(
         memory_setup,
@@ -1294,7 +1300,10 @@ def test_post_setup_invalid_env_profile_can_create_new_config(tmp_path, monkeypa
     OpenVikingMemoryProvider().post_setup(str(hermes_home), config)
 
     assert ovcli_path.read_text(encoding="utf-8") == "{"
-    assert config["memory"]["openviking"] == {"use_ovcli_config": False}
+    assert config["memory"]["openviking"] == {
+        "identity_mode": "solo",
+        "use_ovcli_config": False,
+    }
 
 
 def test_tool_search_sorts_by_raw_score_across_buckets():
@@ -4500,3 +4509,256 @@ def test_prefetch_uses_bounded_http_timeouts(monkeypatch):
 
     assert 0 < captured_post_kwargs[0]["timeout"] < openviking_module._TIMEOUT
     assert 0 < captured_get_kwargs[0]["timeout"] < openviking_module._TIMEOUT
+
+
+def _team_provider_with_immediate_writes(monkeypatch):
+    posts = []
+
+    class StubClient:
+        def __init__(
+            self,
+            endpoint,
+            api_key="",
+            account=None,
+            user=None,
+            agent=None,
+        ):
+            self.agent = agent
+
+        def post(self, path, payload=None, **kwargs):
+            posts.append((self.agent, path, payload))
+            return {"result": {"written_bytes": 12}}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://ov"
+    provider._api_key = "key"
+    provider._account = "acct"
+    provider._user = "team"
+    provider._agent = "hermes"
+    provider._session_id = "sid"
+    provider._identity_mode = "team"
+    provider._spawn_writer = lambda _sid, target, name=None: target()
+    return provider, posts
+
+
+def _feishu_context(user_id, *, name, message_id):
+    return MemoryTurnContext(
+        platform="feishu",
+        chat_id="oc_group",
+        chat_name="Alerts",
+        chat_type="group",
+        user_id=user_id,
+        user_name=name,
+        user_handle=f'<at user_id="{user_id}">{name}</at>',
+        message_id=message_id,
+    )
+
+
+def test_team_session_policy_enables_self_and_peer_memory():
+    assert OpenVikingMemoryProvider._team_session_memory_policy() == {
+        "self": {"enabled": True},
+        "peer": {"enabled": True},
+    }
+
+
+def test_sync_turn_team_mode_attributes_human_but_not_assistant(monkeypatch):
+    provider, posts = _team_provider_with_immediate_writes(monkeypatch)
+    context = _feishu_context("ou_alice", name="Alice", message_id="om_1")
+
+    provider.sync_turn(
+        "favorite snack is oreo",
+        "noted",
+        session_id="sid",
+        messages=[
+            {"role": "user", "content": "favorite snack is oreo"},
+            {"role": "assistant", "content": "noted"},
+        ],
+        context=context,
+    )
+
+    peer_id = provider._peer_id_for_context(context)
+    batch = next(
+        payload["messages"]
+        for _actor, path, payload in posts
+        if path == "/api/v1/sessions/sid/messages/batch"
+    )
+    assert batch[0]["peer_id"] == peer_id
+    assert "peer_id" not in batch[1]
+    assert any(
+        actor == ""
+        and path == "/api/v1/sessions"
+        and payload["memory_policy"] == {
+            "self": {"enabled": True},
+            "peer": {"enabled": True},
+        }
+        for actor, path, payload in posts
+    )
+
+
+def test_sync_turn_team_mode_keeps_observed_speakers_distinct(monkeypatch):
+    provider, posts = _team_provider_with_immediate_writes(monkeypatch)
+    alice = _feishu_context("ou_alice", name="Alice", message_id="om_1")
+    bob = _feishu_context("ou_bob", name="Bob", message_id="om_2")
+
+    provider.sync_turn(
+        "what did Alice mention?",
+        "Alice mentioned oreos.",
+        session_id="sid",
+        messages=[
+            {
+                "role": "user",
+                "content": "favorite snack is oreo",
+                "observed": True,
+                "memory_source": {
+                    "platform": alice.platform,
+                    "chat_id": alice.chat_id,
+                    "chat_name": alice.chat_name,
+                    "chat_type": alice.chat_type,
+                    "user_id": alice.user_id,
+                    "user_name": alice.user_name,
+                    "user_handle": alice.user_handle,
+                    "message_id": alice.message_id,
+                },
+            },
+            {"role": "user", "content": "what did Alice mention?"},
+            {"role": "assistant", "content": "Alice mentioned oreos."},
+        ],
+        context=bob,
+    )
+
+    batch = next(
+        payload["messages"]
+        for _actor, path, payload in posts
+        if path == "/api/v1/sessions/sid/messages/batch"
+    )
+    assert batch[0]["peer_id"] == provider._peer_id_for_context(alice)
+    assert batch[1]["peer_id"] == provider._peer_id_for_context(bob)
+    assert "peer_id" not in batch[2]
+
+
+def test_team_prefetch_uses_unscoped_actor_and_namespace_search(monkeypatch):
+    provider = _make_prefetch_provider()
+    provider._identity_mode = "team"
+    clients = []
+
+    class StubClient:
+        def __init__(
+            self,
+            endpoint,
+            api_key="",
+            account=None,
+            user=None,
+            agent=None,
+        ):
+            self.agent = agent
+            clients.append(self)
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+    provider._session_start_memory_context = lambda _sid, client=None: ""
+    calls = []
+
+    def search(query, *, session_id, client=None):
+        calls.append((query, session_id, client.agent))
+        return "found"
+
+    provider._search_prefetch_context = search
+
+    result = provider.prefetch(
+        "favorite snack",
+        session_id="sid",
+        context=_feishu_context("ou_alice", name="Alice", message_id="om_1"),
+    )
+
+    assert result == "## OpenViking Context\nfound"
+    assert calls == [("favorite snack", "", "")]
+    assert [client.agent for client in clients] == [""]
+
+
+def test_viking_remember_team_routes_human_and_self_owners(monkeypatch):
+    provider, posts = _team_provider_with_immediate_writes(monkeypatch)
+    context = _feishu_context("ou_alice", name="Alice", message_id="om_1")
+
+    human_result = json.loads(
+        provider._tool_remember(
+            {"content": "Alice likes tea", "category": "preference", "owner": "human"},
+            context=context,
+        )
+    )
+    self_result = json.loads(
+        provider._tool_remember(
+            {"content": "Confirm before deploy", "category": "pattern", "owner": "self"},
+            context=context,
+        )
+    )
+
+    assert human_result["status"] == "stored"
+    assert self_result["status"] == "stored"
+    write_uris = [
+        payload["uri"]
+        for _actor, path, payload in posts
+        if path == "/api/v1/content/write"
+        and not payload["uri"].endswith("/resources/profile.md")
+    ]
+    assert write_uris[0].startswith(
+        f"viking://user/peers/{provider._peer_id_for_context(context)}/"
+        "memories/preferences/"
+    )
+    assert write_uris[1].startswith("viking://user/memories/patterns/")
+
+
+class _FakeIdleTimer:
+    instances = []
+
+    def __init__(self, interval, function, args=None, kwargs=None):
+        self.interval = interval
+        self.function = function
+        self.args = list(args or [])
+        self.kwargs = dict(kwargs or {})
+        self.daemon = False
+        self.started = False
+        self.cancelled = False
+        self.__class__.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        if not self.cancelled:
+            self.function(*self.args, **self.kwargs)
+
+
+def test_idle_commit_is_debounced_and_does_not_finalize_session(monkeypatch):
+    _FakeIdleTimer.instances = []
+    monkeypatch.setattr(openviking_module.threading, "Timer", _FakeIdleTimer)
+    provider, _posts = _team_provider_with_immediate_writes(monkeypatch)
+    provider._idle_commit_seconds = 1
+    provider._idle_commit_keep_recent = 0
+    commit_posts = []
+
+    class CommitClient:
+        def post(self, path, payload=None, **kwargs):
+            commit_posts.append((path, payload))
+            return {}
+
+    provider._client_for_commit = lambda: CommitClient()
+    context = _feishu_context("ou_alice", name="Alice", message_id="om_1")
+
+    provider.sync_turn("first fact", "noted", session_id="sid", context=context)
+    first_timer = _FakeIdleTimer.instances[0]
+    provider.sync_turn("second fact", "noted", session_id="sid", context=context)
+    second_timer = _FakeIdleTimer.instances[1]
+
+    assert first_timer.cancelled is True
+    first_timer.fire()
+    assert commit_posts == []
+
+    second_timer.fire()
+    assert commit_posts == [
+        ("/api/v1/sessions/sid/commit", {"keep_recent_count": 0})
+    ]
+    assert provider._has_committed_session("sid") is False

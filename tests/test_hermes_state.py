@@ -1275,6 +1275,32 @@ class TestMessageStorage:
         assert isinstance(conversation[0].get("timestamp"), float)
         assert "observed" not in conversation[1]
 
+    def test_memory_source_round_trips_for_gateway_replay(self, db):
+        db.create_session(session_id="s1", source="feishu:oc_group")
+        memory_source = {
+            "platform": "feishu",
+            "chat_id": "oc_group",
+            "chat_type": "group",
+            "user_id": "ou_alice",
+            "user_name": "Alice",
+            "user_handle": '<at user_id="ou_alice">Alice</at>',
+            "message_id": "om_1",
+        }
+
+        db.append_message(
+            "s1",
+            role="user",
+            content="observed context",
+            observed=True,
+            memory_source=memory_source,
+        )
+
+        messages = db.get_messages("s1")
+        assert json.loads(messages[0]["memory_source"]) == memory_source
+
+        conversation = db.get_messages_as_conversation("s1")
+        assert conversation[0]["memory_source"] == memory_source
+
     def test_tool_response_does_not_increment_tool_count(self, db):
         """Tool responses (role=tool) should not increment tool_call_count.
 
@@ -7761,4 +7787,3 @@ class TestDisplayMetadataReadPaths:
             }],
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
-

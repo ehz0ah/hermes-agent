@@ -12,7 +12,7 @@ import json
 import pytest
 
 from agent.memory_manager import MemoryManager
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, MemoryTurnContext
 
 
 class _RecordingProvider(MemoryProvider):
@@ -44,6 +44,28 @@ class _RecordingProvider(MemoryProvider):
             "content": content,
             "metadata": dict(metadata or {}),
         })
+
+
+class _ContextRecordingProvider(_RecordingProvider):
+    """Provider that opts into MemoryTurnContext on write notifications."""
+
+    def on_memory_write(self, action, target, content, metadata=None, context=None):
+        super().on_memory_write(action, target, content, metadata=metadata)
+        self.calls[-1]["context"] = context
+
+
+class _ContextOnlyProvider(_RecordingProvider):
+    """Provider whose fourth positional parameter is context, not metadata."""
+
+    def on_memory_write(self, action, target, content, context=None):
+        self.calls.append(
+            {
+                "action": action,
+                "target": target,
+                "content": content,
+                "context": context,
+            }
+        )
 
 
 def _manager_with_provider():
@@ -141,5 +163,58 @@ def test_build_metadata_callback_is_merged_per_op():
             "target": "memory",
             "content": "fact",
             "metadata": {"session_id": "s1", "tool_name": "memory"},
+        }
+    ]
+
+
+def test_forwards_turn_context_to_context_aware_provider():
+    mgr = MemoryManager()
+    provider = _ContextRecordingProvider()
+    mgr.add_provider(provider)
+    context = MemoryTurnContext(
+        platform="feishu",
+        chat_id="oc_chat",
+        chat_type="group",
+        user_id="ou_alice",
+        user_name="Alice",
+    )
+
+    mgr.notify_memory_tool_write(
+        json.dumps({"success": True}),
+        {"action": "add", "target": "user", "content": "Alice prefers short replies"},
+        context=context,
+    )
+
+    assert provider.calls == [
+        {
+            "action": "add",
+            "target": "user",
+            "content": "Alice prefers short replies",
+            "metadata": {},
+            "context": context,
+        }
+    ]
+
+
+def test_does_not_shift_metadata_into_context_slot():
+    mgr = MemoryManager()
+    provider = _ContextOnlyProvider()
+    mgr.add_provider(provider)
+    context = MemoryTurnContext(user_id="ou_alice")
+
+    mgr.on_memory_write(
+        "add",
+        "user",
+        "fact",
+        metadata={"tool_name": "memory"},
+        context=context,
+    )
+
+    assert provider.calls == [
+        {
+            "action": "add",
+            "target": "user",
+            "content": "fact",
+            "context": context,
         }
     ]

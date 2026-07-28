@@ -45,6 +45,7 @@ OPENVIKING_ENDPOINT=http://127.0.0.1:1933
 # OPENVIKING_ACCOUNT=default
 # OPENVIKING_USER=default
 # OPENVIKING_AGENT=hermes
+OPENVIKING_IDENTITY_MODE=solo
 ```
 
 ## Config
@@ -68,10 +69,36 @@ profile's `.env`:
 | `OPENVIKING_ACCOUNT` | `default` | Tenant account for local/trusted mode |
 | `OPENVIKING_USER` | `default` | Tenant user for local/trusted mode |
 | `OPENVIKING_AGENT` | `hermes` | Hermes peer ID in OpenViking, used for peer-scoped memories |
+| `OPENVIKING_IDENTITY_MODE` | `solo` | `solo` for one human or `team` for messaging gateways |
+| `OPENVIKING_IDLE_COMMIT_SECONDS` | `900` | Extract an idle session after this many seconds; `0` disables idle checkpoints |
+| `OPENVIKING_IDLE_COMMIT_KEEP_RECENT` | `0` | Messages left unarchived by an idle checkpoint |
 
 When `OPENVIKING_API_KEY` is set, Hermes lets OpenViking derive account/user
 identity from the key. In local or trusted deployments without an API key,
 Hermes sends `OPENVIKING_ACCOUNT` and `OPENVIKING_USER` as identity headers.
+
+### Team Mode
+
+Team mode is intended for a single Hermes profile used by multiple people
+across messaging channels:
+
+- Every human message is tagged with a stable peer ID derived from the
+  platform's immutable user identity.
+- Assistant messages omit `peer_id`, so OpenViking treats them as self memory
+  in the parent user namespace.
+- Retrieval uses the whole configured OpenViking user namespace. This lets one
+  Hermes colleague use what it has learned across chats while preserving the
+  original human attribution on extracted memories.
+- Unaddressed group messages may be observed without running the agent. They
+  are synchronized on the next addressed turn with their original speakers.
+
+Team mode requires gateway sender identity and intentionally refuses to run in
+the Hermes CLI. Run `hermes memory setup` again and choose Solo for CLI use.
+
+OpenViking extracts session memories when a session is committed. The idle
+checkpoint makes short, quiet gateway sessions searchable without ending the
+Hermes session. It is a provider-local checkpoint and does not evict or rebuild
+the warm agent.
 
 ## Tools
 
@@ -87,11 +114,11 @@ Hermes sends `OPENVIKING_ACCOUNT` and `OPENVIKING_USER` as identity headers.
 ## Memory Writes And Deletes
 
 `viking_remember` writes directly to OpenViking with `POST /api/v1/content/write`
-and `mode=create`. It creates peer-scoped memory files under
-`viking://user/peers/${OPENVIKING_AGENT}/memories/...`; OpenViking may return a
-canonical user-scoped form such as
-`viking://user/default/peers/${OPENVIKING_AGENT}/memories/...` in API-key mode.
-Explicit remembers do not depend on session commit extraction.
+and `mode=create`. In Solo mode it writes under the configured agent peer. In
+Team mode, `owner=human` writes under the active human peer and `owner=self`
+writes to the parent user memory namespace. OpenViking may return canonical
+user-scoped forms in API-key mode. Explicit remembers do not depend on session
+commit extraction.
 
 Hermes built-in `memory` tool additions are mirrored to OpenViking after the
 local memory operation succeeds:

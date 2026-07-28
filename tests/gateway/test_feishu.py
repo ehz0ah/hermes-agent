@@ -723,6 +723,23 @@ def _admits_group(adapter, message, sender_id, chat_id=""):
     return adapter._admit(sender, message) is None
 
 
+class _FakeFeishuSessionEntry:
+    session_id = "feishu-group-session"
+
+
+class _FakeFeishuSessionStore:
+    def __init__(self):
+        self.sources = []
+        self.messages = []
+
+    def get_or_create_session(self, source):
+        self.sources.append(source)
+        return _FakeFeishuSessionEntry()
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self.messages.append((session_id, message, skip_db))
+
+
 class TestAdapterBehavior(unittest.TestCase):
     @patch.dict(os.environ, {}, clear=True)
     def test_build_event_handler_registers_reaction_and_card_processors(self):
@@ -944,6 +961,144 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertFalse(
             _admits_group(adapter, SimpleNamespace(mentions=[other_mention]), sender_id, "")
+        )
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_unmentioned_group_messages_can_be_observed_without_dispatching(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "require_mention": True,
+                    "observe_unmentioned_group_messages": True,
+                }
+            )
+        )
+        adapter._session_store = _FakeFeishuSessionStore()
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Team Chat", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={
+                "user_id": "u_alice",
+                "user_name": "Alice",
+                "user_id_alt": "on_alice",
+                "user_handle": '<at user_id="ou_alice">Alice</at>',
+            }
+        )
+        observed_message_id = f"om_observed_{time.time_ns()}"
+        message = SimpleNamespace(
+            message_id=observed_message_id,
+            chat_type="group",
+            chat_id="oc_group",
+            message_type="text",
+            content='{"text":"favorite snack is oreo"}',
+            mentions=[],
+            thread_id=None,
+            root_id=None,
+            parent_id=None,
+            upper_message_id=None,
+        )
+        sender_id = SimpleNamespace(
+            open_id="ou_alice",
+            user_id="u_alice",
+            union_id="on_alice",
+        )
+        data = SimpleNamespace(
+            event=SimpleNamespace(
+                message=message,
+                sender=SimpleNamespace(sender_type="user", sender_id=sender_id),
+            )
+        )
+
+        asyncio.run(adapter._handle_message_event_data(data))
+
+        adapter._dispatch_inbound_event.assert_not_awaited()
+        self.assertEqual(len(adapter._session_store.messages), 1)
+        session_id, entry, skip_db = adapter._session_store.messages[0]
+        self.assertEqual(session_id, "feishu-group-session")
+        self.assertFalse(skip_db)
+        self.assertTrue(entry["observed"])
+        self.assertEqual(entry["message_id"], observed_message_id)
+        self.assertIn('<at user_id="ou_alice">Alice</at>', entry["content"])
+        self.assertIn("favorite snack is oreo", entry["content"])
+        self.assertEqual(
+            entry["memory_source"]["user_handle"],
+            '<at user_id="ou_alice">Alice</at>',
+        )
+        self.assertEqual(entry["memory_source"]["message_id"], observed_message_id)
+        shared_source = adapter._session_store.sources[0]
+        self.assertEqual(shared_source.chat_id, "oc_group")
+        self.assertIsNone(shared_source.user_id)
+        self.assertIsNone(shared_source.user_name)
+
+    def test_addressed_group_message_uses_shared_session_and_speaker_memory_source(self):
+        from gateway.config import PlatformConfig
+        from gateway.session import build_session_key
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "require_mention": True,
+                    "observe_unmentioned_group_messages": True,
+                }
+            )
+        )
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Team Chat", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={
+                "user_id": "u_alice",
+                "user_name": "Alice",
+                "user_id_alt": "on_alice",
+                "user_handle": '<at user_id="ou_alice">Alice</at>',
+            }
+        )
+        message = SimpleNamespace(
+            message_id="om_addressed",
+            chat_type="group",
+            chat_id="oc_group",
+            message_type="text",
+            content='{"text":"what is my favorite snack"}',
+            mentions=[],
+            thread_id=None,
+            root_id=None,
+            parent_id=None,
+            upper_message_id=None,
+        )
+        sender_id = SimpleNamespace(
+            open_id="ou_alice",
+            user_id="u_alice",
+            union_id="on_alice",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(),
+                message=message,
+                sender_id=sender_id,
+                chat_type="group",
+                message_id="om_addressed",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.user_id, "u_alice")
+        self.assertEqual(event.source.user_handle, '<at user_id="ou_alice">Alice</at>')
+        self.assertIsNone(event.session_source.user_id)
+        self.assertIsNone(event.session_source.user_handle)
+        self.assertEqual(event.memory_source.user_id, "u_alice")
+        self.assertEqual(
+            build_session_key(event.session_source),
+            build_session_key(adapter._shared_group_session_source(event.memory_source)),
         )
 
     @patch.dict(
@@ -2161,8 +2316,57 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
         event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertIsNone(event.source.thread_id)
         self.assertEqual(event.reply_to_message_id, "om_parent")
         self.assertEqual(event.reply_to_text, "父消息内容")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_message_preserves_explicit_topic_thread(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Team Chat", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={
+                "user_id": "ou_user",
+                "user_name": "Alice",
+                "user_id_alt": None,
+            }
+        )
+        adapter._fetch_message_text = AsyncMock(return_value="topic root")
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id="omt_topic",
+            root_id="om_root",
+            parent_id="om_parent",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"reply in topic"}',
+            message_id="om_thread_reply",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(
+                    open_id="ou_user",
+                    user_id=None,
+                    union_id=None,
+                ),
+                chat_type="group",
+                message_id="om_thread_reply",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.thread_id, "omt_topic")
+        self.assertEqual(event.reply_to_message_id, "om_parent")
+        self.assertEqual(event.reply_to_text, "topic root")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_replies_in_thread_when_thread_metadata_present(self):
@@ -4000,11 +4204,13 @@ class TestProcessingReactions(unittest.TestCase):
         create_success: bool = True,
         delete_success: bool = True,
         next_reaction_id: str = "r1",
+        reactions: bool = True,
     ):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._reactions = reactions
         tracker = SimpleNamespace(
             create_calls=[],
             delete_calls=[],
@@ -4173,7 +4379,7 @@ class TestProcessingReactions(unittest.TestCase):
     # ------------------------------------------------------------- env toggle
     @patch.dict(os.environ, {"FEISHU_REACTIONS": "false"}, clear=True)
     def test_env_disable_short_circuits_both_hooks(self):
-        adapter, tracker = self._build_adapter()
+        adapter, tracker = self._build_adapter(reactions=False)
         with self._patch_to_thread():
             self._run(adapter.on_processing_start(self._event()))
             self._run(

@@ -35,9 +35,115 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MemoryTurnContext:
+    """Raw gateway identity for one turn.
+
+    The memory interface carries platform-native fields only. Providers remain
+    responsible for deriving backend-specific identities such as peer IDs.
+    """
+
+    platform: str = ""
+    chat_id: str = ""
+    chat_name: str = ""
+    chat_type: str = ""
+    user_id: str = ""
+    user_id_alt: str = ""
+    user_name: str = ""
+    user_handle: str = ""
+    thread_id: str = ""
+    message_id: str = ""
+    session_id: str = ""
+    gateway_session_key: str = ""
+
+
+def _context_value(source: Any, field: str) -> str:
+    value = getattr(source, field, "")
+    if value is None:
+        return ""
+    if field == "platform":
+        value = getattr(value, "value", value)
+    return str(value).strip()
+
+
+def build_memory_turn_context(
+    source: Any,
+    *,
+    session_id: str = "",
+    gateway_session_key: str = "",
+) -> Optional[MemoryTurnContext]:
+    """Build backend-neutral per-turn context from a gateway source."""
+    if source is None:
+        return None
+
+    values = {
+        "platform": _context_value(source, "platform"),
+        "chat_id": _context_value(source, "chat_id"),
+        "chat_name": _context_value(source, "chat_name"),
+        "chat_type": _context_value(source, "chat_type"),
+        "user_id": _context_value(source, "user_id"),
+        "user_id_alt": _context_value(source, "user_id_alt"),
+        "user_name": _context_value(source, "user_name"),
+        "user_handle": _context_value(source, "user_handle"),
+        "thread_id": _context_value(source, "thread_id"),
+        "message_id": _context_value(source, "message_id"),
+        "session_id": str(session_id or "").strip(),
+        "gateway_session_key": str(gateway_session_key or "").strip(),
+    }
+    identity_fields = (
+        "chat_id",
+        "chat_name",
+        "user_id",
+        "user_id_alt",
+        "user_name",
+        "user_handle",
+        "thread_id",
+        "gateway_session_key",
+    )
+    if not any(values[field] for field in identity_fields):
+        return None
+    return MemoryTurnContext(**values)
+
+
+def refresh_memory_turn_context(
+    agent: Any,
+    source: Any,
+    *,
+    session_id: str = "",
+    gateway_session_key: str = "",
+) -> Optional[MemoryTurnContext]:
+    """Refresh cached-agent gateway identity for the current message.
+
+    Empty source fields intentionally clear previous values. This prevents a
+    malformed event from inheriting the last speaker's identity.
+    """
+    context = build_memory_turn_context(
+        source,
+        session_id=session_id,
+        gateway_session_key=gateway_session_key,
+    )
+    values = {
+        "_user_id": _context_value(source, "user_id") if source is not None else "",
+        "_user_id_alt": _context_value(source, "user_id_alt") if source is not None else "",
+        "_user_name": _context_value(source, "user_name") if source is not None else "",
+        "_user_handle": _context_value(source, "user_handle") if source is not None else "",
+        "_chat_id": _context_value(source, "chat_id") if source is not None else "",
+        "_chat_name": _context_value(source, "chat_name") if source is not None else "",
+        "_chat_type": _context_value(source, "chat_type") if source is not None else "",
+        "_thread_id": _context_value(source, "thread_id") if source is not None else "",
+        "_message_id": _context_value(source, "message_id") if source is not None else "",
+        "_gateway_session_key": str(gateway_session_key or "").strip(),
+        "_memory_turn_context": context,
+    }
+    for name, value in values.items():
+        setattr(agent, name, value)
+    return context
 
 
 class MemoryProvider(ABC):
@@ -91,7 +197,13 @@ class MemoryProvider(ABC):
         """
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> str:
         """Recall relevant context for the upcoming turn.
 
         Called before each API call. Return formatted text to inject as
@@ -105,7 +217,13 @@ class MemoryProvider(ABC):
         """
         return ""
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        context: Optional[MemoryTurnContext] = None,
+    ) -> None:
         """Queue a background recall for the NEXT turn.
 
         Called after each turn completes. The result will be consumed
@@ -120,6 +238,7 @@ class MemoryProvider(ABC):
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Persist a completed turn to the backend.
 
@@ -141,7 +260,14 @@ class MemoryProvider(ABC):
         Return empty list if this provider has no tools (context-only).
         """
 
-    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+    def handle_tool_call(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        *,
+        context: Optional[MemoryTurnContext] = None,
+        **kwargs,
+    ) -> str:
         """Handle a tool call for one of this provider's tools.
 
         Must return a JSON string (the tool result).
@@ -283,6 +409,7 @@ class MemoryProvider(ABC):
         target: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
+        context: Optional[MemoryTurnContext] = None,
     ) -> None:
         """Called when the built-in memory tool writes an entry.
 

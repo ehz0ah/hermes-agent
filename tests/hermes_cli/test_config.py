@@ -60,6 +60,16 @@ class TestEnsureHermesHome:
             assert soul_path.exists()
             assert soul_path.read_text(encoding="utf-8").strip() != ""
 
+    def test_default_soul_preserves_capability_and_operational_boundaries(self):
+        from hermes_cli.default_soul import DEFAULT_SOUL_MD
+
+        normalized = " ".join(DEFAULT_SOUL_MD.split())
+        assert "Personality changes presentation, never substance." in normalized
+        assert "Fully solve the task." in normalized
+        assert "Never invent facts, actions, tool results, or access." in normalized
+        assert "do not modify Hermes' deployed source code" in normalized
+        assert "deployment changes must be requested from the maintainer" in normalized
+
     def test_does_not_overwrite_existing_soul_md(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             soul_path = tmp_path / "SOUL.md"
