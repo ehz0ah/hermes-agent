@@ -318,6 +318,13 @@ def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
 # injection share a single, testable seam.
 _DASHBOARD_EMBEDDED_CHAT_ENABLED = True
 
+# Desktop's file.attach compatibility transport sends a complete base64 data
+# URL in one JSON-RPC frame. Uvicorn defaults to 16 MiB, which rejects files at
+# the preview ceiling before the dispatcher sees them. Keep the gateway
+# finite while allowing the 256 MiB raw Desktop attach cap plus base64/JSON
+# overhead.
+_DESKTOP_ATTACHMENT_WS_MAX_BYTES = 384 * 1024 * 1024
+
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
 _REVEAL_MAX_PER_WINDOW = 5
@@ -799,7 +806,23 @@ def _memory_provider_options() -> List[str]:
     return list(dict.fromkeys(options))
 
 
+def _timezone_options() -> List[str]:
+    """Return sorted IANA timezone identifiers, cached at import time."""
+    try:
+        import zoneinfo
+        return sorted(zoneinfo.available_timezones()) or ["UTC"]
+    except Exception:  # pragma: no cover
+        return ["UTC"]
+
+
 _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    "timezone": {
+        "type": "select",
+        "description": "IANA timezone (e.g. America/New_York). Blank uses the system timezone.",
+        "options": _timezone_options(),
+        "searchable": True,
+        "clearable": True,
+    },
     "memory.provider": {
         "type": "select",
         "description": "Memory provider plugin",
@@ -967,6 +990,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # field — fold it into the agent tab rather than spawning a one-field
     # orphan category.
     "computer_use": "agent",
+    # `telemetry.shared_metrics.enabled` is the only schema-surfaced telemetry
+    # field — fold it into security alongside the other privacy-posture toggles.
+    "telemetry": "security",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
@@ -1366,17 +1392,18 @@ class ModelAssignment(BaseModel):
     provider: str
     model: str
     task: str = ""
-    # Optional OpenAI-compatible endpoint URL. Only honored for custom/local
-    # providers on the main slot — lets the GUI configure a self-hosted endpoint
-    # (vLLM, llama.cpp, Ollama, …) that needs no API key. The runtime resolver
-    # reads model.base_url from config (it ignores OPENAI_BASE_URL), so this is
-    # the path that actually wires a local endpoint into resolution.
+    # Optional OpenAI-compatible endpoint URL. Honored for custom/local
+    # providers on the main slot AND on auxiliary slots — lets the GUI wire a
+    # self-hosted endpoint (vLLM, llama.cpp, Ollama, …) that needs no API key.
+    # The runtime resolvers read model.base_url / auxiliary.<task>.base_url
+    # from config (they ignore OPENAI_BASE_URL), so this is the path that
+    # actually wires a local endpoint into resolution.
     base_url: str = ""
     # Optional API key for a custom/local endpoint. Persisted to
-    # ``model.api_key`` (where the runtime resolver reads it) so a self-hosted
-    # endpoint that requires auth works from the GUI — mirrors the key the
-    # ``hermes model`` custom flow collects. Honored only on the main slot for
-    # custom/local providers.
+    # ``model.api_key`` (main slot) or ``auxiliary.<task>.api_key`` (aux
+    # slots) — where the runtime resolvers read it — so a self-hosted
+    # endpoint that requires auth works from the GUI. Mirrors the key the
+    # ``hermes model`` custom flow collects.
     api_key: str = ""
     confirm_expensive_model: bool = False
     profile: Optional[str] = None
@@ -1472,6 +1499,14 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
        known but ``poolside`` isn't) but the model is a vendor-prefixed
        aggregator slug, keep the user's CURRENT aggregator if they're on
        one, else fall back to openrouter.
+
+       Named custom providers (``custom:litellm``, etc.) are excluded from
+       this fallback: ``_KNOWN_PROVIDER_NAMES`` only lists the bare
+       ``"custom"`` bucket, never a specific ``custom:<name>`` slug, so
+       without this exclusion every named custom provider paired with a
+       slash-bearing model (e.g. ``ollama/glm-5.2`` behind a LiteLLM proxy)
+       looked exactly like the stray-vendor-prefix case above and got
+       silently reassigned to ``openrouter``.
     2. Model-format normalization for the resolved provider via
        ``normalize_model_for_provider`` (e.g. ``anthropic/claude-opus-4.6``
        on native anthropic → ``claude-opus-4-6``).
@@ -1506,7 +1541,21 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
     if custom_provider is not None:
         return custom_provider.id, model_in
 
-    if canonical not in _KNOWN_PROVIDER_NAMES and "/" in model_in:
+    # A named custom provider that didn't resolve above (typo, config
+    # mismatch, entry missing from custom_providers/providers) must still
+    # not be treated as a stray vendor prefix -- it isn't a known Hermes
+    # provider/alias, but it also isn't the analytics-vendor case this
+    # fallback exists for. Match only the durable named-custom syntax
+    # (bare "custom" bucket, or "custom:<name>" per
+    # ``providers.custom_provider_slug``) -- a bare ``startswith("custom")``
+    # would also swallow unrelated unconfigured vendor names that merely
+    # happen to start with "custom" (e.g. "customproxy").
+    is_custom_provider_slug = canonical == "custom" or canonical.startswith("custom:")
+    if (
+        canonical not in _KNOWN_PROVIDER_NAMES
+        and not is_custom_provider_slug
+        and "/" in model_in
+    ):
         # Vendor prefix posing as a provider (analytics fallback). Resolve
         # against the user's current provider when it's an aggregator that
         # serves vendor-prefixed slugs; otherwise default to openrouter.
@@ -3647,9 +3696,11 @@ async def get_portal_status():
     cfg = load_config() or {}
     auth: Dict[str, Any] = {}
     try:
-        from hermes_cli.auth import get_nous_auth_status
+        from hermes_cli.auth import get_nous_auth_status_local
 
-        auth = get_nous_auth_status() or {}
+        # Read-only dashboard endpoint: refresh-free snapshot so polling
+        # never performs an OAuth refresh or burns a refresh token.
+        auth = get_nous_auth_status_local() or {}
     except Exception:
         auth = {}
 
@@ -4330,7 +4381,9 @@ async def check_hermes_update(force: bool = False):
 
 
 @app.post("/api/audio/transcribe")
-async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
+async def transcribe_audio_upload(
+    payload: AudioTranscriptionRequest, profile: Optional[str] = None
+):
     data_url = (payload.data_url or "").strip()
     if not data_url.startswith("data:") or "," not in data_url:
         raise HTTPException(status_code=400, detail="Invalid audio payload")
@@ -4380,8 +4433,17 @@ async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
         # and re-listens instead of surfacing a 400 on every quiet turn.
         from tools.voice_mode import transcribe_recording
 
+        def _transcribe_scoped():
+            # Home-only scope (contextvar), NOT _profile_scope: transcription
+            # blocks for the provider round-trip and _profile_scope holds a
+            # process-global skills lock for its entire body (see the MCP
+            # probe above). STT only needs config/.env resolution, which the
+            # contextvar override provides inside this worker thread.
+            with _config_profile_scope(profile):
+                return transcribe_recording(temp_path)
+
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, transcribe_recording, temp_path)
+        result = await loop.run_in_executor(None, _transcribe_scoped)
     except HTTPException:
         raise
     except Exception as exc:
@@ -4395,10 +4457,15 @@ async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
                 pass
 
     if not result.get("success"):
-        raise HTTPException(
-            status_code=400,
-            detail=result.get("error") or "Transcription failed",
-        )
+        err = result.get("error") or "Transcription failed"
+        # An empty transcript means no speech was detected — a normal outcome
+        # for VAD/continuous voice loops (e.g. a wake-word conversation
+        # re-listening on silence), not an error. Return an empty transcript so
+        # the client quietly re-listens instead of surfacing a "transcription
+        # failed" toast on every silent gap.
+        if "empty transcript" in err.lower():
+            return {"ok": True, "transcript": "", "provider": result.get("provider")}
+        raise HTTPException(status_code=400, detail=err)
 
     return {
         "ok": True,
@@ -4441,13 +4508,16 @@ def _voice_list_error_logged_once(signature: Optional[str]) -> bool:
 
 
 @app.get("/api/audio/elevenlabs/voices")
-async def get_elevenlabs_voices():
+async def get_elevenlabs_voices(profile: Optional[str] = None):
     """Return ElevenLabs voices when an API key is configured.
 
     The desktop UI uses this for the ``tts.elevenlabs.voice_id`` dropdown.
     Only non-secret voice metadata is returned; the API key stays server-side.
     """
-    api_key = (load_env().get("ELEVENLABS_API_KEY") or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+    # Config-only scope (await-safe): the key lookup reads the requested
+    # profile's .env, matching the profile the settings UI writes to.
+    with _config_profile_scope(profile):
+        api_key = (load_env().get("ELEVENLABS_API_KEY") or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
     if not api_key:
         return {"available": False, "voices": []}
 
@@ -4509,7 +4579,7 @@ async def get_elevenlabs_voices():
 
 
 @app.post("/api/audio/speak")
-async def speak_text(payload: TTSSpeakRequest):
+async def speak_text(payload: TTSSpeakRequest, profile: Optional[str] = None):
     """Synthesize speech and return audio as base64 data URL.
 
     Used by the desktop voice-conversation mode to play back assistant
@@ -4523,8 +4593,21 @@ async def speak_text(payload: TTSSpeakRequest):
 
     try:
         from tools.tts_tool import text_to_speech_tool
+
+        def _speak_scoped():
+            # Home-only scope (contextvar), NOT _profile_scope: synthesis
+            # blocks for the provider round-trip and only needs config/.env
+            # resolution, so the task-local override inside this worker
+            # thread is sufficient (same reasoning as the MCP probe scope).
+            with _config_profile_scope(profile):
+                return text_to_speech_tool(text)
+
         loop = asyncio.get_running_loop()
-        result_json = await loop.run_in_executor(None, text_to_speech_tool, text)
+        result_json = await loop.run_in_executor(None, _speak_scoped)
+    except HTTPException:
+        # _config_profile_scope raises 400/404 for a bad profile — pass it
+        # through instead of masking it as a 500 synthesis failure.
+        raise
     except Exception as exc:
         _log.exception("Desktop voice TTS failed")
         raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {exc}")
@@ -4621,15 +4704,22 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         return
     await ws.accept()
 
+    # Profile via query param, like /api/pty and /api/console: the provider
+    # chain + API keys must resolve from the requesting profile's config, not
+    # the dashboard's own. The streamer captures its config at resolve time,
+    # so scoping resolution scopes the whole session.
+    profile = (ws.query_params.get("profile") or "").strip() or None
+
     loop = asyncio.get_running_loop()
 
     def _resolve():
         from tools.tts_streaming import resolve_streaming_provider
         from tools.tts_tool import _get_provider, _load_tts_config, _resolve_max_text_length
 
-        cfg = _load_tts_config()
-        streamer = resolve_streaming_provider(cfg)
-        cap = _resolve_max_text_length(_get_provider(cfg), cfg) if streamer else 0
+        with _config_profile_scope(profile):
+            cfg = _load_tts_config()
+            streamer = resolve_streaming_provider(cfg)
+            cap = _resolve_max_text_length(_get_provider(cfg), cfg) if streamer else 0
         return streamer, cap
 
     try:
@@ -4803,6 +4893,7 @@ def get_sessions(
     archived: str = "exclude",
     order: str = "created",
     source: str = None,
+    sources: str = None,
     exclude_sources: str = None,
     cwd_prefix: str = None,
     full: bool = False,
@@ -4847,12 +4938,15 @@ def get_sessions(
             archived_only = archived == "only"
             include_archived = archived == "include"
             # Optional source scoping: ``source`` includes a single class,
+            # ``sources`` includes any of several comma-separated classes, and
             # ``exclude_sources`` (comma-separated) drops classes. The desktop
             # uses these to split recents (exclude=cron) from the cron-jobs
             # section (source=cron) into two independent lists.
-            exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+            source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
+            exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
             sessions = db.list_sessions_rich(
                 source=source or None,
+                sources=source_list or None,
                 exclude_sources=exclude_list or None,
                 cwd_prefix=(cwd_prefix or None),
                 limit=limit,
@@ -4868,6 +4962,7 @@ def get_sessions(
             )
             total = db.session_count(
                 source=source or None,
+                sources=source_list or None,
                 cwd_prefix=(cwd_prefix or None),
                 exclude_sources=exclude_list or None,
                 min_message_count=min_message_count,
@@ -4907,6 +5002,7 @@ def get_profiles_sessions(
     order: str = "recent",
     profile: str = "all",
     source: str = None,
+    sources: str = None,
     exclude_sources: str = None,
     full: bool = False,
 ):
@@ -4951,7 +5047,8 @@ def get_profiles_sessions(
     # the cron-jobs section passes source=cron — two independent lists so
     # newest cron sessions can't starve the recents page.
     source_filter = source or None
-    exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+    source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
+    exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
     # Over-fetch per profile so the merged+sorted window is correct for the
     # requested page. Capped so a huge profile can't blow up the response.
     per_profile = min(max(limit + offset, limit), 500)
@@ -4976,6 +5073,7 @@ def get_profiles_sessions(
         try:
             rows = db.list_sessions_rich(
                 source=source_filter,
+                sources=source_list or None,
                 exclude_sources=exclude_list or None,
                 limit=per_profile,
                 offset=0,
@@ -4988,6 +5086,7 @@ def get_profiles_sessions(
             )
             profile_total = db.session_count(
                 source=source_filter,
+                sources=source_list or None,
                 exclude_sources=exclude_list or None,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
@@ -5152,7 +5251,14 @@ def get_profiles_sessions_sidebar(
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
+async def search_sessions(
+    q: str = "",
+    limit: int = 20,
+    profile: Optional[str] = None,
+    source: str = None,
+    sources: str = None,
+    exclude_sources: str = None,
+):
     """Search sessions by ID plus full-text message content using FTS5.
 
     Direct session-id matches are surfaced first, then FTS message-content
@@ -5169,6 +5275,11 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
         db = _open_session_db_for_profile(profile)
         try:
             safe_limit = max(1, min(int(limit or 20), 100))
+            source_filter = source or None
+            source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
+            include_sources = [source_filter] if source_filter else (source_list or None)
+            exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
+            now = time.time()
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately
@@ -5253,15 +5364,52 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
                 if root in seen or len(seen) >= safe_limit:
                     return
                 payload = dict(payload)
-                payload["session_id"] = lineage_tip(root)
+                sid = lineage_tip(root)
+                payload["session_id"] = sid
                 payload["lineage_root"] = root
+                try:
+                    row = db.get_session_rich_row(sid)
+                except Exception:
+                    row = None
+                if row:
+                    payload.update(
+                        {
+                            "id": row.get("id") or sid,
+                            "source": row.get("source"),
+                            "model": row.get("model"),
+                            "title": row.get("title"),
+                            "started_at": row.get("started_at"),
+                            "ended_at": row.get("ended_at"),
+                            "last_active": row.get("last_active") or row.get("started_at"),
+                            "is_active": (
+                                row.get("ended_at") is None
+                                and (now - (row.get("last_active") or row.get("started_at") or 0)) < 300
+                            ),
+                            "message_count": row.get("message_count") or 0,
+                            "tool_call_count": row.get("tool_call_count") or 0,
+                            "input_tokens": row.get("input_tokens") or 0,
+                            "output_tokens": row.get("output_tokens") or 0,
+                            "preview": row.get("preview"),
+                            "parent_session_id": row.get("parent_session_id"),
+                            "archived": bool(row.get("archived")),
+                        }
+                    )
+                else:
+                    payload["id"] = sid
                 seen[root] = payload
 
             # Direct ID matches first: users often paste a session id from CLI,
             # logs, or another Hermes surface. FTS can't find those unless the
             # id happens to appear in message text. search_sessions_by_id is
             # SQL-bounded, so this stays cheap even with thousands of sessions.
-            for row in db.search_sessions_by_id(q, limit=safe_limit, include_archived=True):
+            for row in db.search_sessions_by_id(
+                q,
+                limit=safe_limit,
+                include_archived=True,
+                source=source_filter,
+                sources=source_list or None,
+                exclude_sources=exclude_list or None,
+            ):
                 sid = row.get("id")
                 preview = (row.get("preview") or "").strip()
                 snippet = preview or f"Session ID: {sid}"
@@ -5290,7 +5438,12 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
             # Over-fetch so lineage dedup can still surface `limit` distinct
             # conversations even when several hits collapse onto one root.
             fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(query=prefix_query, limit=fetch_limit)
+            matches = db.search_messages(
+                query=prefix_query,
+                source_filter=include_sources,
+                exclude_sources=exclude_list or None,
+                limit=fetch_limit,
+            )
 
             for m in matches:
                 if len(seen) >= safe_limit:
@@ -5879,24 +6032,38 @@ def _install_memory_provider_pip_dependencies(dependencies: List[str]) -> List[D
             _command_result(kind="pip", name=", ".join(dependencies), status="already_installed")
         ]
 
-    uv_path = shutil.which("uv")
-    if uv_path:
-        command: Any = [uv_path, "pip", "install", "--python", sys.executable, "--quiet", *missing]
-        display = f"uv pip install --python {sys.executable} {' '.join(missing)}"
-    else:
-        command = [sys.executable, "-m", "pip", "install", "--quiet", *missing]
-        display = f"{sys.executable} -m pip install {' '.join(missing)}"
-
+    # Route through the lazy-install pipeline (tools.lazy_deps.install_specs)
+    # instead of shelling out to pip against sys.executable directly. That
+    # pipeline is environment-aware: on hosted/immutable images the agent venv
+    # under /opt/hermes is sealed read-only, and installs must be redirected
+    # to the writable durable target on the data volume
+    # (HERMES_LAZY_INSTALL_TARGET, e.g. /opt/data/lazy-packages) — the same
+    # path every lazy backend already uses. A direct `pip install --python
+    # sys.executable` on those images fails with a permission error (NS-605).
+    # install_specs also activates the target on sys.path post-install so the
+    # availability recheck below sees the new packages without a restart.
     try:
-        completed = _run_setup_command(command, display=display, timeout=240)
+        from tools.lazy_deps import install_specs
+
+        outcome = install_specs(missing, timeout=240)
     except Exception as exc:
         return [
             _command_result(
                 kind="pip",
                 name=", ".join(missing),
                 status="failed",
-                command=display,
                 error=str(exc),
+            )
+        ]
+
+    if outcome.blocked:
+        return [
+            _command_result(
+                kind="pip",
+                name=", ".join(missing),
+                status="failed",
+                command=outcome.command,
+                error=outcome.reason,
             )
         ]
 
@@ -5904,9 +6071,14 @@ def _install_memory_provider_pip_dependencies(dependencies: List[str]) -> List[D
         _command_result(
             kind="pip",
             name=", ".join(missing),
-            status="installed" if completed.returncode == 0 else "failed",
-            command=display,
-            completed=completed,
+            status="installed" if outcome.ok else "failed",
+            command=outcome.command,
+            completed=subprocess.CompletedProcess(
+                args=outcome.command,
+                returncode=0 if outcome.ok else 1,
+                stdout=outcome.stdout,
+                stderr=outcome.stderr,
+            ),
         )
     ]
 
@@ -7157,7 +7329,19 @@ def _apply_model_assignment_sync(
         new_provider = provider.strip().lower()
         slot_cfg["provider"] = provider
         slot_cfg["model"] = model
-        if new_provider != prev_provider and new_provider != "custom":
+        if base_url:
+            # Sibling of the main-slot endpoint handling (#65254): an aux
+            # assignment for a custom/local endpoint must carry its own
+            # base_url, or the slot silently rebinds to whatever
+            # model.base_url happens to hold — and breaks entirely once the
+            # main slot switches away and clears it. The auxiliary resolver
+            # already reads auxiliary.<task>.base_url/api_key
+            # (_resolve_task_provider_model), so persisting them here is
+            # what actually wires the endpoint in.
+            slot_cfg["base_url"] = base_url
+            if api_key:
+                slot_cfg["api_key"] = api_key
+        elif new_provider != prev_provider and new_provider != "custom":
             slot_cfg.pop("base_url", None)
             clear_model_endpoint_credentials(slot_cfg)
         aux[slot] = slot_cfg
@@ -10149,7 +10333,9 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
     try:
         from hermes_cli import auth as hauth
         if provider_id == "nous":
-            raw = hauth.get_nous_auth_status()
+            # Read-only accounts-tab card: refresh-free snapshot so listing
+            # providers never performs an OAuth refresh.
+            raw = hauth.get_nous_auth_status_local()
             return {
                 "logged_in": bool(raw.get("logged_in")),
                 "source": "nous_portal",
@@ -11076,6 +11262,7 @@ def _xai_device_poller(session_id: str) -> None:
         _save_xai_oauth_tokens,
         _xai_oauth_discovery,
         _xai_oauth_poll_device_token,
+        mark_provider_active_if_unset,
         unsuppress_credential_source,
     )
 
@@ -11112,7 +11299,13 @@ def _xai_device_poller(session_id: str) -> None:
                 discovery=discovery,
                 last_refresh=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 auth_mode="oauth_device_code",
+                # Persist credentials without hijacking an existing active
+                # chat provider.
+                set_active=False,
             )
+            # Mirror `hermes auth add xai-oauth`: first credential may become
+            # active when none is set yet; never overwrite an existing choice.
+            mark_provider_active_if_unset("xai-oauth")
             # The singleton write above is the single source of truth: the
             # credential-pool load seeds it as the canonical ``device_code``
             # entry. Do NOT also insert a parallel ``manual:dashboard_*`` pool
@@ -11673,9 +11866,10 @@ async def get_session_stats(profile: Optional[str] = None):
         messages = db.message_count()
         by_source: Dict[str, int] = {}
         try:
-            for s in db.list_sessions_rich(limit=10000, include_archived=True, compact_rows=True):
-                src = str(s.get("source") or "cli")
-                by_source[src] = by_source.get(src, 0) + 1
+            by_source = db.session_count_by_source(
+                include_archived=True,
+                exclude_children=True,
+            )
         except Exception:
             pass
         return {
@@ -13168,15 +13362,18 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
         # (Figma's MCP catalog, etc.) 403 the register call before any
         # authorization URL exists — surface what's actually happening
         # instead of a bare "403 Forbidden".
-        lowered = msg.lower()
-        if "403" in msg and ("regist" in lowered or "forbidden" in lowered):
-            msg = (
-                f"'{flow.server_name}' only allows pre-approved OAuth clients — it rejected "
-                "client registration (403), so no browser flow can start. "
-                "Options: add a pre-registered client to this server's entry "
-                "(oauth: {client_id: ..., client_secret: ...}), or use the "
-                "provider's stdio / API-key server instead."
+        try:
+            from tools.mcp_oauth import humanize_oauth_registration_error
+
+            humanized = humanize_oauth_registration_error(
+                flow.server_name,
+                exc,
+                server_url=cfg.get("url") if isinstance(cfg, dict) else None,
             )
+            if humanized:
+                msg = humanized
+        except Exception:
+            pass
         flow.mark_error(msg)
     finally:
         flow.mark_worker_done()
@@ -14564,7 +14761,6 @@ _SKILL_HUB_SOURCE_LABELS = {
     "url": "Direct URL",
     "github": "GitHub",
     "clawhub": "ClawHub",
-    "claude-marketplace": "Claude Marketplace",
     "lobehub": "LobeHub",
     "browse-sh": "browse.sh",
 }
@@ -14666,7 +14862,7 @@ async def list_skills_hub_sources(profile: Optional[str] = None):
         # calls per keystroke. Keep this set in sync with that function's
         # ``_api_source_ids``.
         _api_source_ids = frozenset(
-            {"github", "skills-sh", "clawhub", "claude-marketplace", "lobehub", "well-known"}
+            {"github", "skills-sh", "clawhub", "lobehub", "well-known"}
         )
         for entry in out:
             entry["searchable"] = not (index_available and entry["id"] in _api_source_ids)
@@ -20204,6 +20400,7 @@ def start_server(
         # reaped via the WebSocketDisconnect → disconnect/reap path.
         ws_ping_interval=None if _is_loopback else 20.0,
         ws_ping_timeout=None if _is_loopback else 20.0,
+        ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
     )
     server = uvicorn.Server(config)
 

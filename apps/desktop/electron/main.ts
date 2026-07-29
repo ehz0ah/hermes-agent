@@ -64,10 +64,12 @@ import {
   profileRemoteOverride,
   profileSshOverride,
   resolveAuthMode,
+  resolveProfileBackendRoute,
   resolveTestWsUrl,
   savedProfileSsh,
   tokenPreview
 } from './connection-config'
+import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import {
@@ -79,6 +81,7 @@ import {
   shouldRemoveAppBundle,
   uninstallArgsForMode
 } from './desktop-uninstall'
+import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
 import { findGitBash as _findGitBash } from './find-git-bash'
@@ -112,9 +115,13 @@ import {
   switchBranch
 } from './git-worktree-ops'
 import {
-  DATA_URL_READ_MAX_BYTES,
+  ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
+  clampDataUrlReadMaxMb,
+  DATA_URL_READ_DEFAULT_MAX_MB,
+  dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret as encryptDesktopSecretStrict,
+  readFileDataUrlForIpc,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
@@ -142,9 +149,16 @@ import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
+import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
+import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
-import { RemoteLivenessTracker, RemoteRevalidationCoordinator, revalidateRemoteConnection } from './remote-liveness'
+import {
+  RemoteLivenessTracker,
+  RemoteRevalidationCoordinator,
+  revalidatePooledRemoteBackends,
+  revalidateRemoteConnection
+} from './remote-liveness'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -178,6 +192,7 @@ import {
 } from './update-relaunch'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
+import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import {
   computeWindowOptions,
@@ -261,6 +276,29 @@ if (REMOTE_DISPLAY_REASON) {
   console.log(
     `[hermes] remote display detected (${REMOTE_DISPLAY_REASON}); disabling GPU hardware acceleration to prevent flicker`
   )
+}
+
+// Renderer debugging port. On for dev-server runs (`hgui` / `npm run dev`) so
+// the CDP tooling in scripts/ can attach; never for a packaged build — see
+// electron/dev-cdp.ts. Must run before app `ready` like the switches above;
+// Chromium binds it at launch.
+const DEV_CDP = resolveDevCdpPort({ env: process.env, isPackaged: IS_PACKAGED, devServer: DEV_SERVER })
+
+if (DEV_CDP.port) {
+  app.commandLine.appendSwitch('remote-debugging-port', String(DEV_CDP.port))
+  // Loopback only. Chromium already defaults to 127.0.0.1, but say it out loud
+  // so a future edit can't widen it by omission.
+  app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1')
+  console.log(
+    `[hermes] renderer debugging on http://127.0.0.1:${DEV_CDP.port} — anything that can reach it ` +
+      'can run code in the renderer. HERMES_DESKTOP_CDP_PORT=off to disable.'
+  )
+} else {
+  const why = describeDevCdpDecision(DEV_CDP)
+
+  if (why) {
+    console.warn(`[hermes] ${why}`)
+  }
 }
 
 // WSLg: Chromium blocklists the Mesa vGPU → software compositing → typing lag.
@@ -599,6 +637,10 @@ const DESKTOP_LOG_DISCARD_BYTES = DESKTOP_LOG_MAX_BYTES * 4
 const desktopLogBackupPath = n => `${DESKTOP_LOG_PATH}.${n}`
 const BOOT_FAKE_MODE = process.env.HERMES_DESKTOP_BOOT_FAKE === '1'
 const BOOT_FAKE_ERROR = process.env.HERMES_DESKTOP_BOOT_FAKE_ERROR || ''
+// Automated teardown (Playwright's app.close(), harness scripts) quits with
+// nobody to answer a modal, so the active-work confirmation would hang the
+// caller instead of letting the process exit. Force quits set this.
+const SKIP_QUIT_CONFIRM = process.env.HERMES_DESKTOP_SKIP_QUIT_CONFIRM === '1'
 
 const BOOT_FAKE_STEP_MS = (() => {
   const raw = Number.parseInt(String(process.env.HERMES_DESKTOP_BOOT_FAKE_STEP_MS || ''), 10)
@@ -923,7 +965,7 @@ app.setAboutPanelOptions({
 
 // Custom scheme for streaming local media (video/audio) into the renderer.
 // Reading large media through `readFileDataUrl` failed: it base64-loads the
-// whole file into memory and is hard-capped at DATA_URL_READ_MAX_BYTES (16 MB),
+// whole file into memory and is hard-capped (default 16 MB, Settings → Chat),
 // so any non-trivial video silently refused to load. Streaming via a protocol
 // handler removes the size cap and gives the <video> element seekable,
 // range-aware playback. Must be registered before the app is ready.
@@ -1210,6 +1252,14 @@ function rememberLog(chunk) {
   }
 
   scheduleDesktopLogFlush()
+}
+
+installCrashForensics({ flush: flushDesktopLogBufferSync, log: rememberLog })
+
+// A rejected loadURL leaves a blank window and, unhandled, no trace anywhere
+// the user can send us. `label` names the surface so the log says which one.
+function loadWindowUrl(win, url, label) {
+  win.loadURL(url).catch(error => rememberLog(`${label} failed to load: ${describeCrashReason(error)}`))
 }
 
 function openExternalUrl(rawUrl) {
@@ -2494,6 +2544,12 @@ let updateInFlight = false
 // actually dies and the hand-off script can proceed immediately.
 let isQuittingForHandoff = false
 
+// Quit-guard latches: one while the confirmation is on screen (a second
+// Cmd-Q must not stack dialogs), one after the user has said "quit anyway"
+// (the app.quit() that follows re-enters before-quit and must pass through).
+let quitPromptOpen = false
+let quitConfirmedWithActiveWork = false
+
 // Resolve the staged updater binary. The Tauri installer copies itself to
 // HERMES_HOME/hermes-setup.exe on a successful install (see
 // apps/bootstrap-installer paths::copy_self_to_hermes_home). That binary owns
@@ -2821,6 +2877,39 @@ async function applyUpdates(opts = {}) {
       startHermes().catch(() => {})
 
       return { ok: false, error: message }
+    }
+
+    // Preflight: after releasing our own backends, check for remaining
+    // Hermes processes running from this venv.  The updater normally refuses
+    // when it detects a holder, but because the updater is spawned detached
+    // with stdio:ignore, the user never sees that refusal and the update
+    // silently fails.  This preflight detects holders early and gives the
+    // user an actionable error.  Windows-only; the .pyd lock hazard is a
+    // Windows phenomenon.  ALL failures (blocked, missing python, timeout,
+    // malformed output, missing psutil) abort the handoff — never proceed
+    // to the detached updater when the venv state is unknown.
+    if (IS_WINDOWS) {
+      const scanOutcome = await scanVenvBlockers(updateRoot)
+
+      if (scanOutcome.kind === 'blocked') {
+        const message = formatBlockerMessage(scanOutcome.result)
+
+        rememberLog(`[updates] venv-blocked: ${scanOutcome.result.processes.length} process(es) hold the install`)
+        emitUpdateProgress({ stage: 'error', message, percent: null })
+        startHermes().catch(() => {})
+
+        return { ok: false, error: 'venv-blocked', message }
+      }
+
+      if (scanOutcome.kind === 'probe-failure') {
+        const message = formatProbeFailedMessage()
+
+        rememberLog(`[updates] venv-blocker probe failed: ${scanOutcome.error}`)
+        emitUpdateProgress({ stage: 'error', message, percent: null })
+        startHermes().catch(() => {})
+
+        return { ok: false, error: 'venv-probe-failed', message }
+      }
     }
 
     // Detached so the updater outlives this process — it needs us GONE before
@@ -4840,6 +4929,45 @@ function closePreviewWatchers() {
   }
 }
 
+/** Watch a DIRECTORY for entry churn (folders appearing/vanishing) — the
+ *  disk-plugin door's "new plugin folder" signal, replacing the renderer's 5s
+ *  readdir poll. Same registry + change channel as the preview file watchers
+ *  (the renderer reconciles on any tick; per-file edits stay on their own
+ *  watches), so stopPreviewFileWatch/closePreviewWatchers manage these too. */
+function watchDirectory(rawDir) {
+  const watchDir = path.resolve(String(rawDir || ''))
+
+  if (!fs.existsSync(watchDir) || !fs.statSync(watchDir).isDirectory()) {
+    throw new Error(`Not a directory: ${watchDir}`)
+  }
+
+  const id = crypto.randomBytes(12).toString('base64url')
+  let timer = null
+
+  const watcher = fs.watch(watchDir, () => {
+    if (timer) {
+      clearTimeout(timer)
+    }
+
+    timer = setTimeout(() => {
+      timer = null
+      sendPreviewFileChanged({ id, path: watchDir, url: pathToFileURL(watchDir).toString() })
+    }, PREVIEW_WATCH_DEBOUNCE_MS)
+  })
+
+  previewWatchers.set(id, {
+    close: () => {
+      if (timer) {
+        clearTimeout(timer)
+      }
+
+      watcher.close()
+    }
+  })
+
+  return { id, path: watchDir }
+}
+
 // Best-effort read of a gateway's advertised auth providers, cached per base
 // URL for the life of the process. Used by the oauth pre-flight guard to tell
 // a password-provider gateway (which cannot satisfy the bearer/cookie checks
@@ -5136,7 +5264,7 @@ function buildApplicationMenu() {
         label: 'Actual Size',
         accelerator: 'CommandOrControl+0',
         click: () => {
-          setAndPersistZoomLevel(mainWindow, 0)
+          setAndPersistZoomLevel(mainWindow, DEFAULT_ZOOM_LEVEL)
         }
       },
       {
@@ -5144,7 +5272,7 @@ function buildApplicationMenu() {
         accelerator: 'CommandOrControl+Plus',
         click: () => {
           if (mainWindow && !mainWindow.isDestroyed()) {
-            setAndPersistZoomLevel(mainWindow, mainWindow.webContents.getZoomLevel() + 0.1)
+            setAndPersistZoomLevel(mainWindow, mainWindow.webContents.getZoomLevel() + ZOOM_STEP)
           }
         }
       },
@@ -5153,7 +5281,7 @@ function buildApplicationMenu() {
         accelerator: 'CommandOrControl+-',
         click: () => {
           if (mainWindow && !mainWindow.isDestroyed()) {
-            setAndPersistZoomLevel(mainWindow, mainWindow.webContents.getZoomLevel() - 0.1)
+            setAndPersistZoomLevel(mainWindow, mainWindow.webContents.getZoomLevel() - ZOOM_STEP)
           }
         }
       },
@@ -5232,8 +5360,10 @@ function installPreviewShortcut(window) {
 // read it back on did-finish-load to re-apply after reloads or crash recovery.
 import {
   applyZoomLevel,
+  DEFAULT_ZOOM_LEVEL,
   installZoomReassertOnWindowEvents,
   percentToZoomLevel,
+  ZOOM_STEP,
   ZOOM_STORAGE_KEY,
   zoomLevelToPercent,
   zoomWiringForWindowKind
@@ -5277,31 +5407,33 @@ function restorePersistedZoomLevel(window) {
     return
   }
 
-  // Fall back to localStorage for installs that predate zoom-state.json,
-  // migrating the value into the JSON store on first read.
+  // No JSON yet: paint the shipped default immediately so a fresh install
+  // doesn't flash Chromium 100%, then try localStorage for pre-JSON installs
+  // and overwrite if a legacy value is there.
+  applyZoomLevel(window.webContents, DEFAULT_ZOOM_LEVEL)
+
   window.webContents
     .executeJavaScript(
       `(() => { try { return localStorage.getItem(${JSON.stringify(ZOOM_STORAGE_KEY)}) } catch { return null } })()`
     )
     .then(stored => {
-      if (stored == null || !window || window.isDestroyed()) {
+      if (!window || window.isDestroyed()) {
         return
       }
 
-      // Notify the renderer too — otherwise the Appearance UI Scale control
-      // can stay stuck at 100% even though the window zoom was restored.
-      const applied = applyZoomLevel(window.webContents, Number(stored))
+      const level = stored == null ? DEFAULT_ZOOM_LEVEL : Number(stored)
+      const applied = applyZoomLevel(window.webContents, level)
       writeZoomState(applied)
     })
     .catch(error => rememberLog(`[zoom] restore failed: ${error?.message || error}`))
 }
 
 function installZoomShortcuts(window) {
-  // Override Ctrl/Cmd + +/-/0 with half the default zoom step (0.1 vs 0.2).
-  // The menu items handle this on macOS (where the menu is always present),
-  // but on Linux/Windows the menu is null and Chromium's default handler
-  // would use the full 0.2 step, so we intercept here for consistency.
-  const ZOOM_STEP = 0.1
+  // Override Ctrl/Cmd + +/-/0 with half Chromium's default zoom step (ZOOM_STEP
+  // is 0.1 vs Chromium's 0.2). The menu items handle this on macOS (where the
+  // menu is always present), but on Linux/Windows the menu is null and
+  // Chromium's default handler would use the full 0.2 step, so we intercept
+  // here for consistency. Ctrl/Cmd+0 resets to DEFAULT_ZOOM_LEVEL, not Chromium 0.
   window.webContents.on('before-input-event', (event, input) => {
     const mod = IS_MAC ? input.meta : input.control
 
@@ -5317,7 +5449,7 @@ function installZoomShortcuts(window) {
       }
 
       event.preventDefault()
-      setAndPersistZoomLevel(window, 0)
+      setAndPersistZoomLevel(window, DEFAULT_ZOOM_LEVEL)
     } else if (key === '=' || key === '+') {
       // Zoom-in must accept the shift modifier: on US layouts Plus is
       // physically Shift+=, so Cmd+Plus arrives as Cmd+Shift+'+' (or '='
@@ -5453,18 +5585,22 @@ function installContextMenu(window) {
   })
 }
 
-// Microphone capture for the voice composer. The renderer drives mic access
+// Microphone and camera capture. The voice composer drives mic access and
+// renderer features (e.g. desktop plugins) can drive camera access, both
 // through getUserMedia, which Chromium gates behind these two session hooks.
 //
 // The naive `details.mediaTypes.includes('audio')` check works on macOS but
-// breaks on Windows: Chromium frequently fires the mic permission request with
-// an empty/undefined `mediaTypes`, so the strict check denies it and
-// getUserMedia throws NotAllowedError ("Microphone permission was denied").
-// We therefore treat an audio-capture request as allowed whenever it's the
-// 'media'/'audioCapture' permission AND mediaTypes either includes 'audio' OR
-// is empty/absent (the Windows case). Video is still denied.
-function isAudioCapturePermission(permission, details) {
-  if (permission === 'audioCapture') {
+// breaks on Windows: Chromium frequently fires the request with an empty or
+// undefined `mediaTypes`, so a strict check denies it and getUserMedia throws
+// NotAllowedError. We therefore allow the capture permissions and treat absent
+// metadata as allowed.
+//
+// Granting here is not the last gate: the OS still applies its own capture
+// permission (macOS TCC prompts on first use, per the NSMicrophone/NSCamera
+// usage strings), so the user keeps a real allow/deny and can revoke it in
+// System Settings afterwards.
+function isMediaCapturePermission(permission, details) {
+  if (permission === 'audioCapture' || permission === 'videoCapture') {
     return true
   }
 
@@ -5474,38 +5610,31 @@ function isAudioCapturePermission(permission, details) {
 
   const mediaTypes = details?.mediaTypes
 
+  // Windows: mediaTypes is often empty for a capture request. Don't deny on
+  // missing metadata.
   if (!Array.isArray(mediaTypes) || mediaTypes.length === 0) {
-    // Windows: mediaTypes is often empty for a mic request. Don't deny on
-    // missing metadata. (A video request would carry mediaTypes:['video'].)
     return true
   }
 
-  return mediaTypes.includes('audio') && !mediaTypes.includes('video')
+  return mediaTypes.includes('audio') || mediaTypes.includes('video')
 }
 
 function installMediaPermissions() {
   // Async request handler: the prompt-style path (most platforms).
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
-    callback(isAudioCapturePermission(permission, details))
+    callback(isMediaCapturePermission(permission, details))
   })
 
   // Synchronous check handler: Chromium consults this for getUserMedia on
   // Windows in addition to (or instead of) the request handler. Without it,
-  // the check defaults to false and the mic is denied before the request
+  // the check defaults to false and capture is denied before the request
   // handler ever runs.
-  session.defaultSession.setPermissionCheckHandler((_webContents, permission, _origin, details) => {
-    if (permission === 'media' || permission === ('audioCapture' as any) /* todo: is this needed? */) {
-      // details.mediaType is a single string here (not the mediaTypes array).
-      const mediaType = details?.mediaType
-
-      if (mediaType === 'video') {
-        return false
-      }
-
-      return true
-    }
-
-    return false
+  session.defaultSession.setPermissionCheckHandler((_webContents, permission) => {
+    return (
+      permission === 'media' ||
+      permission === ('audioCapture' as any) /* todo: is this needed? */ ||
+      permission === ('videoCapture' as any)
+    )
   })
 }
 
@@ -7726,15 +7855,28 @@ function primaryProfileKey() {
   return readActiveDesktopProfile() || 'default'
 }
 
-// Resolve a backend connection for the given profile. Routes the primary
-// profile to startHermes() (the window backend: boot UI, bootstrap, remote
-// mode), and any OTHER profile to a lazily-spawned pool backend. An empty /
-// unknown profile resolves to the primary, so all legacy callers are unchanged.
+// Options describing the current connection setup for `resolveProfileBackendRoute`.
+function profileRouteOptions(profile) {
+  return {
+    globalRemote: globalRemoteActive(),
+    primaryProfile: primaryProfileKey(),
+    profileRemoteOverride: Boolean(profileHasRemoteOverride(profile))
+  }
+}
+
+// Resolve a backend connection for the given profile, per the routing table in
+// resolveProfileBackendRoute(). An empty / unknown profile resolves to the
+// primary, so legacy callers are unchanged.
 async function ensureBackend(profile) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+  const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
 
-  if (key === primaryProfileKey()) {
-    return startHermes()
+  if (route.backend === 'primary') {
+    const connection = await startHermes()
+
+    // A shared backend still owes the caller its profile scope, so renderer-side
+    // WebSocket, filesystem, and cache routing target the selected profile.
+    return route.descriptorProfile ? { ...connection, profile: route.descriptorProfile } : connection
   }
 
   const existing = backendPool.get(key)
@@ -7747,7 +7889,15 @@ async function ensureBackend(profile) {
 
   evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
 
-  const entry = { process: null, port: null, token: null, connectionPromise: null, lastActiveAt: Date.now() }
+  const entry = {
+    process: null,
+    port: null,
+    token: null,
+    connectionPromise: null,
+    lastActiveAt: Date.now(),
+    remoteBaseUrl: null
+  }
+
   entry.connectionPromise = spawnPoolBackend(key, entry).catch(error => {
     backendPool.delete(key)
     throw error
@@ -7843,6 +7993,10 @@ async function spawnPoolBackend(profile, entry) {
 
   if (remote) {
     await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
+
+    // Recorded on the entry so revalidation can probe this descriptor without
+    // awaiting connectionPromise, which may still be pending for a sibling.
+    entry.remoteBaseUrl = remote.baseUrl
 
     return {
       ...remote,
@@ -7941,6 +8095,17 @@ async function spawnPoolBackend(profile, entry) {
 
   entry.token = authToken
 
+  // Verify the WebSocket session token before declaring backend ready.
+  // HTTP /api/status can pass while WS auth fails (separate transport, separate guards).
+  const wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`
+  const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+
+  if (!wsProbe.ok) {
+    throw new Error(
+      `Hermes backend for profile "${profile}" is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
+    )
+  }
+
   return {
     baseUrl,
     mode: 'local',
@@ -7948,7 +8113,7 @@ async function spawnPoolBackend(profile, entry) {
     authMode: 'token',
     token: authToken,
     profile,
-    wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`,
+    wsUrl,
     logs: hermesLog.slice(-80),
     ...getWindowState()
   }
@@ -8266,6 +8431,16 @@ async function startHermes() {
       rememberLog
     })
 
+    // Verify the WebSocket session token before declaring backend ready.
+    const wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`
+    const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+
+    if (!wsProbe.ok) {
+      throw new Error(
+        `Local Hermes backend is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
+      )
+    }
+
     updateBootProgress({
       phase: 'backend.ready',
       message: 'Hermes backend is ready. Finalizing desktop startup',
@@ -8280,7 +8455,7 @@ async function startHermes() {
       source: 'local',
       authMode: 'token',
       token: authToken,
-      wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`,
+      wsUrl,
       logs: hermesLog.slice(-80),
       ...getWindowState()
     }
@@ -8434,12 +8609,14 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
 
   wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
 
-  win.loadURL(
+  loadWindowUrl(
+    win,
     buildSessionWindowUrl(sessionId, {
       devServer: DEV_SERVER,
       rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
       watch
-    })
+    }),
+    'Session window'
   )
 
   return win
@@ -8519,11 +8696,7 @@ function createInstanceWindow() {
     instanceWindows.delete(win)
   })
 
-  if (DEV_SERVER) {
-    win.loadURL(DEV_SERVER)
-  } else {
-    win.loadURL(pathToFileURL(resolveRendererIndex()).toString())
-  }
+  loadWindowUrl(win, DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString(), 'Instance window')
 
   return win
 }
@@ -8635,7 +8808,7 @@ function spawnPetOverlayWindow(bounds) {
     }
   })
 
-  win.loadURL(petOverlayUrl())
+  loadWindowUrl(win, petOverlayUrl(), 'Pet overlay')
 
   return win
 }
@@ -8787,7 +8960,7 @@ function spawnQuickEntryWindow() {
     }
   })
 
-  win.loadURL(quickEntryUrl())
+  loadWindowUrl(win, quickEntryUrl(), 'Quick entry')
 
   return win
 }
@@ -9081,11 +9254,7 @@ function createWindow() {
     rememberLog(`[renderer console] ${text} (${src}:${lineNo})`)
   })
 
-  if (DEV_SERVER) {
-    mainWindow.loadURL(DEV_SERVER)
-  } else {
-    mainWindow.loadURL(pathToFileURL(resolveRendererIndex()).toString())
-  }
+  loadWindowUrl(mainWindow, DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString(), 'Renderer')
 
   // Start the Python backend NOW, in parallel with the renderer load — not on
   // did-finish-load. The backend cold boot (spawn → port announce → /api/status)
@@ -9117,6 +9286,8 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
   const connectionPromise = backendConnectionState.getPromise()
 
   if (!connectionPromise) {
+    await revalidatePool()
+
     return { ok: true, rebuilt: false }
   }
 
@@ -9124,14 +9295,17 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
   // share this primary connection. Coalesce simultaneous requests so one outage
   // produces one failure observation rather than exhausting the whole streak.
   return remoteRevalidation.run(connectionPromise, async () => {
-    const result = await revalidateRemoteConnection({
-      connectionPromise,
-      currentConnectionPromise: () => backendConnectionState.getPromise(),
-      log: rememberLog,
-      probe: fetchPublicJson,
-      resetConnection: resetHermesConnection,
-      tracker: remoteLiveness
-    })
+    const [result] = await Promise.all([
+      revalidateRemoteConnection({
+        connectionPromise,
+        currentConnectionPromise: () => backendConnectionState.getPromise(),
+        log: rememberLog,
+        probe: fetchPublicJson,
+        resetConnection: resetHermesConnection,
+        tracker: remoteLiveness
+      }),
+      revalidatePool()
+    ])
 
     // A rebuilt SSH connection must also tear down its tunnel/master before the
     // renderer re-dials (which only happens after this handler resolves), so the
@@ -9149,6 +9323,20 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
     return result
   })
 })
+
+// Pooled remote descriptors get the same treatment as the primary: they have no
+// child process to signal their host's death, and the renderer's keepalive touch
+// spares them from the idle reaper, so nothing else can retire a dead one.
+function revalidatePool() {
+  return revalidatePooledRemoteBackends({
+    entries: backendPool.entries(),
+    log: rememberLog,
+    probe: fetchPublicJson,
+    stopBackend: stopPoolBackend,
+    tracker: remoteLiveness
+  })
+}
+
 ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
   touchPoolBackend(profile)
 
@@ -9177,7 +9365,8 @@ ipcMain.handle('hermes:window:openInstance', async () => {
 // shortcuts and the View menu. Reads and writes target the asking window.
 ipcMain.handle('hermes:zoom:get', event => {
   const window = BrowserWindow.fromWebContents(event.sender)
-  const level = window && !window.isDestroyed() ? window.webContents.getZoomLevel() : 0
+
+  const level = window && !window.isDestroyed() ? window.webContents.getZoomLevel() : DEFAULT_ZOOM_LEVEL
 
   return { level, percent: zoomLevelToPercent(level) }
 })
@@ -9775,12 +9964,7 @@ async function fetchProfilesSessionSlice(searchParams, remoteProfiles) {
       return remoteSessionList(requested, searchParams)
     }
 
-    const primary = await ensureBackend(null)
-
-    return fetchJson(`${primary.baseUrl}/api/profiles/sessions?${searchParams}`, primary.token, {
-      method: 'GET',
-      timeoutMs: DEFAULT_FETCH_TIMEOUT_MS
-    }).catch(() => ({ sessions: [], total: 0, profile_totals: {} }))
+    return fetchPrimaryProfileSessions(searchParams, fetchJsonForProfile)
   }
 
   return mergeRemoteProfileSessions(searchParams, remoteProfiles)
@@ -9795,12 +9979,7 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   const offset = Math.max(0, Number(searchParams.get('offset')) || 0)
   const order = searchParams.get('order') === 'created' ? 'started_at' : 'last_active'
 
-  const primary = await ensureBackend(null)
-
-  const base = (await fetchJson(`${primary.baseUrl}/api/profiles/sessions?${searchParams}`, primary.token, {
-    method: 'GET',
-    timeoutMs: DEFAULT_FETCH_TIMEOUT_MS
-  }).catch(() => ({ sessions: [], total: 0, profile_totals: {} }))) as any
+  const base = (await fetchPrimaryProfileSessions(searchParams, fetchJsonForProfile)) as any
 
   // Over-fetch each remote from offset 0 (limit+offset rows) so the merged window
   // is correct for this page — mirrors the primary's per-profile over-fetch.
@@ -9859,10 +10038,7 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   const connection = await ensureBackend(routeProfile)
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
-  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, {
-    globalRemote: globalRemoteActive(),
-    profileRemoteOverride: profileHasRemoteOverride(profile)
-  })
+  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
 
   const url = `${connection.baseUrl}${requestPath}`
 
@@ -9971,15 +10147,71 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   return true
 })
 
+// Data-URL file load cap (composer attach + local previews). Main owns the
+// persisted MB value so every IPC read honours Settings → Chat without the
+// renderer having to pass maxBytes on each call. Default is 16 MB; clamp
+// lives in hardening.ts.
+const DATA_URL_READ_MAX_CONFIG_PATH = path.join(app.getPath('userData'), 'data-url-read-max.json')
+
+function readPersistedDataUrlReadMaxMb() {
+  try {
+    return clampDataUrlReadMaxMb(JSON.parse(fs.readFileSync(DATA_URL_READ_MAX_CONFIG_PATH, 'utf8')).maxMb)
+  } catch {
+    return DATA_URL_READ_DEFAULT_MAX_MB
+  }
+}
+
+let dataUrlReadMaxMb = readPersistedDataUrlReadMaxMb()
+
+function persistDataUrlReadMaxMb(maxMb) {
+  const next = clampDataUrlReadMaxMb(maxMb)
+  dataUrlReadMaxMb = next
+
+  try {
+    fs.mkdirSync(path.dirname(DATA_URL_READ_MAX_CONFIG_PATH), { recursive: true })
+    fs.writeFileSync(DATA_URL_READ_MAX_CONFIG_PATH, JSON.stringify({ maxMb: next }, null, 2), 'utf8')
+  } catch (error) {
+    rememberLog(`[data-url-read-max] write failed: ${error.message}`)
+  }
+
+  return next
+}
+
+ipcMain.handle('hermes:data-url-read-max:get', () => ({
+  maxMb: dataUrlReadMaxMb,
+  // Keep the default bytes constant visible for tests / diagnostics.
+  defaultMaxMb: DATA_URL_READ_DEFAULT_MAX_MB,
+  maxBytes: dataUrlReadMaxBytesFromMb(dataUrlReadMaxMb)
+}))
+
+ipcMain.handle('hermes:data-url-read-max:set', (_event, maxMb) => {
+  const next = persistDataUrlReadMaxMb(maxMb)
+
+  return {
+    maxMb: next,
+    defaultMaxMb: DATA_URL_READ_DEFAULT_MAX_MB,
+    maxBytes: dataUrlReadMaxBytesFromMb(next)
+  }
+})
+
 ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
-  const { resolvedPath } = await resolveReadableFileForIpc(filePath, {
-    maxBytes: DATA_URL_READ_MAX_BYTES,
+  return readFileDataUrlForIpc(filePath, {
+    maxBytes: dataUrlReadMaxBytesFromMb(dataUrlReadMaxMb),
+    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'File preview' })),
     purpose: 'File preview'
   })
+})
 
-  const data = await fs.promises.readFile(resolvedPath)
-
-  return `data:${mimeTypeForPath(resolvedPath)};base64,${data.toString('base64')}`
+// Remote attachment transfer is independent of the preview / Settings path.
+// Keep a finite cap so Electron + base64 memory stays bounded while archives
+// can exceed the default 16 MiB preview ceiling (and still fit the gateway
+// WebSocket frame limit after base64 expansion).
+ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
+  return readFileDataUrlForIpc(filePath, {
+    maxBytes: ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
+    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'Attachment upload' })),
+    purpose: 'Attachment upload'
+  })
 })
 
 ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
@@ -10050,6 +10282,12 @@ ipcMain.handle('hermes:writeClipboard', (_event, text) => {
   return true
 })
 
+// Paired reader for the GUI terminal's paste chord: the renderer's
+// navigator.clipboard.readText() throws "Document is not focused" whenever a
+// portaled overlay has focus, and there's no way to route a read through the
+// canvas. The main process has no such gate.
+ipcMain.handle('hermes:readClipboard', () => clipboard.readText())
+
 ipcMain.handle('hermes:saveImageFromUrl', (_event, url) => saveImageFromUrl(String(url || '')))
 
 ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
@@ -10091,7 +10329,23 @@ ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
 
 ipcMain.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(String(url || '')))
 
+ipcMain.handle('hermes:watchDirectory', (_event, dir) => watchDirectory(String(dir || '')))
+
 ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
+
+// Each renderer reports the turns it has in flight; the quit guard reads the
+// merged picture. Keyed by webContents id so a closed window stops counting.
+const activeWorkByWebContents = new Map<number, ActiveWork>()
+
+ipcMain.on('hermes:active-work', (event, payload) => {
+  const id = event.sender.id
+
+  if (!activeWorkByWebContents.has(id)) {
+    event.sender.once('destroyed', () => activeWorkByWebContents.delete(id))
+  }
+
+  activeWorkByWebContents.set(id, normalizeActiveWork(payload))
+})
 
 ipcMain.on('hermes:titlebar-theme', (_event, payload) => {
   if (!payload || !isHexColor(payload.background) || !isHexColor(payload.foreground)) {
@@ -11358,7 +11612,58 @@ function configureSpellChecker() {
   }
 }
 
+// Ask before a quit kills a turn in flight. True when the quit was intercepted
+// and the confirmation is on screen; "Quit Anyway" re-enters before-quit with
+// the latch set and falls straight through to the teardown below.
+function heldQuitForActiveWork(event: Electron.Event): boolean {
+  if (SKIP_QUIT_CONFIRM || quitConfirmedWithActiveWork || quitPromptOpen) {
+    return false
+  }
+
+  const prompt = quitPromptFor(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff)
+  const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+
+  if (!prompt || !parent || parent.isDestroyed()) {
+    return false
+  }
+
+  event.preventDefault()
+  quitPromptOpen = true
+
+  void dialog
+    .showMessageBox(parent, {
+      buttons: ['Keep Running', 'Quit Anyway'],
+      cancelId: 0,
+      defaultId: 0,
+      detail: prompt.detail,
+      message: prompt.message,
+      type: 'question'
+    })
+    .then(({ response }) => {
+      quitPromptOpen = false
+
+      if (response === 1) {
+        quitConfirmedWithActiveWork = true
+        app.quit()
+      }
+    })
+    .catch(() => {
+      // A dialog we can't show must not become a quit we can't perform.
+      quitPromptOpen = false
+      quitConfirmedWithActiveWork = true
+      app.quit()
+    })
+
+  return true
+}
+
 app.on('before-quit', event => {
+  // Runs ahead of every teardown below, so "Keep Running" leaves the app
+  // exactly as it was.
+  if (heldQuitForActiveWork(event)) {
+    return
+  }
+
   if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {
     event.preventDefault()
     sshBootstrapCoordinator.cancelAll()
