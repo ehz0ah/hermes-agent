@@ -895,7 +895,8 @@ agent:
 #   - A preset like "hermes-cli" or "hermes-telegram" (curated tool set)
 #   - A list of individual toolsets to compose your own (see list below)
 #
-# Supported platform keys: cli, telegram, discord, whatsapp, slack, qqbot, teams, google_chat
+# Supported platform keys: cli, telegram, discord, whatsapp, slack, feishu,
+# signal, homeassistant, qqbot, yuanbao, teams, google_chat
 #
 # Examples:
 #
@@ -927,6 +928,7 @@ agent:
 #   qqbot:            hermes-qqbot            (same as telegram)
 #   teams:            hermes-teams            (same as telegram)
 #   google_chat:      hermes-google_chat      (same as telegram)
+#   feishu:           hermes-feishu           (gateway + first-party Lark tools)
 #
 platform_toolsets:
   cli: [hermes-cli]
@@ -940,6 +942,7 @@ platform_toolsets:
   yuanbao: [hermes-yuanbao]
   teams: [hermes-teams]
   google_chat: [hermes-google_chat]
+  feishu: [hermes-feishu]
 
 # =============================================================================
 # Gateway Platform Settings
@@ -948,7 +951,10 @@ platform_toolsets:
 # Platform-specific knobs live under `extra`.
 #
 # platforms:
+#   # Disable an unused adapter explicitly without changing Telegram's
+#   # built-in behavior for deployments where it remains enabled.
 #   telegram:
+#     enabled: false
 #     reply_to_mode: "first"  # off | first | all
 #     # guest_mode lets explicit @mentions from non-allowlisted groups through.
 #     # Default false; ordinary messages, replies, and regex wake words stay blocked.
@@ -969,11 +975,30 @@ platform_toolsets:
 #         priority_mode: prepend
 #         priority:
 #           - my_plugin_command
+#   feishu:
+#     enabled: true
+#     typing_indicator: false
+#     extra:
+#       reactions: false
+#       observe_unmentioned_group_messages: true
+#       participation:
+#         mode: adaptive
+#         timeout_seconds: 4
+#         recent_messages: 12
+#         confidence_threshold: 0.8
+#         cooldown_seconds: 30
 #   webhook:
 #     extra:
 #       # Route scripts default to a 30 second timeout. Scripts must live under
 #       # the active profile's scripts directory and receive webhook JSON on stdin.
 #       script_timeout_seconds: 30
+#
+# Gateway-only deployment protection for a shared internal agent. This blocks
+# chat users from modifying or restarting the active Hermes deployment while
+# leaving CLI/operator work and unrelated repositories unchanged.
+# gateway:
+#   deployment_guard:
+#     enabled: true
 #
 # Discord-specific settings (config.yaml top-level, not under platforms:):
 #
@@ -1247,6 +1272,30 @@ delegation:
 # honcho: {}
 
 # =============================================================================
+# Internal Gateway Scheduling And Observability
+# =============================================================================
+# Shared deployments can configure bounded cron concurrency, separate cron
+# inference, background-job deferral, and content-free per-turn latency
+# records with:
+#
+# cron:
+#   max_parallel_jobs: 2
+#   max_parallel_agent_jobs: 1
+#   agent_runtime:
+#     provider: volcano
+#     model: "<configured-cron-model>"
+#   background_window:
+#     timezone: Asia/Singapore
+#     start: "20:00"
+#     end: "08:00"
+#     active_grace_seconds: 300
+#     max_deferral_seconds: 43200
+#
+# observability:
+#   turn_latency:
+#     enabled: true
+
+# =============================================================================
 # Display
 # =============================================================================
 display:
@@ -1334,6 +1383,16 @@ display:
   #   error:   Only the final message when exit code != 0
   #   all:     Running output updates + final message (default)
   background_process_notifications: all
+
+  # Per-platform presentation overrides. This Feishu profile emits only the
+  # final answer: no tool breadcrumbs, interim narration, or progress notices.
+  # platforms:
+  #   feishu:
+  #     tool_progress: off
+  #     interim_assistant_messages: false
+  #     long_running_notifications: false
+  #     busy_ack_detail: false
+  #     live_status: off
 
 
   # Play terminal bell when agent finishes a response.
