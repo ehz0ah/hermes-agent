@@ -194,7 +194,11 @@ class TestConfigGetUnset:
         assert json.loads(capsys.readouterr().out)["backend"] == "docker"
 
     def test_config_get_prints_null_for_resolved_null_value(self, capsys):
-        args = argparse.Namespace(config_command="get", key="cron.max_parallel_jobs", json=False)
+        args = argparse.Namespace(
+            config_command="get",
+            key="max_concurrent_sessions",
+            json=False,
+        )
         config_command(args)
 
         assert capsys.readouterr().out.strip() == "null"

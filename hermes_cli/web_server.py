@@ -12331,6 +12331,7 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    timing_policy: str = "exact"
 
 
 class CronJobUpdate(BaseModel):
@@ -12673,6 +12674,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            timing_policy=body.timing_policy,
         )
     except HTTPException:
         raise

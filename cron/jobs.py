@@ -449,6 +449,14 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
+    from cron.timing_policy import normalize_timing_policy
+
+    try:
+        normalized["timing_policy"] = normalize_timing_policy(
+            normalized.get("timing_policy")
+        )
+    except ValueError:
+        normalized["timing_policy"] = "exact"
 
     state = _coerce_job_text(normalized.get("state")).strip()
     if not state:
@@ -1119,11 +1127,17 @@ def _resolve_default_model_snapshot() -> Optional[str]:
         except Exception:
             pass
         cfg = _expand_env_vars(cfg)
-        # Mirror run_job's precedence: the explicit cron-fleet default
-        # (cron.model) beats the global chat model for unpinned cron jobs.
+        # Mirror run_job's precedence: the explicit cron agent-runtime default
+        # beats the legacy cron.model alias and global chat model.
         cron_cfg = cfg.get("cron") or {}
         if isinstance(cron_cfg, dict):
-            cron_model = cron_cfg.get("model")
+            agent_runtime = cron_cfg.get("agent_runtime")
+            runtime_model = (
+                agent_runtime.get("model")
+                if isinstance(agent_runtime, dict)
+                else None
+            )
+            cron_model = runtime_model or cron_cfg.get("model")
             if isinstance(cron_model, str) and cron_model.strip():
                 return cron_model.strip()
         model_cfg = cfg.get("model") or {}
@@ -1220,6 +1234,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    timing_policy: str = "exact",
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1264,6 +1279,9 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        timing_policy: ``exact`` runs at the scheduled time. ``background``
+                prefers the configured low-contention window and defers while
+                users are active, subject to a bounded maximum delay.
 
     Returns:
         The created job dict
@@ -1296,6 +1314,9 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    from cron.timing_policy import normalize_timing_policy
+
+    normalized_timing_policy = normalize_timing_policy(timing_policy)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1376,6 +1397,7 @@ def create_job(
         "paused_reason": None,
         "created_at": now,
         "next_run_at": next_run_at,
+        "timing_policy": normalized_timing_policy,
         "last_run_at": None,
         "last_status": None,
         "last_error": None,
@@ -1488,6 +1510,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "timing_policy" in updates:
+                from cron.timing_policy import normalize_timing_policy
+
+                updates["timing_policy"] = normalize_timing_policy(
+                    updates["timing_policy"]
+                )
+                if updates["timing_policy"] == "exact":
+                    updates["background_deferred_since"] = None
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
@@ -1977,6 +2008,12 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 
     jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
     due = []
+    try:
+        from hermes_cli.config import load_config
+
+        timing_config = load_config() or {}
+    except Exception:
+        timing_config = {}
 
     # Normalize malformed "schedule" records (direct jobs.json edit, old writers,
     # corruption, etc.). "schedule" must be a dict; a null/string/etc. value
@@ -2172,6 +2209,47 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     continue
 
             if next_run_dt <= now:
+                from cron.timing_policy import (
+                    BACKGROUND,
+                    background_defer_until,
+                    normalize_timing_policy,
+                )
+
+                timing_policy = normalize_timing_policy(job.get("timing_policy"))
+                if timing_policy == BACKGROUND:
+                    policy_job = dict(job)
+                    if not policy_job.get("background_deferred_since"):
+                        policy_job["background_deferred_since"] = (
+                            next_run_dt.isoformat()
+                        )
+                    defer_until = background_defer_until(
+                        policy_job,
+                        now,
+                        config=timing_config,
+                    )
+                    if defer_until is not None and defer_until > now:
+                        deferred_since = policy_job["background_deferred_since"]
+                        job["next_run_at"] = defer_until.isoformat()
+                        job["background_deferred_since"] = deferred_since
+                        for rj in raw_jobs:
+                            if rj["id"] == job["id"]:
+                                rj["next_run_at"] = defer_until.isoformat()
+                                rj["background_deferred_since"] = deferred_since
+                                needs_save = True
+                                break
+                        logger.info(
+                            "Job '%s' deferred by background timing policy until %s",
+                            job.get("name", job.get("id", "?")),
+                            defer_until.isoformat(),
+                        )
+                        continue
+                    if job.get("background_deferred_since"):
+                        job.pop("background_deferred_since", None)
+                        for rj in raw_jobs:
+                            if rj["id"] == job["id"]:
+                                rj.pop("background_deferred_since", None)
+                                needs_save = True
+                                break
 
                 # For recurring jobs, check if the scheduled time is stale
                 # (gateway was down and missed the window). Fast-forward to

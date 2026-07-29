@@ -2119,6 +2119,14 @@ DEFAULT_CONFIG = {
         },
     },
 
+    "observability": {
+        "turn_latency": {
+            # Content-free, one-record-per-gateway-turn latency evidence.
+            # Disabled by default; internal deployments opt in explicitly.
+            "enabled": False,
+        },
+    },
+
     # Web dashboard settings
     "dashboard": {
         "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
@@ -2965,6 +2973,12 @@ DEFAULT_CONFIG = {
         # Inference provider paired with cron.model (NOT the scheduler
         # provider below). Empty string = resolve from global config.
         "model_provider": "",
+        # Preferred inference defaults for LLM-backed cron jobs. Resolution:
+        # per-job pin > agent_runtime > legacy model/model_provider > global.
+        "agent_runtime": {
+            "provider": "",
+            "model": "",
+        },
         # Active cron SCHEDULER provider (Axis B — the trigger that decides
         # WHEN a due job fires). Empty string = the built-in in-process 60s
         # ticker (default). Name an installed provider (plugins/cron_providers/<name>/ or
@@ -3020,7 +3034,18 @@ DEFAULT_CONFIG = {
         # null/0 = unbounded (limited only by thread count).
         # 1 = serial (pre-v0.9 behaviour).
         # Also overridable via HERMES_CRON_MAX_PARALLEL env var.
-        "max_parallel_jobs": None,
+        "max_parallel_jobs": 2,
+        # Separate bound for LLM-backed jobs. Deterministic no_agent scripts do
+        # not consume this lane.
+        "max_parallel_agent_jobs": 1,
+        "background_window": {
+            "timezone": "Asia/Singapore",
+            "start": "20:00",
+            "end": "08:00",
+            "active_grace_seconds": 300,
+            "max_deferral_seconds": 43200,
+            "jitter_seconds": 300,
+        },
         # Per-job output-file retention: save_job_output keeps the N most
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
@@ -8984,8 +9009,16 @@ def _cron_fleet_default_covers_axis(
     cron_config = config.get("cron")
     if not isinstance(cron_config, dict):
         return False
-    key = "model" if axis == "model" else "model_provider"
-    value = cron_config.get(key)
+    agent_runtime = cron_config.get("agent_runtime")
+    runtime_key = "model" if axis == "model" else "provider"
+    value = (
+        agent_runtime.get(runtime_key)
+        if isinstance(agent_runtime, dict)
+        else None
+    )
+    if not value:
+        legacy_key = "model" if axis == "model" else "model_provider"
+        value = cron_config.get(legacy_key)
     return isinstance(value, str) and bool(value.strip())
 
 

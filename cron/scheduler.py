@@ -11,6 +11,7 @@ runs at a time if multiple processes overlap.
 import asyncio
 import atexit
 import concurrent.futures
+import contextlib
 import contextvars
 import json
 import logging
@@ -324,6 +325,8 @@ def _is_cron_silence_response(text: str) -> bool:
 # ---------------------------------------------------------------------------
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
+_agent_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_agent_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
 
@@ -430,6 +433,38 @@ def _consume_interrupted_flag(job_id: str) -> bool:
 _sequential_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
 
+class _ExecutionLimiter:
+    """Bound total in-process cron execution without coupling executor queues."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._active = 0
+        self._limit: Optional[int] = None
+
+    def configure(self, limit: Optional[int]) -> None:
+        normalized = int(limit) if limit and int(limit) > 0 else None
+        with self._condition:
+            self._limit = normalized
+            self._condition.notify_all()
+
+    @contextlib.contextmanager
+    def slot(self):
+        with self._condition:
+            while self._limit is not None and self._active >= self._limit:
+                self._condition.wait()
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+
+
+_execution_limiter = _ExecutionLimiter()
+_agent_execution_limiter = _ExecutionLimiter()
+
+
 class _ReadWriteLock:
     """Writer-preferring readers-writer lock.
 
@@ -517,8 +552,23 @@ def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
     return _sequential_pool
 
 
+def _get_agent_pool(max_workers: int) -> concurrent.futures.ThreadPoolExecutor:
+    """Return the dedicated pool for LLM-backed cron jobs."""
+    global _agent_pool, _agent_pool_max_workers
+    if _agent_pool is None or _agent_pool_max_workers != max_workers:
+        if _agent_pool is not None:
+            _agent_pool.shutdown(wait=False, cancel_futures=False)
+        _agent_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="cron-agent",
+        )
+        _agent_pool_max_workers = max_workers
+    return _agent_pool
+
+
 def _shutdown_parallel_pool() -> None:
     """Shut down the persistent pools on process exit."""
+    global _agent_pool, _agent_pool_max_workers
     global _parallel_pool, _parallel_pool_max_workers, _sequential_pool
     if _parallel_pool is not None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
@@ -527,6 +577,10 @@ def _shutdown_parallel_pool() -> None:
     if _sequential_pool is not None:
         _sequential_pool.shutdown(wait=True, cancel_futures=False)
         _sequential_pool = None
+    if _agent_pool is not None:
+        _agent_pool.shutdown(wait=True, cancel_futures=False)
+        _agent_pool = None
+        _agent_pool_max_workers = None
 
 
 atexit.register(_shutdown_parallel_pool)
@@ -3150,15 +3204,16 @@ def run_job(
                 else str(delivery_target["thread_id"])
             )
 
-        # Model resolution precedence: per-job override > cron.model (the
-        # cron-fleet default) > HERMES_MODEL env > config.yaml ``model:``
+        # Model resolution precedence: per-job override > cron.agent_runtime >
+        # legacy cron.model > HERMES_MODEL env > config.yaml ``model:``
         # (string or ``{default: ...}``). The per-job value is intentionally
         # re-read from storage every tick so a ``cronjob action=update
         # model=...`` after a failed run takes effect on the next tick — there
         # is no in-memory cache.
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
-        # cron.model / cron.model_provider: a deliberate cron-fleet default
+        # cron.agent_runtime (and the legacy aliases cron.model /
+        # cron.model_provider): a deliberate cron-fleet default
         # so unattended jobs stop shadowing chat `/model` switches. When an
         # axis resolves from here, the #44585 drift guard is skipped for that
         # axis — following cron.model is explicit, not drift.
@@ -3189,11 +3244,18 @@ def run_job(
                 _model_cfg = _cfg.get("model") or {}
                 _cron_cfg_for_model = _cfg.get("cron") or {}
                 if isinstance(_cron_cfg_for_model, dict):
+                    _agent_runtime_cfg = _cron_cfg_for_model.get("agent_runtime")
+                    if not isinstance(_agent_runtime_cfg, dict):
+                        _agent_runtime_cfg = {}
                     _cron_default_model = str(
-                        _cron_cfg_for_model.get("model") or ""
+                        _agent_runtime_cfg.get("model")
+                        or _cron_cfg_for_model.get("model")
+                        or ""
                     ).strip()
                     _cron_default_provider = str(
-                        _cron_cfg_for_model.get("model_provider") or ""
+                        _agent_runtime_cfg.get("provider")
+                        or _cron_cfg_for_model.get("model_provider")
+                        or ""
                     ).strip()
                 if not job.get("model"):
                     if _cron_default_model:
@@ -4117,31 +4179,65 @@ def tick(
         for job in due_jobs:
             advance_next_run(job["id"])
 
-        # Resolve max parallel workers: env var > config.yaml > unbounded.
+        # Resolve total and LLM-backed concurrency separately. Deterministic
+        # no-agent jobs do not consume the agent lane.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
-        _max_workers: Optional[int] = None
+        _max_workers: Optional[int] = 2
+        _max_agent_workers = 1
+        _total_limit_from_env = False
         try:
             _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
             if _env_par:
+                _total_limit_from_env = True
                 _max_workers = int(_env_par) or None
         except (ValueError, TypeError):
-            logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded")
-        if _max_workers is None:
-            try:
-                _ucfg = load_config() or {}
-                _cfg_par = (
-                    _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
-                ).get("max_parallel_jobs")
+            _total_limit_from_env = False
+            _max_workers = 2
+            logger.warning(
+                "Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to 2"
+            )
+        try:
+            _ucfg = load_config() or {}
+            _cron_runtime_cfg = (
+                _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
+            )
+            if not isinstance(_cron_runtime_cfg, dict):
+                _cron_runtime_cfg = {}
+            if not _total_limit_from_env:
+                _cfg_par = _cron_runtime_cfg.get("max_parallel_jobs")
                 if _cfg_par is not None:
                     _max_workers = int(_cfg_par) or None
-            except Exception:
-                pass
+            _cfg_agent_par = _cron_runtime_cfg.get(
+                "max_parallel_agent_jobs", 1
+            )
+            _max_agent_workers = max(1, int(_cfg_agent_par or 1))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid cron concurrency config; using safe defaults"
+            )
+            if not _total_limit_from_env:
+                _max_workers = 2
+            _max_agent_workers = 1
+        try:
+            _env_agent_par = os.getenv(
+                "HERMES_CRON_MAX_PARALLEL_AGENT", ""
+            ).strip()
+            if _env_agent_par:
+                _max_agent_workers = max(1, int(_env_agent_par))
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid HERMES_CRON_MAX_PARALLEL_AGENT value; defaulting to 1"
+            )
+            _max_agent_workers = 1
+        _execution_limiter.configure(_max_workers)
+        _agent_execution_limiter.configure(_max_agent_workers)
 
         if verbose:
             logger.info(
-                "Running %d job(s) in parallel (max_workers=%s)",
+                "Running %d job(s) (total=%s, agent=%d)",
                 len(due_jobs),
                 _max_workers if _max_workers else "unbounded",
+                _max_agent_workers,
             )
 
         def _process_job(job: dict) -> bool:
@@ -4149,7 +4245,21 @@ def tick(
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            with _execution_limiter.slot():
+                if job.get("no_agent"):
+                    return run_one_job(
+                        job,
+                        adapters=adapters,
+                        loop=loop,
+                        verbose=verbose,
+                    )
+                with _agent_execution_limiter.slot():
+                    return run_one_job(
+                        job,
+                        adapters=adapters,
+                        loop=loop,
+                        verbose=verbose,
+                    )
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
@@ -4157,8 +4267,23 @@ def tick(
         # That alone only keeps workdir jobs from overlapping EACH OTHER;
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        # Preserve the established single-thread workdir lane for every job:
+        # run_job temporarily mutates process-global TERMINAL_CWD regardless of
+        # whether the job uses an agent. The agent limiter above still applies
+        # to LLM-backed workdir jobs.
+        sequential_jobs = [
+            j for j in due_jobs if (j.get("workdir") or "").strip()
+        ]
+        parallel_jobs = [
+            j
+            for j in due_jobs
+            if j.get("no_agent") and not (j.get("workdir") or "").strip()
+        ]
+        agent_jobs = [
+            j
+            for j in due_jobs
+            if not j.get("no_agent") and not (j.get("workdir") or "").strip()
+        ]
 
         _results: list = []
         _all_futures: list = []
@@ -4255,6 +4380,19 @@ def tick(
                 _all_futures.append(fut)
                 if not sync:
                     _results.append(True)  # optimistically counted
+
+        # LLM-backed jobs have a dedicated executor so queued inference cannot
+        # occupy deterministic workers. The shared execution limiter still
+        # enforces max_parallel_jobs across every lane.
+        if agent_jobs:
+            agent_pool = _get_agent_pool(_max_agent_workers)
+            for job in agent_jobs:
+                fut = _submit_with_guard(job, agent_pool)
+                if fut is None:
+                    continue
+                _all_futures.append(fut)
+                if not sync:
+                    _results.append(True)
 
         # Best-effort sweep of MCP stdio subprocesses that survived their
         # session teardown.  Must run AFTER jobs finish so active sessions

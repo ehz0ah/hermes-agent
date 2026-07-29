@@ -537,6 +537,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "provider": job.get("provider"),
         "base_url": job.get("base_url"),
         "schedule": job.get("schedule_display") or "?",
+        "timing_policy": job.get("timing_policy", "exact"),
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
         "next_run_at": job.get("next_run_at"),
@@ -635,6 +636,7 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    timing_policy: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -708,6 +710,7 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                timing_policy=timing_policy or "exact",
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -905,6 +908,8 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if timing_policy is not None:
+                updates["timing_policy"] = timing_policy
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -976,6 +981,17 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "repeat": {
                 "type": "integer",
                 "description": "Optional repeat count. Omit for defaults (once for one-shot, forever for recurring)."
+            },
+            "timing_policy": {
+                "type": "string",
+                "enum": ["exact", "background"],
+                "default": "exact",
+                "description": (
+                    "Scheduling policy. 'exact' runs at the requested time and is "
+                    "appropriate for reminders. 'background' may defer into the "
+                    "configured low-contention window while users are active, "
+                    "subject to a bounded maximum delay."
+                ),
             },
             "deliver": {
                 "type": "string",
@@ -1091,6 +1107,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        timing_policy=args.get("timing_policy"),
         task_id=kw.get("task_id"),
     ),
     check_fn=check_cronjob_requirements,

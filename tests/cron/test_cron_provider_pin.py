@@ -440,6 +440,52 @@ class TestCronFleetDefaultModel:
         assert captured.get("target_model") == "qwen-2.5-7b:free"
         assert agent_kwargs.get("model") == "qwen-2.5-7b:free"
 
+    def test_nested_agent_runtime_beats_legacy_and_global_defaults(self, tmp_path):
+        job = _base_job()
+        captured = {}
+        config_yaml = (
+            "model:\n  default: global-model\n"
+            "cron:\n"
+            "  model: legacy-model\n"
+            "  model_provider: legacy-provider\n"
+            "  agent_runtime:\n"
+            "    model: cron-model\n"
+            "    provider: volcano\n"
+        )
+        (tmp_path / "config.yaml").write_text(config_yaml)
+        fake_db = MagicMock()
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return {
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": kwargs.get("requested"),
+                "api_mode": "chat_completions",
+            }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 side_effect=_capture,
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert captured["target_model"] == "cron-model"
+        assert captured["requested"] == "volcano"
+        assert mock_agent_cls.call_args.kwargs["model"] == "cron-model"
+
     def test_per_job_pin_still_beats_cron_model(self, tmp_path):
         job = _base_job(
             provider_snapshot="openrouter",

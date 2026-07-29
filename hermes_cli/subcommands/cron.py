@@ -83,6 +83,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
+    cron_create.add_argument(
+        "--timing-policy",
+        choices=("exact", "background"),
+        default="exact",
+        help=(
+            "When to run: exact preserves the requested time; background may "
+            "defer into the configured low-contention window."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -159,6 +168,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--provider",
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--timing-policy",
+        choices=("exact", "background"),
+        help="Change the job timing policy.",
     )
 
     # lifecycle actions

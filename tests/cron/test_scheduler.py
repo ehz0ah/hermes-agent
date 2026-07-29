@@ -3575,23 +3575,22 @@ class TestParallelTick:
         barrier = threading.Barrier(2, timeout=5)
         call_order = []
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
+        def mock_run_one_job(job, **_kwargs):
             """Each job hits a barrier — both must be active simultaneously."""
             call_order.append(("start", job["id"]))
             barrier.wait()  # blocks until both threads reach here
             call_order.append(("end", job["id"]))
-            return (True, "output", "response", None)
+            return True
 
         jobs = [
-            {"id": "job-a", "name": "a", "deliver": "local"},
-            {"id": "job-b", "name": "b", "deliver": "local"},
+            {"id": "job-a", "name": "a", "deliver": "local", "no_agent": True},
+            {"id": "job-b", "name": "b", "deliver": "local", "no_agent": True},
         ]
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
              patch("cron.scheduler.advance_next_run"), \
-             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.create_execution", return_value={"id": "exec"}), \
+             patch("cron.scheduler.run_one_job", side_effect=mock_run_one_job), \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             result = tick(verbose=False)
@@ -3609,7 +3608,7 @@ class TestParallelTick:
         from gateway.session_context import get_session_env
         seen = {}
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
+        def mock_run_one_job(job, **_kwargs):
             origin = job.get("origin", {})
             # run_job sets ContextVars — verify each job sees its own
             from gateway.session_context import set_session_vars, clear_session_vars
@@ -3623,7 +3622,7 @@ class TestParallelTick:
             chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
             seen[job["id"]] = {"platform": platform, "chat_id": chat_id}
             clear_session_vars(tokens)
-            return (True, "output", "response", None)
+            return True
 
         jobs = [
             {"id": "tg-job", "name": "tg", "deliver": "local",
@@ -3634,9 +3633,8 @@ class TestParallelTick:
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
              patch("cron.scheduler.advance_next_run"), \
-             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.create_execution", return_value={"id": "exec"}), \
+             patch("cron.scheduler.run_one_job", side_effect=mock_run_one_job), \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
@@ -3649,12 +3647,12 @@ class TestParallelTick:
         monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "1")
         call_times = []
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
+        def mock_run_one_job(job, **_kwargs):
             import time
             call_times.append(("start", job["id"], time.monotonic()))
             time.sleep(0.05)
             call_times.append(("end", job["id"], time.monotonic()))
-            return (True, "output", "response", None)
+            return True
 
         jobs = [
             {"id": "s1", "name": "s1", "deliver": "local"},
@@ -3663,9 +3661,8 @@ class TestParallelTick:
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
              patch("cron.scheduler.advance_next_run"), \
-             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.create_execution", return_value={"id": "exec"}), \
+             patch("cron.scheduler.run_one_job", side_effect=mock_run_one_job), \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             result = tick(verbose=False)
@@ -3675,6 +3672,213 @@ class TestParallelTick:
         end_s1 = [t for action, jid, t in call_times if action == "end" and jid == "s1"][0]
         start_s2 = [t for action, jid, t in call_times if action == "start" and jid == "s2"][0]
         assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
+
+    def test_total_concurrency_defaults_to_two(self, monkeypatch):
+        """Existing configs without a limit still use the safe runtime default."""
+        import threading
+        import time
+
+        monkeypatch.delenv("HERMES_CRON_MAX_PARALLEL", raising=False)
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def mock_run_one_job(job, **_kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return True
+
+        jobs = [
+            {
+                "id": f"script-{index}",
+                "name": f"script-{index}",
+                "no_agent": True,
+            }
+            for index in range(3)
+        ]
+
+        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.load_config", return_value={}), \
+             patch("cron.scheduler.run_one_job", side_effect=mock_run_one_job), \
+             patch(
+                 "cron.scheduler.create_execution",
+                 side_effect=lambda job_id, **_kwargs: {"id": f"exec-{job_id}"},
+             ), \
+             patch("cron.scheduler.finish_execution"), \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+
+            result = tick(verbose=False)
+
+        assert result == 3
+        assert max_active == 2
+
+    def test_agent_lane_is_serial_but_no_agent_job_can_overlap(self):
+        """Agent inference is serialized without blocking deterministic scripts."""
+        import threading
+        import time
+
+        lock = threading.Lock()
+        active_agents = 0
+        max_active_agents = 0
+        script_overlapped_agent = False
+
+        def mock_run_one_job(job, **_kwargs):
+            nonlocal active_agents, max_active_agents, script_overlapped_agent
+            if job.get("no_agent"):
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    with lock:
+                        if active_agents:
+                            script_overlapped_agent = True
+                            break
+                    time.sleep(0.005)
+                time.sleep(0.03)
+            else:
+                with lock:
+                    active_agents += 1
+                    max_active_agents = max(max_active_agents, active_agents)
+                time.sleep(0.08)
+                with lock:
+                    active_agents -= 1
+            return True
+
+        jobs = [
+            {"id": "agent-a", "name": "agent-a", "deliver": "local"},
+            {"id": "agent-b", "name": "agent-b", "deliver": "local"},
+            {
+                "id": "script",
+                "name": "script",
+                "deliver": "local",
+                "no_agent": True,
+            },
+        ]
+
+        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.load_config", return_value={
+                 "cron": {
+                     "max_parallel_jobs": 2,
+                     "max_parallel_agent_jobs": 1,
+                 }
+             }), \
+             patch("cron.scheduler.run_one_job", side_effect=mock_run_one_job), \
+             patch("cron.scheduler.create_execution", return_value={"id": "exec"}), \
+             patch("cron.scheduler.finish_execution"), \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            result = tick(verbose=False)
+
+        assert result == 3
+        assert max_active_agents == 1
+        assert script_overlapped_agent is True
+
+    def test_total_env_override_keeps_configured_agent_lane(
+        self, monkeypatch
+    ):
+        """Total and agent concurrency resolve independently across sources."""
+        import threading
+        import time
+
+        monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "2")
+        lock = threading.Lock()
+        active_agents = 0
+        max_active_agents = 0
+
+        def mock_run_one_job(job, **_kwargs):
+            nonlocal active_agents, max_active_agents
+            with lock:
+                active_agents += 1
+                max_active_agents = max(max_active_agents, active_agents)
+            time.sleep(0.04)
+            with lock:
+                active_agents -= 1
+            return True
+
+        jobs = [
+            {"id": "agent-a", "name": "agent-a"},
+            {"id": "agent-b", "name": "agent-b"},
+        ]
+        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.load_config", return_value={
+                 "cron": {
+                     "max_parallel_jobs": 9,
+                     "max_parallel_agent_jobs": 1,
+                 }
+             }), \
+             patch("cron.scheduler.run_one_job", side_effect=mock_run_one_job), \
+             patch(
+                 "cron.scheduler.create_execution",
+                 side_effect=lambda job_id, **_kwargs: {"id": f"exec-{job_id}"},
+             ), \
+             patch("cron.scheduler.finish_execution"), \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+
+            result = tick(verbose=False)
+
+        assert result == 2
+        assert max_active_agents == 1
+
+    def test_workdir_agent_uses_sequential_pool_and_agent_limit(self, tmp_path):
+        """Workdir safety and agent concurrency remain independent invariants."""
+        import threading
+        import time
+
+        lock = threading.Lock()
+        active_agents = 0
+        max_active_agents = 0
+        threads: dict[str, str] = {}
+
+        def mock_run_one_job(job, **_kwargs):
+            nonlocal active_agents, max_active_agents
+            with lock:
+                active_agents += 1
+                max_active_agents = max(max_active_agents, active_agents)
+                threads[job["id"]] = threading.current_thread().name
+            time.sleep(0.04)
+            with lock:
+                active_agents -= 1
+            return True
+
+        jobs = [
+            {
+                "id": "workdir-agent",
+                "name": "workdir-agent",
+                "workdir": str(tmp_path),
+            },
+            {"id": "plain-agent", "name": "plain-agent"},
+        ]
+
+        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.load_config", return_value={
+                 "cron": {
+                     "max_parallel_jobs": 2,
+                     "max_parallel_agent_jobs": 1,
+                 }
+             }), \
+             patch("cron.scheduler.run_one_job", side_effect=mock_run_one_job), \
+             patch(
+                 "cron.scheduler.create_execution",
+                 side_effect=lambda job_id, **_kwargs: {"id": f"exec-{job_id}"},
+             ), \
+             patch("cron.scheduler.finish_execution"), \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            result = tick(verbose=False)
+
+        assert result == 2
+        assert max_active_agents == 1
+        assert threads["workdir-agent"].startswith("cron-seq")
+        assert threads["plain-agent"].startswith("cron-agent")
 
 
 class TestDeliverResultTimeoutCancelsFuture:
