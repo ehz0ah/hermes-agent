@@ -353,6 +353,7 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    _context_started_at = time.monotonic()
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -1154,6 +1155,7 @@ def build_turn_context(
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
     if agent._memory_manager:
+        _prefetch_started_at = time.monotonic()
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             ext_prefetch_cache = agent._memory_manager.prefetch_all(
@@ -1163,6 +1165,15 @@ def build_turn_context(
             ) or ""
         except Exception:
             pass
+        finally:
+            try:
+                from gateway.turn_latency import record_openviking_prefetch
+
+                record_openviking_prefetch(
+                    time.monotonic() - _prefetch_started_at
+                )
+            except Exception:
+                pass
 
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
@@ -1249,6 +1260,13 @@ def build_turn_context(
         # close path must no longer treat it as a pre-worker UI input.
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
+
+    try:
+        from gateway.turn_latency import record_context_assembly
+
+        record_context_assembly(time.monotonic() - _context_started_at)
+    except Exception:
+        pass
 
     return TurnContext(
         user_message=user_message,

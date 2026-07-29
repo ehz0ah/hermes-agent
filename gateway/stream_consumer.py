@@ -391,7 +391,27 @@ class GatewayStreamConsumer:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        return await self.adapter.edit_message(**kwargs)
+        return await self._timed_delivery(self.adapter.edit_message(**kwargs))
+
+    async def _send_message(self, **kwargs):
+        """Send through the adapter while recording only real platform I/O."""
+        return await self._timed_delivery(self.adapter.send(**kwargs))
+
+    async def _send_draft_message(self, **kwargs):
+        """Send a native draft frame with the same delivery accounting."""
+        return await self._timed_delivery(self.adapter.send_draft(**kwargs))
+
+    @staticmethod
+    async def _timed_delivery(awaitable):
+        from gateway.turn_latency import current_tracker, record_delivery
+
+        if current_tracker() is None:
+            return await awaitable
+        started_at = time.monotonic()
+        try:
+            return await awaitable
+        finally:
+            record_delivery(time.monotonic() - started_at)
 
     def has_delivered_text(self, text: str) -> bool:
         """Return True if *text* was already delivered as visible chat content."""
@@ -1142,7 +1162,7 @@ class GatewayStreamConsumer:
         if not text.strip():
             return reply_to_id
         try:
-            result = await self.adapter.send(
+            result = await self._send_message(
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
@@ -1382,7 +1402,7 @@ class GatewayStreamConsumer:
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
-                result = await self.adapter.send(
+                result = await self._send_message(
                     chat_id=self.chat_id,
                     content=chunk,
                     metadata=self._metadata_for_send(final=True),
@@ -1477,7 +1497,7 @@ class GatewayStreamConsumer:
         result = None
         for attempt in range(2):
             try:
-                result = await self.adapter.send(
+                result = await self._send_message(
                     chat_id=self.chat_id,
                     content=final_text,
                     metadata=self._metadata_for_send(final=True),
@@ -1621,7 +1641,7 @@ class GatewayStreamConsumer:
             self._use_draft_streaming = False
             return False
         try:
-            result = await self.adapter.send_draft(
+            result = await self._send_draft_message(
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
                 content=text,
@@ -1669,7 +1689,7 @@ class GatewayStreamConsumer:
         if not tail.strip():
             return
         try:
-            result = await self.adapter.send(
+            result = await self._send_message(
                 chat_id=self.chat_id,
                 content=tail,
                 metadata=self.metadata,
@@ -1706,7 +1726,7 @@ class GatewayStreamConsumer:
         if not text.strip():
             return False
         try:
-            result = await self.adapter.send(
+            result = await self._send_message(
                 chat_id=self.chat_id,
                 content=text,
                 metadata=self.metadata,
@@ -1852,7 +1872,7 @@ class GatewayStreamConsumer:
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
         try:
-            result = await self.adapter.send(
+            result = await self._send_message(
                 chat_id=self.chat_id,
                 content=text,
                 metadata=self._metadata_for_send(final=True),
@@ -2239,7 +2259,7 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
-                result = await self.adapter.send(
+                result = await self._send_message(
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,

@@ -930,6 +930,11 @@ class GatewayConfig:
     # disables sd_notify at runtime.
     systemd_watchdog_seconds: int = 0
 
+    # Emit one content-free structured latency record for each handled gateway
+    # turn. Disabled by default; internal deployments may opt in through
+    # observability.turn_latency.enabled.
+    turn_latency_enabled: bool = False
+
     # In-process event-loop liveness watchdog (#69089). A daemon OS thread
     # probes the gateway loop with call_soon_threadsafe; after consecutive
     # missed probes it dumps all-thread stacks and hard-exits with the
@@ -1071,6 +1076,9 @@ class GatewayConfig:
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
+            "observability": {
+                "turn_latency": {"enabled": self.turn_latency_enabled}
+            },
             "loop_watchdog": self.loop_watchdog,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
@@ -1148,6 +1156,16 @@ class GatewayConfig:
         else:
             loop_watchdog_raw = nested_gateway.get("loop_watchdog")
         loop_watchdog = _coerce_bool(loop_watchdog_raw, True)
+        observability = data.get("observability")
+        if not isinstance(observability, dict):
+            observability = {}
+        turn_latency = observability.get("turn_latency")
+        if not isinstance(turn_latency, dict):
+            turn_latency = {}
+        turn_latency_enabled = _coerce_bool(
+            turn_latency.get("enabled"),
+            False,
+        )
         if multiplex_profiles is None and isinstance(nested_gateway, dict):
             # Also honor gateway.multiplex_profiles written by
             # ``hermes config set gateway.multiplex_profiles true``.
@@ -1208,6 +1226,7 @@ class GatewayConfig:
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             systemd_watchdog_seconds=systemd_watchdog_seconds,
+            turn_latency_enabled=turn_latency_enabled,
             loop_watchdog=loop_watchdog,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
@@ -1406,6 +1425,15 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["filter_silence_narration"] = gateway_section[
                     "filter_silence_narration"
                 ]
+
+            observability_cfg = yaml_cfg.get("observability")
+            if (
+                observability_cfg is None
+                and isinstance(gateway_section, dict)
+            ):
+                observability_cfg = gateway_section.get("observability")
+            if isinstance(observability_cfg, dict):
+                gw_data["observability"] = observability_cfg
 
             if "unauthorized_dm_behavior" in yaml_cfg:
                 gw_data["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(
@@ -1743,6 +1771,13 @@ def load_gateway_config() -> GatewayConfig:
 
     # Override with environment variables
     _apply_env_overrides(config)
+
+    # Adapters receive PlatformConfig rather than GatewayConfig. Bridge this
+    # global switch once at load time without exposing it as a platform option.
+    for platform_config in config.platforms.values():
+        platform_config.extra["_turn_latency_enabled"] = (
+            config.turn_latency_enabled
+        )
     
     # --- Validate loaded values ---
     _validate_gateway_config(config)

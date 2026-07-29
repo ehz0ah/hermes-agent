@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -80,6 +81,7 @@ def _candidate(
         session_source=FeishuAdapter._shared_group_session_source(source),
         key=key,
         generation=generation,
+        queued_at=time.monotonic(),
     )
 
 
@@ -90,6 +92,7 @@ def _adaptive_adapter() -> FeishuAdapter:
     )
     adapter._participation_mode = "adaptive"
     adapter._participation_debounce_seconds = 0
+    adapter._participation_timeout_seconds = 4
     adapter._participation_recent_messages = 12
     adapter._participation_confidence_threshold = 0.8
     adapter._participation_cooldown_seconds = 30
@@ -130,6 +133,7 @@ class TestParticipationSettings:
                 "participation": {
                     "mode": "adaptive",
                     "debounce_seconds": "not-a-number",
+                    "timeout_seconds": "not-a-number",
                     "recent_messages": "invalid",
                     "confidence_threshold": float("nan"),
                     "cooldown_seconds": -1,
@@ -139,6 +143,7 @@ class TestParticipationSettings:
 
         assert settings.participation_mode == "adaptive"
         assert settings.participation_debounce_seconds == 1.5
+        assert settings.participation_timeout_seconds == 4.0
         assert settings.participation_recent_messages == 12
         assert settings.participation_confidence_threshold == 0.8
         assert settings.participation_cooldown_seconds == 30
@@ -311,6 +316,7 @@ class TestParticipationDecisionParsing:
             == "https://example.invalid/v1"
         )
         assert call.await_args.kwargs["api_key"] == "secret-test-value"
+        assert call.await_args.kwargs["timeout"] == 4
         payload = json.loads(messages[1]["content"])
         assert payload["chat"]["chat_name"] == "Platform Team"
         assert payload["sender"]["name"] == "Alice"
@@ -398,6 +404,25 @@ class TestParticipationDecisionParsing:
         ):
             assert not await adapter._classify_participation(_candidate())
 
+    @pytest.mark.asyncio
+    async def test_classifier_enforces_one_end_to_end_deadline(self):
+        adapter = _adaptive_adapter()
+        adapter._participation_timeout_seconds = 0.01
+        adapter._session_store = _TranscriptStore()
+
+        async def never_finishes(**_kwargs):
+            await asyncio.sleep(10)
+
+        with patch(
+            "agent.auxiliary_client.async_call_llm",
+            side_effect=never_finishes,
+        ):
+            started_at = time.monotonic()
+            with pytest.raises(TimeoutError):
+                await adapter._classify_participation(_candidate())
+
+        assert time.monotonic() - started_at < 0.5
+
 
 class TestParticipationLifecycle:
     @pytest.mark.asyncio
@@ -419,12 +444,22 @@ class TestParticipationLifecycle:
             ]
             is True
         )
+        participation_latency = (
+            adapter._process_inbound_message.await_args.kwargs[
+                "participation_latency"
+            ]
+        )
+        assert participation_latency["debounce_seconds"] >= 0
+        assert participation_latency["classifier_seconds"] >= 0
         adapter._persist_observed_candidate.assert_not_awaited()
         assert candidate.key not in adapter._participation_pending
 
     @pytest.mark.asyncio
     async def test_silent_or_cooldown_candidate_is_persisted_observed(self):
         adapter = _adaptive_adapter()
+        adapter.config = SimpleNamespace(
+            extra={"_turn_latency_enabled": True}
+        )
         candidate = _candidate()
         adapter._participation_generations[candidate.key] = candidate.generation
         adapter._participation_pending[candidate.key] = candidate
@@ -432,10 +467,17 @@ class TestParticipationLifecycle:
         adapter._process_inbound_message = AsyncMock()
         adapter._persist_observed_candidate = AsyncMock()
 
-        await adapter._run_participation_candidate(candidate)
+        with patch(
+            "gateway.turn_latency.emit_participation_only"
+        ) as emit_latency:
+            await adapter._run_participation_candidate(candidate)
 
         adapter._process_inbound_message.assert_not_awaited()
         adapter._persist_observed_candidate.assert_awaited_once_with(candidate)
+        assert (
+            emit_latency.call_args.kwargs["outcome"]
+            == "participation_silent"
+        )
 
         next_candidate = _candidate(
             message_id="om_next",
@@ -449,11 +491,18 @@ class TestParticipationLifecycle:
         )
         adapter._persist_observed_candidate.reset_mock()
 
-        await adapter._run_participation_candidate(next_candidate)
+        with patch(
+            "gateway.turn_latency.emit_participation_only"
+        ) as emit_latency:
+            await adapter._run_participation_candidate(next_candidate)
 
         adapter._process_inbound_message.assert_not_awaited()
         adapter._persist_observed_candidate.assert_awaited_once_with(
             next_candidate
+        )
+        assert (
+            emit_latency.call_args.kwargs["outcome"]
+            == "participation_cooldown"
         )
 
     @pytest.mark.asyncio

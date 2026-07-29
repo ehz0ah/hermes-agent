@@ -412,6 +412,17 @@ def _run_agent_tool_execution_middleware(
         block_message = scope_block
         block_error_type = "tool_scope_block"
         if block_message is None:
+            from gateway.deployment_guard import blocked_gateway_tool_message
+
+            block_message = blocked_gateway_tool_message(
+                platform=getattr(agent, "platform", ""),
+                function_name=function_name,
+                function_args=final_args,
+                effective_task_id=effective_task_id,
+            )
+            if block_message is not None:
+                block_error_type = "deployment_guard_block"
+        if block_message is None:
             block_error_type = "plugin_block"
 
             def _resolve_pre_tool_block():
@@ -1195,6 +1206,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
 
+        try:
+            from gateway.turn_latency import record_tool
+
+            record_tool(tool_duration)
+        except Exception:
+            pass
+
         agent._current_tool = None
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
@@ -1805,6 +1823,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
+
+        try:
+            from gateway.turn_latency import record_tool
+
+            record_tool(tool_duration)
+        except Exception:
+            pass
 
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (

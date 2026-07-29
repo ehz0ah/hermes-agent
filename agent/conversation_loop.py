@@ -2178,6 +2178,12 @@ def run_conversation(
                 # streaming automatically if the provider doesn't
                 # support it.
                 def _stop_spinner():
+                    try:
+                        from gateway.turn_latency import mark_model_first_token
+
+                        mark_model_first_token()
+                    except Exception:
+                        pass
                     nonlocal thinking_spinner
                     if thinking_spinner:
                         thinking_spinner.stop("")
@@ -2266,6 +2272,12 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
+                    from gateway.turn_latency import mark_model_start
+
+                    _turn_model_started_at = mark_model_start()
+                except Exception:
+                    _turn_model_started_at = None
+                try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
                         _perform_api_call,
@@ -2283,6 +2295,12 @@ def run_conversation(
                         middleware_trace=list(_llm_middleware_trace),
                     )
                 finally:
+                    try:
+                        from gateway.turn_latency import mark_model_end
+
+                        mark_model_end(_turn_model_started_at)
+                    except Exception:
+                        pass
                     if _redirect_lock is not None:
                         with _redirect_lock:
                             if _model_request_active is not None:

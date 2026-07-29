@@ -426,6 +426,7 @@ class FeishuAdapterSettings:
     observe_unmentioned_group_messages: bool = False
     participation_mode: str = "mention_only"
     participation_debounce_seconds: float = 1.5
+    participation_timeout_seconds: float = 4.0
     participation_recent_messages: int = 12
     participation_confidence_threshold: float = 0.8
     participation_cooldown_seconds: float = 30.0
@@ -463,6 +464,7 @@ class _FeishuParticipationCandidate:
     session_source: Any
     key: str
     generation: int
+    queued_at: float
 
 
 # ---------------------------------------------------------------------------
@@ -1745,6 +1747,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 ),
                 default=1.5,
             ),
+            participation_timeout_seconds=_coerce_float(
+                participation_cfg.get(
+                    "timeout_seconds",
+                    os.getenv("FEISHU_PARTICIPATION_TIMEOUT_SECONDS", "4"),
+                ),
+                default=4.0,
+                min_value=0.1,
+            ),
             participation_recent_messages=_coerce_required_int(
                 participation_cfg.get(
                     "recent_messages",
@@ -1812,6 +1822,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._participation_debounce_seconds = (
             settings.participation_debounce_seconds
         )
+        self._participation_timeout_seconds = settings.participation_timeout_seconds
         self._participation_recent_messages = settings.participation_recent_messages
         self._participation_confidence_threshold = (
             settings.participation_confidence_threshold
@@ -3692,6 +3703,7 @@ class FeishuAdapter(BasePlatformAdapter):
             session_source=self._shared_group_session_source(source),
             key=key,
             generation=generation,
+            queued_at=time.monotonic(),
         )
 
     async def _persist_observed_candidate(
@@ -3790,17 +3802,32 @@ class FeishuAdapter(BasePlatformAdapter):
         candidate: _FeishuParticipationCandidate,
     ) -> None:
         current_task = asyncio.current_task()
+        debounce_seconds = 0.0
+        classifier_seconds = 0.0
+        latency_enabled = bool(
+            getattr(
+                getattr(self, "config", None),
+                "extra",
+                {},
+            ).get("_turn_latency_enabled", False)
+        )
         try:
             await asyncio.sleep(
                 float(getattr(self, "_participation_debounce_seconds", 1.5))
             )
+            debounce_seconds = max(0.0, time.monotonic() - candidate.queued_at)
             if (
                 self._participation_generations.get(candidate.key)
                 != candidate.generation
             ):
                 return
 
+            classifier_started_at = time.monotonic()
             should_speak = await self._classify_participation(candidate)
+            classifier_seconds = max(
+                0.0,
+                time.monotonic() - classifier_started_at,
+            )
             if (
                 self._participation_generations.get(candidate.key)
                 != candidate.generation
@@ -3819,9 +3846,28 @@ class FeishuAdapter(BasePlatformAdapter):
                     message_id=candidate.message_id,
                     is_bot=False,
                     dispatch_immediately=True,
+                    participation_latency={
+                        "debounce_seconds": debounce_seconds,
+                        "classifier_seconds": classifier_seconds,
+                    },
                 )
             else:
                 await self._persist_observed_candidate(candidate)
+                from gateway.turn_latency import emit_participation_only
+
+                emit_participation_only(
+                    enabled=latency_enabled,
+                    platform="feishu",
+                    chat_type="group",
+                    outcome=(
+                        "participation_silent"
+                        if not should_speak
+                        else "participation_cooldown"
+                    ),
+                    started_at=candidate.queued_at,
+                    debounce_seconds=debounce_seconds,
+                    classifier_seconds=classifier_seconds,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -3833,6 +3879,17 @@ class FeishuAdapter(BasePlatformAdapter):
             if self._participation_pending.get(candidate.key) is candidate:
                 self._participation_pending.pop(candidate.key, None)
                 await self._persist_observed_candidate(candidate)
+                from gateway.turn_latency import emit_participation_only
+
+                emit_participation_only(
+                    enabled=latency_enabled,
+                    platform="feishu",
+                    chat_type="group",
+                    outcome="participation_failure",
+                    started_at=candidate.queued_at,
+                    debounce_seconds=debounce_seconds,
+                    classifier_seconds=classifier_seconds,
+                )
         finally:
             if self._participation_tasks.get(candidate.key) is current_task:
                 self._participation_tasks.pop(candidate.key, None)
@@ -3903,8 +3960,11 @@ class FeishuAdapter(BasePlatformAdapter):
         }
         _bridge_byteplus_participation_env()
         aux_prefix = "AUXILIARY_FEISHU_PARTICIPATION"
-        response = await asyncio.wait_for(
-            async_call_llm(
+        deadline = float(
+            getattr(self, "_participation_timeout_seconds", 4.0)
+        )
+        async with asyncio.timeout(deadline):
+            response = await async_call_llm(
                 task="feishu_participation",
                 provider=os.getenv(f"{aux_prefix}_PROVIDER", "").strip() or None,
                 model=os.getenv(f"{aux_prefix}_MODEL", "").strip() or None,
@@ -3919,10 +3979,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 ],
                 temperature=0,
                 max_tokens=120,
-                timeout=8,
-            ),
-            timeout=10,
-        )
+                timeout=deadline,
+            )
         result = self._parse_participation_decision(
             extract_content_or_reasoning(response)
         )
@@ -4085,6 +4143,7 @@ class FeishuAdapter(BasePlatformAdapter):
         message_id: str,
         is_bot: bool = False,
         dispatch_immediately: bool = False,
+        participation_latency: Optional[Dict[str, float]] = None,
     ) -> None:
         text, inbound_type, media_urls, media_types, mentions = await self._extract_message_content(message)
 
@@ -4171,6 +4230,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 chat_id=chat_id,
                 thread_id=thread_id,
                 include_observed_context=is_group_observe_turn,
+            ),
+            metadata=(
+                {"turn_latency_participation": participation_latency}
+                if participation_latency
+                else {}
             ),
             timestamp=datetime.now(),
         )
@@ -6729,7 +6793,7 @@ def register(ctx) -> None:
         description="Decide when Hermes should join unaddressed group discussions",
         defaults={
             "provider": "auto",
-            "timeout": 8,
+            "timeout": 4,
         },
     )
     ctx.register_platform(

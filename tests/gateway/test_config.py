@@ -391,6 +391,7 @@ class TestGatewayConfigRoundtrip:
             group_sessions_per_user=False,
             thread_sessions_per_user=True,
             systemd_watchdog_seconds=120,
+            turn_latency_enabled=True,
         )
         d = config.to_dict()
         restored = GatewayConfig.from_dict(d)
@@ -402,6 +403,10 @@ class TestGatewayConfigRoundtrip:
         assert restored.group_sessions_per_user is False
         assert restored.thread_sessions_per_user is True
         assert restored.systemd_watchdog_seconds == 120
+        assert restored.turn_latency_enabled is True
+
+    def test_turn_latency_defaults_disabled(self):
+        assert GatewayConfig.from_dict({}).turn_latency_enabled is False
 
     def test_systemd_watchdog_from_dict_disables_invalid_values(self):
         invalid_values = [
@@ -548,6 +553,32 @@ class TestGatewayConfigRoundtrip:
 
 
 class TestLoadGatewayConfig:
+    def test_bridges_turn_latency_to_platform_configs(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "observability:\n"
+            "  turn_latency:\n"
+            "    enabled: true\n"
+            "platforms:\n"
+            "  feishu:\n"
+            "    enabled: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.turn_latency_enabled is True
+        assert all(
+            platform.extra["_turn_latency_enabled"] is True
+            for platform in config.platforms.values()
+        )
+
     def test_shipped_template_does_not_enable_auto_reset(self, tmp_path, monkeypatch):
         """A fresh install seeded from cli-config.yaml.example must not
         auto-reset sessions.

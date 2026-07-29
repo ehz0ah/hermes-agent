@@ -161,8 +161,9 @@ gateway acks it after durable handoff.
 
 Source of truth: `SessionSource.to_dict()` in `gateway/session.py`. These are
 every key the gateway accepts on the wire. `platform`, `chat_id`, `chat_type`,
-`user_id`, `user_name`, `thread_id`, `chat_name`, and `chat_topic` are always
-present (may be `null`); the rest are included only when set.
+`user_id`, `user_name`, `user_handle`, `thread_id`, `chat_name`, and
+`chat_topic` are always present (may be `null`); the rest are included only
+when set.
 
 | Field | Type | Always sent | Meaning |
 | --- | --- | --- | --- |
@@ -172,6 +173,7 @@ present (may be `null`); the rest are included only when set.
 | `chat_name` | string\|null | yes | Human-readable chat name. |
 | `user_id` | string\|null | yes | Message author id. Session-key discriminator. |
 | `user_name` | string\|null | yes | Author display name. |
+| `user_handle` | string\|null | yes | Platform-native username or mention string, when available. Presentation metadata only; not a session-key discriminator. |
 | `thread_id` | string\|null | yes | Thread/forum-topic id when in a thread. Session-key discriminator. |
 | `chat_topic` | string\|null | yes | Channel topic/description (Discord, Slack). |
 | `user_id_alt` | string | no | Platform-specific stable alt id (Signal UUID, Feishu union_id). |
