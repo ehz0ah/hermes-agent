@@ -143,10 +143,18 @@ class TestParticipationSettings:
 
         assert settings.participation_mode == "adaptive"
         assert settings.participation_debounce_seconds == 1.5
-        assert settings.participation_timeout_seconds == 4.0
+        assert settings.participation_timeout_seconds == 6.0
         assert settings.participation_recent_messages == 12
         assert settings.participation_confidence_threshold == 0.8
         assert settings.participation_cooldown_seconds == 30
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_timeout_override_is_preserved(self):
+        settings = FeishuAdapter._load_settings(
+            {"participation": {"mode": "adaptive", "timeout_seconds": 2.5}}
+        )
+
+        assert settings.participation_timeout_seconds == 2.5
 
     def test_per_group_mode_precedes_global_and_legacy_policy(self):
         adapter = _adaptive_adapter()

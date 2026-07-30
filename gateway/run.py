@@ -1084,6 +1084,8 @@ _OBSERVED_CONTEXT_PROMPT_MARKERS = (
     _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER,
     _FEISHU_OBSERVED_CONTEXT_PROMPT_MARKER,
 )
+_FEISHU_OBSERVED_CONTEXT_DEFAULT_MESSAGES = 50
+_FEISHU_OBSERVED_CONTEXT_DEFAULT_TOKENS = 10_000
 
 
 def _uses_observed_group_context(channel_prompt: Optional[str]) -> bool:
@@ -1126,6 +1128,132 @@ def _trailing_observed_group_messages(
         trailing.append(message)
     trailing.reverse()
     return trailing
+
+
+def _truncate_to_rough_token_budget(text: str, max_tokens: int) -> str:
+    """Return the longest text prefix within the rough model-token budget."""
+    from agent.model_metadata import estimate_tokens_rough
+
+    if max_tokens <= 0 or not text:
+        return ""
+    if estimate_tokens_rough(text) <= max_tokens:
+        return text
+
+    low, high = 0, len(text)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        if estimate_tokens_rough(text[:midpoint]) <= max_tokens:
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return text[:low].rstrip()
+
+
+def _bounded_feishu_observed_context(
+    messages: List[Dict[str, Any]],
+    *,
+    inject_timestamps: bool = False,
+    max_messages: int = _FEISHU_OBSERVED_CONTEXT_DEFAULT_MESSAGES,
+    max_tokens: int = _FEISHU_OBSERVED_CONTEXT_DEFAULT_TOKENS,
+) -> Optional[str]:
+    """Render the newest Feishu observations as a bounded sliding window."""
+    from agent.model_metadata import estimate_tokens_rough
+    from gateway.message_timestamps import (
+        render_user_content_with_timestamp as _render_msg_ts,
+    )
+    from hermes_time import get_timezone as _get_msg_tz
+
+    if max_messages <= 0 or max_tokens <= 0:
+        return None
+
+    timezone = _get_msg_tz() if inject_timestamps else None
+    rendered: List[str] = []
+    for message in messages[-max_messages:]:
+        content = str(message.get("content") or "")
+        if inject_timestamps:
+            content = _render_msg_ts(content, message.get("timestamp"), tz=timezone)
+        content = content.strip()
+        if content:
+            rendered.append(content)
+
+    selected: List[str] = []
+    used_tokens = 0
+    for block in reversed(rendered):
+        separator_tokens = 4 if selected else 0
+        remaining = max_tokens - used_tokens - separator_tokens
+        if remaining <= 0:
+            break
+
+        block_tokens = estimate_tokens_rough(block)
+        if block_tokens > remaining:
+            if selected:
+                break
+            block = _truncate_to_rough_token_budget(block, remaining)
+            if not block:
+                break
+            block_tokens = estimate_tokens_rough(block)
+
+        selected.append(block)
+        used_tokens += separator_tokens + block_tokens
+
+    if not selected:
+        return None
+    selected.reverse()
+    return "\n".join(selected)
+
+
+def _observed_group_context_for_prompt(
+    history: List[Dict[str, Any]],
+    *,
+    channel_prompt: Optional[str] = None,
+    inject_timestamps: bool = False,
+) -> Optional[str]:
+    """Select observed prompt context without changing persistence semantics."""
+    if not _uses_observed_group_context(channel_prompt):
+        return None
+
+    if channel_prompt and _FEISHU_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt:
+        observed_messages: List[Dict[str, Any]] = []
+        for message in reversed(history or []):
+            if not _is_observed_user_message(message):
+                continue
+            observed_messages.append(message)
+            if len(observed_messages) >= _FEISHU_OBSERVED_CONTEXT_DEFAULT_MESSAGES:
+                break
+        observed_messages.reverse()
+        return _bounded_feishu_observed_context(
+            observed_messages,
+            inject_timestamps=inject_timestamps,
+        )
+
+    trailing = _trailing_observed_group_messages(
+        history,
+        channel_prompt=channel_prompt,
+    )
+    if not trailing:
+        return None
+
+    if not inject_timestamps:
+        return "\n".join(
+            str(message.get("content") or "").strip()
+            for message in trailing
+            if str(message.get("content") or "").strip()
+        ) or None
+
+    from gateway.message_timestamps import (
+        render_user_content_with_timestamp as _render_msg_ts,
+    )
+    from hermes_time import get_timezone as _get_msg_tz
+
+    timezone = _get_msg_tz()
+    return "\n".join(
+        _render_msg_ts(
+            str(message.get("content") or ""),
+            message.get("timestamp"),
+            tz=timezone,
+        ).strip()
+        for message in trailing
+    ) or None
 
 
 def _observed_context_guidance(channel_prompt: Optional[str]) -> str:
@@ -1406,11 +1534,12 @@ def _build_gateway_agent_history(
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
     """Convert stored gateway transcript rows into agent replay messages.
 
-    Observed group rows are returned as API-only context for the
-    current addressed message instead of being replayed as normal prior user
-    turns.  Keeping that context out of ``conversation_history`` avoids
-    consecutive-user repair merging it with the live user turn and then hiding
-    the current message behind ``history_offset`` during persistence.
+    Observed group rows are returned as API-only context instead of being
+    replayed as normal prior user turns. Feishu uses a bounded sliding prompt
+    window; Telegram preserves its trailing-only window. Keeping that context
+    out of ``conversation_history`` avoids consecutive-user repair merging it
+    with the live user turn and then hiding the current message behind
+    ``history_offset`` during persistence.
 
     When ``inject_timestamps`` is True (gateway.message_timestamps.enabled),
     each replayed user message is rendered with a single human-readable
@@ -1424,18 +1553,11 @@ def _build_gateway_agent_history(
 
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
-    observed_group_context: List[str] = []
     separate_observed_context = _uses_observed_group_context(channel_prompt)
-    trailing_observed_ids = (
-        {
-            id(message)
-            for message in _trailing_observed_group_messages(
-                history,
-                channel_prompt=channel_prompt,
-            )
-        }
-        if separate_observed_context
-        else set()
+    observed_context = _observed_group_context_for_prompt(
+        history,
+        channel_prompt=channel_prompt,
+        inject_timestamps=inject_timestamps,
     )
 
     for msg in history or []:
@@ -1456,8 +1578,6 @@ def _build_gateway_agent_history(
         if inject_timestamps and role == "user" and isinstance(content, str):
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and _is_observed_user_message(msg):
-            if id(msg) in trailing_observed_ids and content:
-                observed_group_context.append(str(content).strip())
             continue
 
         # Rich agent messages (tool_calls, tool results) must be passed through
@@ -1511,7 +1631,6 @@ def _build_gateway_agent_history(
         agent_history, now=time.time()
     )
 
-    observed_context = "\n".join(observed_group_context).strip() or None
     return agent_history, observed_context
 
 
@@ -1520,7 +1639,7 @@ def _observed_group_messages_for_memory(
     *,
     channel_prompt: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Return the same trailing observed window for provider-only memory sync."""
+    """Return the one-time trailing observed window for provider memory sync."""
     return [
         dict(message)
         for message in _trailing_observed_group_messages(

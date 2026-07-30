@@ -983,7 +983,7 @@ platform_toolsets:
 #       observe_unmentioned_group_messages: true
 #       participation:
 #         mode: adaptive
-#         timeout_seconds: 4
+#         timeout_seconds: 6
 #         recent_messages: 12
 #         confidence_threshold: 0.8
 #         cooldown_seconds: 30

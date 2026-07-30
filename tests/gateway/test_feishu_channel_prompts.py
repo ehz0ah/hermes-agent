@@ -100,3 +100,157 @@ def test_observed_context_prompts_prioritize_same_chat():
     assert "newest relevant message in this same chat or thread" in channel_prompt
     assert "newest relevant message in this same chat or thread" in turn_prompt
     assert "before consulting other conversations or long-term memory" in turn_prompt
+
+
+def test_feishu_observed_context_slides_while_memory_sync_stays_trailing():
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _observed_group_messages_for_memory,
+    )
+
+    channel_prompt = "observed Feishu/Lark group context"
+    observed_a = {"role": "user", "content": "[Alice]\nA", "observed": True}
+    observed_b = {"role": "user", "content": "[Bob]\nB", "observed": True}
+    first_history = [observed_a, observed_b]
+
+    first_replay, first_context = _build_gateway_agent_history(
+        first_history,
+        channel_prompt=channel_prompt,
+    )
+    first_sync = _observed_group_messages_for_memory(
+        first_history,
+        channel_prompt=channel_prompt,
+    )
+
+    assert first_replay == []
+    assert first_context == "[Alice]\nA\n[Bob]\nB"
+    assert [message["content"] for message in first_sync] == [
+        "[Alice]\nA",
+        "[Bob]\nB",
+    ]
+
+    observed_c = {"role": "user", "content": "[Carol]\nC", "observed": True}
+    second_history = [
+        observed_a,
+        observed_b,
+        {"role": "user", "content": "[Alice]\nWhat did everyone say?"},
+        {"role": "assistant", "content": "A and B."},
+        observed_c,
+    ]
+
+    second_replay, second_context = _build_gateway_agent_history(
+        second_history,
+        channel_prompt=channel_prompt,
+    )
+    second_sync = _observed_group_messages_for_memory(
+        second_history,
+        channel_prompt=channel_prompt,
+    )
+
+    assert second_replay == [
+        {"role": "user", "content": "[Alice]\nWhat did everyone say?"},
+        {"role": "assistant", "content": "A and B."},
+    ]
+    assert second_context == "[Alice]\nA\n[Bob]\nB\n[Carol]\nC"
+    assert [message["content"] for message in second_sync] == ["[Carol]\nC"]
+
+
+def test_feishu_observed_context_keeps_newest_50_in_chronological_order():
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {
+            "role": "user",
+            "content": f"observed-{index:02d}",
+            "observed": True,
+        }
+        for index in range(55)
+    ]
+
+    replay, context = _build_gateway_agent_history(
+        history,
+        channel_prompt="observed Feishu/Lark group context",
+    )
+
+    assert replay == []
+    assert context is not None
+    assert context.splitlines() == [
+        f"observed-{index:02d}" for index in range(5, 55)
+    ]
+
+
+def test_feishu_observed_context_enforces_token_cap_for_oversized_newest_message():
+    from agent.model_metadata import estimate_tokens_rough
+    from gateway.run import _build_gateway_agent_history
+
+    oversized = "界" * 12_000
+    history = [
+        {"role": "user", "content": "older context", "observed": True},
+        {"role": "user", "content": oversized, "observed": True},
+    ]
+
+    replay, context = _build_gateway_agent_history(
+        history,
+        channel_prompt="observed Feishu/Lark group context",
+    )
+
+    assert replay == []
+    assert context is not None
+    assert "older context" not in context
+    assert context
+    assert len(context) < len(oversized)
+    assert estimate_tokens_rough(context) <= 10_000
+
+
+def test_real_feishu_thread_inherits_bounded_parent_observed_window():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    parent_history = [
+        {"role": "user", "content": "[Alice]\nparent A", "observed": True},
+        {"role": "user", "content": "[Bob]\nparent B", "observed": True},
+        {"role": "user", "content": "[Alice]\naddressed parent turn"},
+        {"role": "assistant", "content": "parent answer"},
+        {"role": "user", "content": "[Carol]\nparent C", "observed": True},
+    ]
+
+    class _ParentStore:
+        _entries = {
+            "parent-session-key": SimpleNamespace(session_id="parent-session")
+        }
+
+        @staticmethod
+        def _ensure_loaded():
+            return None
+
+        @staticmethod
+        def load_transcript(session_id):
+            assert session_id == "parent-session"
+            return parent_history
+
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = _ParentStore()
+    runner._session_key_for_source = lambda source: (
+        "parent-session-key" if source.thread_id is None else "thread-session-key"
+    )
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_team",
+        chat_name="Platform Team",
+        chat_type="group",
+        user_id="ou_alice",
+        user_name="Alice",
+        thread_id="omt_thread",
+    )
+
+    context = runner._feishu_parent_observed_context_for_thread(
+        source,
+        channel_prompt="observed Feishu/Lark group context",
+    )
+
+    assert context is not None
+    assert context.startswith("[Recent parent chat context before this thread]")
+    assert context.index("parent A") < context.index("parent B") < context.index("parent C")
+    assert "addressed parent turn" not in context
+    assert "parent answer" not in context

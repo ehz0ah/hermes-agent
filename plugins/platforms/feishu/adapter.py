@@ -426,7 +426,7 @@ class FeishuAdapterSettings:
     observe_unmentioned_group_messages: bool = False
     participation_mode: str = "mention_only"
     participation_debounce_seconds: float = 1.5
-    participation_timeout_seconds: float = 4.0
+    participation_timeout_seconds: float = 6.0
     participation_recent_messages: int = 12
     participation_confidence_threshold: float = 0.8
     participation_cooldown_seconds: float = 30.0
@@ -1750,9 +1750,9 @@ class FeishuAdapter(BasePlatformAdapter):
             participation_timeout_seconds=_coerce_float(
                 participation_cfg.get(
                     "timeout_seconds",
-                    os.getenv("FEISHU_PARTICIPATION_TIMEOUT_SECONDS", "4"),
+                    os.getenv("FEISHU_PARTICIPATION_TIMEOUT_SECONDS", "6"),
                 ),
-                default=4.0,
+                default=6.0,
                 min_value=0.1,
             ),
             participation_recent_messages=_coerce_required_int(
@@ -3961,7 +3961,7 @@ class FeishuAdapter(BasePlatformAdapter):
         _bridge_byteplus_participation_env()
         aux_prefix = "AUXILIARY_FEISHU_PARTICIPATION"
         deadline = float(
-            getattr(self, "_participation_timeout_seconds", 4.0)
+            getattr(self, "_participation_timeout_seconds", 6.0)
         )
         async with asyncio.timeout(deadline):
             response = await async_call_llm(
