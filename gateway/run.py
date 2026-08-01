@@ -68,6 +68,11 @@ from agent.conversation_compression import (
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from agent.memory_provider import refresh_memory_turn_context
+from gateway.response_filters import (
+    is_intentional_silence_agent_result,
+    is_intentional_silence_message,
+    is_intentional_silence_response,
+)
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -1373,6 +1378,8 @@ def _cross_session_sender_name(message: Dict[str, Any]) -> str:
 
 
 def _cross_session_message_content(message: Dict[str, Any]) -> str:
+    if is_intentional_silence_message(message):
+        return ""
     content = str(message.get("content") or "").strip()
     content = _FEISHU_AT_TAG_RE.sub(
         lambda match: f"@{match.group(1).strip()}",
@@ -1563,6 +1570,8 @@ def _build_gateway_agent_history(
     for msg in history or []:
         role = msg.get("role")
         if not role:
+            continue
+        if is_intentional_silence_message(msg):
             continue
 
         # Skip metadata entries (tool definitions, session info) -- these are
@@ -14902,13 +14911,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # empty-response handling (and the suppression below) applies.
             if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
                 response = ""
-            try:
-                from gateway.response_filters import is_intentional_silence_agent_result
-                _intentional_silence = is_intentional_silence_agent_result(
-                    agent_result, response,
-                )
-            except Exception:
-                _intentional_silence = False
+            _silence_control = is_intentional_silence_response(response)
+            _intentional_silence = is_intentional_silence_agent_result(
+                agent_result,
+                response,
+            )
+            if _silence_control and not _intentional_silence:
+                # A failed agent turn must surface its real error. Treat an
+                # exact control token as absent output so the normal failure
+                # normalization below can produce the user-facing error.
+                response = ""
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -15321,6 +15333,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
+                new_messages = [
+                    msg
+                    for msg in new_messages
+                    if not is_intentional_silence_message(msg)
+                ]
 
                 # If no new messages found (edge case), fall back to simple user/assistant
                 if not new_messages:
@@ -24397,13 +24414,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Apply the same predicate as the normal completed-turn path.
                     # This direct queued-send branch predates intentional-silence
                     # filtering, so without this check it leaks the literal marker.
-                    try:
-                        from gateway.response_filters import is_intentional_silence_agent_result
-                        _intentional_silence = is_intentional_silence_agent_result(
-                            _delivery_result, first_response,
+                    _silence_control = is_intentional_silence_response(first_response)
+                    _intentional_silence = is_intentional_silence_agent_result(
+                        _delivery_result,
+                        first_response,
+                    )
+                    if _silence_control and not _intentional_silence:
+                        first_response = _normalize_empty_agent_response(
+                            _delivery_result,
+                            "",
+                            history_len=len(history),
                         )
-                    except Exception:
-                        _intentional_silence = False
                     if _intentional_silence:
                         logger.info(
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",

@@ -144,6 +144,77 @@ def test_request_idempotency_returns_cached_result(service, monkeypatch):
     assert len(client.requests) == 1
 
 
+def test_managed_reaction_is_idempotent_and_removes_only_owned_id(
+    service,
+    monkeypatch,
+):
+    calls = []
+
+    def request(method, uri, **kwargs):
+        calls.append((method, uri, kwargs))
+        if method == "POST":
+            return LarkApiResult({"reaction_id": "reaction_1"}, "req-add")
+        return LarkApiResult({}, "req-remove")
+
+    monkeypatch.setattr(service, "request", request)
+
+    first = service.add_managed_reaction(
+        message_id="om_1",
+        emoji_type="THUMBSUP",
+        scopes=("im:message.reactions:write",),
+        idempotency_key="stable",
+    )
+    second = service.add_managed_reaction(
+        message_id="om_1",
+        emoji_type="THUMBSUP",
+        scopes=("im:message.reactions:write",),
+        idempotency_key="stable",
+    )
+
+    assert first.data == {"reaction_id": "reaction_1"}
+    assert second.data["already_present"] is True
+    assert len(calls) == 1
+
+    removed = service.remove_managed_reaction(
+        message_id="om_1",
+        scopes=("im:message.reactions:write",),
+    )
+    assert removed.data["removed"] is True
+    assert calls[-1][2]["paths"]["reaction_id"] == "reaction_1"
+
+    missing = service.remove_managed_reaction(
+        message_id="om_1",
+        scopes=("im:message.reactions:write",),
+    )
+    assert missing.data["reason"] == "no_managed_reaction"
+    assert len(calls) == 2
+
+
+def test_managed_reaction_refuses_replacement(service, monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "request",
+        lambda *args, **kwargs: LarkApiResult(
+            {"reaction_id": "reaction_1"},
+            "req-add",
+        ),
+    )
+    service.add_managed_reaction(
+        message_id="om_1",
+        emoji_type="THUMBSUP",
+        scopes=("im:message.reactions:write",),
+        idempotency_key="stable",
+    )
+
+    with pytest.raises(LarkServiceError, match="already has"):
+        service.add_managed_reaction(
+            message_id="om_1",
+            emoji_type="HEART",
+            scopes=("im:message.reactions:write",),
+            idempotency_key="different",
+        )
+
+
 def test_user_auth_requires_explicit_user_oauth_token(service, monkeypatch):
     monkeypatch.delenv("FEISHU_USER_ACCESS_TOKEN", raising=False)
 

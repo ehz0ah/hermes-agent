@@ -62,6 +62,23 @@ class _FakeService:
         self.calls.append(("DOWNLOAD_FILE", "", kwargs))
         return LarkApiResult({"path": kwargs["destination"]}, "req-download-file")
 
+    def add_managed_reaction(self, **kwargs):
+        self.calls.append(("ADD_REACTION", "", kwargs))
+        return LarkApiResult(
+            {
+                "reaction_id": "reaction_1",
+                "reaction_type": {"emoji_type": kwargs["emoji_type"]},
+            },
+            "req-reaction",
+        )
+
+    def remove_managed_reaction(self, **kwargs):
+        self.calls.append(("REMOVE_REACTION", "", kwargs))
+        return LarkApiResult(
+            {"removed": True, "message_id": kwargs["message_id"]},
+            "req-remove-reaction",
+        )
+
 
 @pytest.fixture
 def fake_service(monkeypatch):
@@ -88,15 +105,25 @@ def test_lark_tools_are_registered_in_feishu_toolset_only():
         "lark_wiki",
         "lark_drive",
         "lark_calendar",
-        "lark_tasks",
         "lark_bitable",
-        "lark_meetings",
         "lark_permissions",
     }
     assert names <= set(TOOLSETS["hermes-feishu"]["tools"])
+    assert "lark_tasks" not in TOOLSETS["hermes-feishu"]["tools"]
+    assert "lark_meetings" not in TOOLSETS["hermes-feishu"]["tools"]
     for toolset, definition in TOOLSETS.items():
         if toolset != "hermes-feishu":
             assert not names.intersection(definition["tools"])
+
+
+def test_deferred_domains_and_meeting_rooms_are_not_exposed():
+    from toolsets import TOOLSETS
+
+    feishu_tools = set(TOOLSETS["hermes-feishu"]["tools"])
+    assert "lark_tasks" not in feishu_tools
+    assert "lark_meetings" not in feishu_tools
+    assert "list_rooms" not in _TOOLS["lark_calendar"][1]
+    assert "list_rooms" in _CALENDAR_ACTIONS
 
 
 def test_action_schema_explains_required_parameters():
@@ -797,6 +824,75 @@ def test_send_formats_mentions_and_honors_approval(fake_service, monkeypatch):
     assert kwargs["retries"] == 0
 
 
+def test_react_uses_safe_alias_without_interactive_approval(
+    fake_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "tools.lark_tools.request_tool_approval",
+        lambda *args, **kwargs: pytest.fail("reactions must not prompt"),
+    )
+
+    payload = _payload(
+        _execute(
+            "lark_im",
+            _IM_ACTIONS,
+            {
+                "action": "react",
+                "params": {"message_id": "om_1", "emoji": "👍"},
+            },
+            {"session_id": "sid"},
+        )
+    )
+
+    assert payload["success"] is True
+    method, _, kwargs = fake_service.calls[0]
+    assert method == "ADD_REACTION"
+    assert kwargs["message_id"] == "om_1"
+    assert kwargs["emoji_type"] == "THUMBSUP"
+    assert kwargs["scopes"] == ("im:message.reactions:write",)
+    assert kwargs["idempotency_key"]
+
+
+def test_react_rejects_emoji_outside_allowlist(fake_service):
+    payload = _payload(
+        _execute(
+            "lark_im",
+            _IM_ACTIONS,
+            {
+                "action": "react",
+                "params": {"message_id": "om_1", "emoji": "Typing"},
+            },
+            {},
+        )
+    )
+
+    assert "emoji must be one of" in payload["error"]
+    assert fake_service.calls == []
+
+
+def test_remove_reaction_uses_only_service_managed_handle(fake_service):
+    payload = _payload(
+        _execute(
+            "lark_im",
+            _IM_ACTIONS,
+            {
+                "action": "remove_reaction",
+                "params": {"message_id": "om_1"},
+            },
+            {},
+        )
+    )
+
+    assert payload["success"] is True
+    method, _, kwargs = fake_service.calls[0]
+    assert method == "REMOVE_REACTION"
+    assert kwargs == {
+        "message_id": "om_1",
+        "scopes": ("im:message.reactions:write",),
+    }
+
+
 def test_write_denial_never_calls_lark(fake_service, monkeypatch):
     monkeypatch.setattr(
         "tools.lark_tools.request_tool_approval",
@@ -867,10 +963,20 @@ def test_permission_audit_does_not_expose_credentials(fake_service, monkeypatch)
         "tenant_token": "configured",
         "user_token": "missing",
     }
-    assert payload["user_token_actions"] == [
-        "lark_wiki.search",
-        "lark_tasks.search",
-        "lark_meetings.search",
-        "lark_meetings.search_minutes",
-    ]
+    assert payload["active_tools"] == sorted(
+        {
+            "lark_people",
+            "lark_im",
+            "lark_docs",
+            "lark_wiki",
+            "lark_drive",
+            "lark_calendar",
+            "lark_bitable",
+        }
+    )
+    assert payload["deferred_domains"] == {
+        "calendar_rooms": "Deferred until meeting-room permissions are approved.",
+        "lark_meetings": "Deferred for a later release.",
+        "lark_tasks": "Deferred because the team does not use native Feishu Tasks.",
+    }
     assert "secret" not in result.lower()

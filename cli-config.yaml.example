@@ -983,9 +983,12 @@ platform_toolsets:
 #       observe_unmentioned_group_messages: true
 #       participation:
 #         mode: adaptive
-#         timeout_seconds: 6
+#         timeout_seconds: 10
 #         recent_messages: 12
 #         confidence_threshold: 0.8
+#         hot_confidence_threshold: 0.55
+#         hot_window_seconds: 180
+#         hot_max_human_messages: 2
 #         cooldown_seconds: 30
 #   webhook:
 #     extra:

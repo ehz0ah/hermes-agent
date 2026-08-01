@@ -190,6 +190,8 @@ class LarkService:
         self._dedup: dict[str, tuple[float, LarkApiResult]] = {}
         self._scope_lock = threading.Lock()
         self._scope_status: dict[str, str] = {}
+        self._reaction_lock = threading.Lock()
+        self._managed_reactions: dict[str, tuple[str, str]] = {}
 
     @classmethod
     def from_environment(cls) -> "LarkService":
@@ -351,6 +353,101 @@ class LarkService:
             return
         with self._dedup_lock:
             self._dedup[key] = (time.monotonic() + _DEDUP_TTL_SECONDS, result)
+
+    def add_managed_reaction(
+        self,
+        *,
+        message_id: str,
+        emoji_type: str,
+        scopes: Sequence[str],
+        idempotency_key: str,
+    ) -> LarkApiResult:
+        """Add one Hermes-owned reaction to a message.
+
+        The opaque reaction ID is retained in memory so removal can never
+        target a reaction created by another user or application. Losing this
+        handle on restart is intentionally fail-safe: Hermes can no longer
+        remove the old reaction, but it also cannot remove the wrong one.
+        """
+
+        with self._reaction_lock:
+            existing = self._managed_reactions.get(message_id)
+            if existing is not None:
+                reaction_id, existing_emoji = existing
+                if existing_emoji == emoji_type:
+                    return LarkApiResult(
+                        {
+                            "reaction_id": reaction_id,
+                            "emoji_type": existing_emoji,
+                            "already_present": True,
+                        },
+                        "",
+                    )
+                raise LarkServiceError(
+                    "Hermes already has a managed reaction on this message. "
+                    "Remove it before choosing another emoji."
+                )
+
+            result = self.request(
+                "POST",
+                "/open-apis/im/v1/messages/:message_id/reactions",
+                paths={"message_id": message_id},
+                body={"reaction_type": {"emoji_type": emoji_type}},
+                scopes=scopes,
+                idempotency_key=idempotency_key,
+                retries=0,
+            )
+            payload = result.data if isinstance(result.data, Mapping) else {}
+            reaction_id = str(payload.get("reaction_id") or "")
+            if not reaction_id:
+                raise LarkServiceError(
+                    "Lark accepted the reaction request but returned no reaction ID."
+                )
+            self._managed_reactions[message_id] = (reaction_id, emoji_type)
+            return result
+
+    def remove_managed_reaction(
+        self,
+        *,
+        message_id: str,
+        scopes: Sequence[str],
+    ) -> LarkApiResult:
+        """Remove only the reaction previously created by this service."""
+
+        with self._reaction_lock:
+            existing = self._managed_reactions.get(message_id)
+            if existing is None:
+                return LarkApiResult(
+                    {
+                        "message_id": message_id,
+                        "removed": False,
+                        "reason": "no_managed_reaction",
+                    },
+                    "",
+                )
+            reaction_id, emoji_type = existing
+            result = self.request(
+                "DELETE",
+                "/open-apis/im/v1/messages/:message_id/reactions/:reaction_id",
+                paths={
+                    "message_id": message_id,
+                    "reaction_id": reaction_id,
+                },
+                scopes=scopes,
+                retries=0,
+            )
+            self._managed_reactions.pop(message_id, None)
+            payload = result.data if isinstance(result.data, Mapping) else {}
+            return LarkApiResult(
+                {
+                    **dict(payload),
+                    "message_id": message_id,
+                    "reaction_id": reaction_id,
+                    "emoji_type": emoji_type,
+                    "removed": True,
+                },
+                result.request_id,
+            )
 
     def request(
         self,

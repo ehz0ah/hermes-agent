@@ -531,9 +531,7 @@ TOOLSETS = {
             "lark_wiki",
             "lark_drive",
             "lark_calendar",
-            "lark_tasks",
             "lark_bitable",
-            "lark_meetings",
             "lark_permissions",
         ],
         "includes": []

@@ -2650,6 +2650,44 @@ def _long_structured_turn(assistant_count=204):
     ]
 
 
+def test_sync_turn_does_not_persist_assistant_silence_control_row(monkeypatch):
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://test"
+    provider._api_key = ""
+    provider._account = "acct"
+    provider._user = "usr"
+    provider._agent = "hermes"
+    provider._session_id = "sid-silence"
+    captured = []
+
+    class StubClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, path, payload=None, **kwargs):
+            captured.append((path, payload))
+            return {}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+    provider.sync_turn(
+        "question",
+        "NO_REPLY",
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "NO_REPLY"},
+        ],
+    )
+    assert provider._drain_writers("sid-silence", timeout=2.0)
+
+    assert captured == [
+        (
+            "/api/v1/sessions/sid-silence/messages/batch",
+            {"messages": [{"role": "user", "parts": [{"type": "text", "text": "question"}]}]},
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     ("assistant_count", "expected_chunk_sizes"),
     [

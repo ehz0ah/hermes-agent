@@ -88,6 +88,9 @@ def test_inbound_event_no_prompt_when_unconfigured():
     event = _run_inbound(adapter, chat_id="oc_chat")
     assert event.channel_prompt.startswith("When mentioning a Feishu/Lark user")
     assert "preserve the exact verified" in event.channel_prompt
+    assert "first-party lark_* tools" in event.channel_prompt
+    assert "never substitute terminal commands" in event.channel_prompt
+    assert "Use lark_im reactions sparingly" in event.channel_prompt
 
 
 def test_observed_context_prompts_prioritize_same_chat():
@@ -100,6 +103,28 @@ def test_observed_context_prompts_prioritize_same_chat():
     assert "newest relevant message in this same chat or thread" in channel_prompt
     assert "newest relevant message in this same chat or thread" in turn_prompt
     assert "before consulting other conversations or long-term memory" in turn_prompt
+
+
+def test_intentional_silence_rows_are_excluded_from_replay_and_cross_session_context():
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _render_cross_session_message,
+    )
+
+    silence_row = {"role": "assistant", "content": "NO_REPLY"}
+    replay, observed_context = _build_gateway_agent_history(
+        [
+            {"role": "user", "content": "hello"},
+            silence_row,
+            {"role": "assistant", "content": "Use NO_REPLY only as a control token."},
+        ],
+        channel_prompt=None,
+    )
+
+    assert observed_context is None
+    assert silence_row not in replay
+    assert replay[-1]["content"] == "Use NO_REPLY only as a control token."
+    assert _render_cross_session_message(silence_row) is None
 
 
 def test_feishu_observed_context_slides_while_memory_sync_stays_trailing():

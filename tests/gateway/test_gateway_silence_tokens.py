@@ -93,7 +93,10 @@ def test_failed_agent_result_never_counts_as_intentional_silence():
 
 
 @pytest.mark.asyncio
-async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkeypatch, tmp_path):
+async def test_silence_token_suppresses_delivery_and_gateway_transcript_projection(
+    monkeypatch,
+    tmp_path,
+):
     runner = _runner(monkeypatch, tmp_path)
     runner._run_agent = AsyncMock(return_value={
         "final_response": "[SILENT]",
@@ -114,8 +117,36 @@ async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkey
 
     assert response == ""
     appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
-    assert {"role": "assistant", "content": "[SILENT]"}.items() <= appended[-1].items()
-    assert [msg["role"] for msg in appended if msg.get("role") in {"user", "assistant"}] == ["user", "assistant"]
+    assert not any(
+        msg.get("role") == "assistant" and msg.get("content") == "[SILENT]"
+        for msg in appended
+    )
+    assert [msg["role"] for msg in appended if msg.get("role") in {"user", "assistant"}] == ["user"]
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_with_silence_token_surfaces_real_error(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "NO_REPLY",
+        "messages": [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "NO_REPLY"},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": True,
+        "error": "provider unavailable",
+    })
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert "provider unavailable" in response
+    assert "NO_REPLY" not in response
 
 
 @pytest.mark.asyncio

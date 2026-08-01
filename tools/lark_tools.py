@@ -33,6 +33,7 @@ class ActionSpec:
     query_keys: tuple[str, ...] = ()
     scopes: tuple[str, ...] = ()
     write: bool = False
+    approval_required: bool = True
     paginate: bool = False
     custom: str = ""
     auth: str = "tenant"
@@ -167,6 +168,54 @@ _IM_ACTIONS = {
         write=True,
         custom="reply",
     ),
+    "react": ActionSpec(
+        "POST",
+        "/open-apis/im/v1/messages/:message_id/reactions",
+        required=("message_id", "emoji"),
+        path_keys=("message_id",),
+        scopes=("im:message.reactions:write",),
+        write=True,
+        approval_required=False,
+        custom="react",
+    ),
+    "remove_reaction": ActionSpec(
+        "DELETE",
+        "/open-apis/im/v1/messages/:message_id/reactions/:reaction_id",
+        required=("message_id",),
+        path_keys=("message_id",),
+        scopes=("im:message.reactions:write",),
+        write=True,
+        approval_required=False,
+        custom="remove_reaction",
+    ),
+}
+
+_SAFE_REACTION_EMOJIS = {
+    "APPLAUSE",
+    "CLAP",
+    "EYES",
+    "FIRE",
+    "HEART",
+    "LAUGH",
+    "OK",
+    "PARTY",
+    "SMILE",
+    "THANKS",
+    "THUMBSUP",
+}
+_REACTION_ALIASES = {
+    "👏": "APPLAUSE",
+    "👀": "EYES",
+    "🔥": "FIRE",
+    "❤": "HEART",
+    "❤️": "HEART",
+    "😂": "LAUGH",
+    "🤣": "LAUGH",
+    "👌": "OK",
+    "🎉": "PARTY",
+    "😊": "SMILE",
+    "🙏": "THANKS",
+    "👍": "THUMBSUP",
 }
 
 _DOC_ACTIONS = {
@@ -436,6 +485,12 @@ _CALENDAR_ACTIONS = {
         scopes=("calendar:calendar.event:update",),
         write=True,
     ),
+}
+
+_ACTIVE_CALENDAR_ACTIONS = {
+    action: spec
+    for action, spec in _CALENDAR_ACTIONS.items()
+    if action != "list_rooms"
 }
 
 _TASK_ACTIONS = {
@@ -721,20 +776,18 @@ _TOOLS: dict[str, tuple[str, Mapping[str, ActionSpec]]] = {
     ),
     "lark_calendar": (
         "Inspect agendas and availability or manage events and attendees.",
-        _CALENDAR_ACTIONS,
-    ),
-    "lark_tasks": (
-        "Search and manage tasks, subtasks, lists, comments, and attachments.",
-        _TASK_ACTIONS,
+        _ACTIVE_CALENDAR_ACTIONS,
     ),
     "lark_bitable": (
         "Inspect and update Bitable apps, tables, fields, views, and records.",
         _BITABLE_ACTIONS,
     ),
-    "lark_meetings": (
-        "Find completed meetings, participants, minutes, transcripts, and artifacts.",
-        _MEETING_ACTIONS,
-    ),
+}
+
+_DEFERRED_DOMAINS = {
+    "calendar_rooms": "Deferred until meeting-room permissions are approved.",
+    "lark_meetings": "Deferred for a later release.",
+    "lark_tasks": "Deferred because the team does not use native Feishu Tasks.",
 }
 
 _ALL_REQUIRED_SCOPES = tuple(
@@ -807,6 +860,17 @@ def _message_text(params: Mapping[str, Any]) -> str:
         if tags:
             prefix = " ".join(tags) + " "
     return prefix + str(params.get("text") or "")
+
+
+def _reaction_emoji_type(value: Any) -> str:
+    raw = str(value or "").strip()
+    normalized = _REACTION_ALIASES.get(raw, raw.upper())
+    if normalized not in _SAFE_REACTION_EMOJIS:
+        raise ValueError(
+            "emoji must be one of: "
+            + ", ".join(sorted(_SAFE_REACTION_EMOJIS))
+        )
+    return normalized
 
 
 def _idempotency_key(
@@ -988,7 +1052,7 @@ def _execute(
         )
 
     dedup_key = _idempotency_key(tool_name, action, params, args, kwargs)
-    if spec.write:
+    if spec.write and spec.approval_required:
         target = next(
             (
                 str(params[key])
@@ -1039,6 +1103,18 @@ def _execute(
                 file_token=str(params["file_token"]),
                 destination=str(params["destination"]),
                 version=str(params.get("version") or ""),
+            )
+        elif spec.custom == "react":
+            result = service.add_managed_reaction(
+                message_id=str(params["message_id"]),
+                emoji_type=_reaction_emoji_type(params["emoji"]),
+                scopes=spec.scopes,
+                idempotency_key=dedup_key,
+            )
+        elif spec.custom == "remove_reaction":
+            result = service.remove_managed_reaction(
+                message_id=str(params["message_id"]),
+                scopes=spec.scopes,
             )
         else:
             paths = {key: params[key] for key in spec.path_keys}
@@ -1185,12 +1261,8 @@ def _permission_handler(args: dict, **kwargs) -> str:
             "Hermes process. Unverified scopes have not been exercised yet."
         ),
         authentication=authentication,
-        user_token_actions=[
-            "lark_wiki.search",
-            "lark_tasks.search",
-            "lark_meetings.search",
-            "lark_meetings.search_minutes",
-        ],
+        active_tools=sorted(_TOOLS),
+        deferred_domains=_DEFERRED_DOMAINS,
         **audit,
     )
 

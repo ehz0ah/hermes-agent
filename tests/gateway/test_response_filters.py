@@ -1,6 +1,7 @@
 from gateway.response_filters import (
     is_autonomous_silence_response,
     is_intentional_silence_agent_result,
+    is_intentional_silence_message,
     is_intentional_silence_response,
 )
 
@@ -26,6 +27,28 @@ def test_blank_and_prose_mentions_are_not_silence():
 def test_failed_agent_result_never_counts_as_intentional_silence():
     assert is_intentional_silence_agent_result({"failed": False}, "NO_REPLY")
     assert not is_intentional_silence_agent_result({"failed": True}, "NO_REPLY")
+
+
+def test_plain_assistant_silence_rows_are_inert_but_protocol_rows_are_retained():
+    assert is_intentional_silence_message(
+        {"role": "assistant", "content": "NO_REPLY"}
+    )
+    assert not is_intentional_silence_message(
+        {"role": "user", "content": "NO_REPLY"}
+    )
+    assert not is_intentional_silence_message(
+        {
+            "role": "assistant",
+            "content": "NO_REPLY",
+            "tool_calls": [{"id": "call-1"}],
+        }
+    )
+    assert not is_intentional_silence_message(
+        {
+            "role": "assistant",
+            "content": "Use NO_REPLY when no answer is needed.",
+        }
+    )
 
 
 def test_autonomous_silence_accepts_marker_with_own_line_note():

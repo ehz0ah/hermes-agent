@@ -50,6 +50,7 @@ from urllib.request import url2pathname
 from agent.message_content import flatten_message_text
 from agent.memory_provider import MemoryProvider, MemoryTurnContext
 from agent.skill_commands import extract_user_instruction_from_skill_message
+from gateway.response_filters import is_intentional_silence_message
 from tools.registry import tool_error
 from utils import atomic_json_write, env_var_enabled
 
@@ -4557,7 +4558,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
             else []
         )
         if turn_messages:
-            turn_messages = [dict(message) for message in turn_messages]
+            turn_messages = [
+                dict(message)
+                for message in turn_messages
+                if not is_intentional_silence_message(message)
+            ]
             if not self._team_mode():
                 turn_messages = [
                     message

@@ -11,7 +11,7 @@ from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from gateway.platforms.base import ProcessingOutcome
 
@@ -525,6 +525,35 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             captured["request"].request_body.content,
             json.dumps({"text": "📖 read_file: \"/tmp/image.png\""}, ensure_ascii=False),
         )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_and_edit_suppress_exact_silence_without_calling_feishu(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        message_api = MagicMock()
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=message_api))
+        )
+
+        send_result = asyncio.run(adapter.send("oc_chat", "NO_REPLY"))
+        edit_result = asyncio.run(
+            adapter.edit_message("oc_chat", "om_progress", "[SILENT]")
+        )
+
+        self.assertTrue(send_result.success)
+        self.assertEqual(
+            send_result.raw_response,
+            {"suppressed": "intentional_silence"},
+        )
+        self.assertTrue(edit_result.success)
+        self.assertEqual(edit_result.message_id, "om_progress")
+        self.assertEqual(
+            edit_result.raw_response,
+            {"suppressed": "intentional_silence"},
+        )
+        message_api.assert_not_called()
 
     @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_falls_back_to_text_when_post_update_is_rejected(self):

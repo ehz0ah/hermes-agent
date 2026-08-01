@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -17,6 +18,7 @@ from plugins.platforms.feishu.adapter import (
     FeishuAdapter,
     FeishuGroupRule,
     _FeishuParticipationCandidate,
+    _FeishuParticipationState,
     _apply_yaml_config,
     _build_adapter,
     register,
@@ -95,6 +97,9 @@ def _adaptive_adapter() -> FeishuAdapter:
     adapter._participation_timeout_seconds = 4
     adapter._participation_recent_messages = 12
     adapter._participation_confidence_threshold = 0.8
+    adapter._participation_hot_confidence_threshold = 0.55
+    adapter._participation_hot_window_seconds = 180
+    adapter._participation_hot_max_human_messages = 2
     adapter._participation_cooldown_seconds = 30
     adapter._sent_message_ids_to_chat = {}
     adapter._ensure_participation_state()
@@ -136,6 +141,9 @@ class TestParticipationSettings:
                     "timeout_seconds": "not-a-number",
                     "recent_messages": "invalid",
                     "confidence_threshold": float("nan"),
+                    "hot_confidence_threshold": float("inf"),
+                    "hot_window_seconds": -1,
+                    "hot_max_human_messages": -1,
                     "cooldown_seconds": -1,
                 }
             }
@@ -143,9 +151,12 @@ class TestParticipationSettings:
 
         assert settings.participation_mode == "adaptive"
         assert settings.participation_debounce_seconds == 1.5
-        assert settings.participation_timeout_seconds == 6.0
+        assert settings.participation_timeout_seconds == 10.0
         assert settings.participation_recent_messages == 12
         assert settings.participation_confidence_threshold == 0.8
+        assert settings.participation_hot_confidence_threshold == 0.55
+        assert settings.participation_hot_window_seconds == 180
+        assert settings.participation_hot_max_human_messages == 2
         assert settings.participation_cooldown_seconds == 30
 
     @patch.dict(os.environ, {}, clear=True)
@@ -236,14 +247,14 @@ class TestParticipationDecisionParsing:
         ("raw", "expected"),
         [
             (
-                '{"decision":"speak","confidence":0.91,"reason_code":"useful"}',
-                ("speak", 0.91, "useful"),
+                '{"decision":"wake","confidence":0.91}',
+                ("wake", 0.91),
             ),
             (
                 "```json\n"
-                '{"decision":"silent","confidence":1,"reason_code":"chatter"}'
+                '{"decision":"silent","confidence":1}'
                 "\n```",
-                ("silent", 1.0, "chatter"),
+                ("silent", 1.0),
             ),
         ],
     )
@@ -256,10 +267,10 @@ class TestParticipationDecisionParsing:
             "",
             "speak",
             "[]",
-            '{"decision":"maybe","confidence":0.9,"reason_code":"x"}',
-            '{"decision":"speak","confidence":true,"reason_code":"x"}',
-            '{"decision":"speak","confidence":1.1,"reason_code":"x"}',
-            '{"decision":"speak","confidence":0.9,"reason_code":""}',
+            '{"decision":"maybe","confidence":0.9}',
+            '{"decision":"wake","confidence":true}',
+            '{"decision":"wake","confidence":1.1}',
+            '{"decision":"wake","confidence":0.9,"reason_code":"extra"}',
         ],
     )
     def test_rejects_malformed_or_ambiguous_output(self, raw):
@@ -298,10 +309,7 @@ class TestParticipationDecisionParsing:
             ) as call,
             patch(
                 "agent.auxiliary_client.extract_content_or_reasoning",
-                return_value=(
-                    '{"decision":"speak","confidence":0.9,'
-                    '"reason_code":"unanswered_question"}'
-                ),
+                return_value='{"decision":"wake","confidence":0.9}',
             ),
         ):
             assert await adapter._classify_participation(_candidate())
@@ -315,8 +323,9 @@ class TestParticipationDecisionParsing:
         assert "do not dismiss it merely because it is personal" in classifier_prompt
         assert "confidence that speaking would be useful" in classifier_prompt
         assert "not confidence that this classifier knows the answer" in classifier_prompt
-        assert "confidence at least 0.8" in classifier_prompt
+        assert "high confidence" in classifier_prompt
         assert "which option Alice preferred" in classifier_prompt
+        assert "structured hot-state evidence" in classifier_prompt
         assert call.await_args.kwargs["provider"] == "custom"
         assert call.await_args.kwargs["model"] == "deepseek-v4-flash"
         assert (
@@ -340,7 +349,8 @@ class TestParticipationDecisionParsing:
                 "timestamp": "4",
             },
         ]
-        assert payload["hermes_recently_participated"] is True
+        assert payload["conversation_state"]["same_chat_and_thread"] is True
+        assert payload["conversation_state"]["reply_to_hermes"] is False
 
     @pytest.mark.asyncio
     @patch.dict(
@@ -363,10 +373,7 @@ class TestParticipationDecisionParsing:
             ) as call,
             patch(
                 "agent.auxiliary_client.extract_content_or_reasoning",
-                return_value=(
-                    '{"decision":"silent","confidence":0.95,'
-                    '"reason_code":"casual_chatter"}'
-                ),
+                return_value='{"decision":"silent","confidence":0.95}',
             ),
         ):
             assert not await adapter._classify_participation(_candidate())
@@ -392,10 +399,7 @@ class TestParticipationDecisionParsing:
             ),
             patch(
                 "agent.auxiliary_client.extract_content_or_reasoning",
-                return_value=(
-                    '{"decision":"speak","confidence":0.79,'
-                    '"reason_code":"weak_signal"}'
-                ),
+                return_value='{"decision":"wake","confidence":0.79}',
             ),
         ):
             assert not await adapter._classify_participation(_candidate())
@@ -452,6 +456,12 @@ class TestParticipationLifecycle:
             ]
             is True
         )
+        assert (
+            adapter._process_inbound_message.await_args.kwargs[
+                "adaptive_participation"
+            ]
+            is True
+        )
         participation_latency = (
             adapter._process_inbound_message.await_args.kwargs[
                 "participation_latency"
@@ -494,8 +504,14 @@ class TestParticipationLifecycle:
         adapter._participation_generations[candidate.key] = 2
         adapter._participation_pending[candidate.key] = next_candidate
         adapter._classify_participation = AsyncMock(return_value=True)
-        adapter._participation_last_spoke_at[candidate.key] = (
-            __import__("time").monotonic()
+        adapter._session_store = _TranscriptStore(
+            [
+                {
+                    "role": "assistant",
+                    "content": "recent Hermes reply",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            ]
         )
         adapter._persist_observed_candidate.reset_mock()
 
@@ -523,7 +539,7 @@ class TestParticipationLifecycle:
         adapter._process_inbound_message = AsyncMock()
         adapter._persist_observed_candidate = AsyncMock()
 
-        async def supersede_while_classifying(_candidate):
+        async def supersede_while_classifying(_candidate, **_kwargs):
             adapter._participation_generations[old.key] = 2
             adapter._participation_pending[old.key] = new
             return True
@@ -573,6 +589,110 @@ class TestParticipationLifecycle:
         assert candidate.key not in adapter._participation_tasks
 
 
+class TestParticipationState:
+    @pytest.mark.asyncio
+    async def test_recent_same_sender_continuation_is_hot(self):
+        adapter = _adaptive_adapter()
+        adapter._session_store = _TranscriptStore(
+            [
+                {
+                    "role": "assistant",
+                    "content": "What do you think?",
+                    "timestamp": datetime.now().isoformat(),
+                },
+                {
+                    "role": "user",
+                    "content": "I prefer the first option",
+                    "timestamp": datetime.now().isoformat(),
+                    "memory_source": {
+                        "user_id_alt": "on_alice",
+                        "user_name": "Alice",
+                    },
+                },
+            ]
+        )
+
+        state = await adapter._participation_state(_candidate())
+
+        assert state.hot is True
+        assert state.seconds_since_hermes_reply is not None
+        assert state.seconds_since_hermes_reply < 5
+        assert state.human_messages_since_hermes_reply == 2
+        assert state.same_sender_as_last_human is True
+        assert state.recent_dialogue[-1]["sender"] == "Alice"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            [],
+            [
+                {
+                    "role": "assistant",
+                    "content": "old reply",
+                    "timestamp": (
+                        datetime.now() - timedelta(minutes=10)
+                    ).isoformat(),
+                }
+            ],
+            [
+                {
+                    "role": "assistant",
+                    "content": "recent reply",
+                    "timestamp": datetime.now().isoformat(),
+                },
+                {"role": "user", "content": "one"},
+                {"role": "user", "content": "two"},
+            ],
+        ],
+    )
+    async def test_missing_stale_or_crowded_context_is_cold(self, rows):
+        adapter = _adaptive_adapter()
+        adapter._session_store = _TranscriptStore(rows)
+
+        state = await adapter._participation_state(_candidate())
+
+        assert state.hot is False
+
+    @pytest.mark.asyncio
+    async def test_hot_state_uses_lower_wake_threshold(self):
+        adapter = _adaptive_adapter()
+        response = object()
+        hot_state = _FeishuParticipationState(
+            recent_dialogue=[],
+            seconds_since_hermes_reply=10,
+            human_messages_since_hermes_reply=1,
+            same_sender_as_last_human=True,
+            hot=True,
+        )
+        cold_state = _FeishuParticipationState(
+            recent_dialogue=[],
+            seconds_since_hermes_reply=None,
+            human_messages_since_hermes_reply=0,
+            same_sender_as_last_human=False,
+            hot=False,
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client.async_call_llm",
+                new=AsyncMock(return_value=response),
+            ),
+            patch(
+                "agent.auxiliary_client.extract_content_or_reasoning",
+                return_value='{"decision":"wake","confidence":0.6}',
+            ),
+        ):
+            assert await adapter._classify_participation(
+                _candidate(),
+                state=hot_state,
+            )
+            assert not await adapter._classify_participation(
+                _candidate(),
+                state=cold_state,
+            )
+
+
 class TestParticipationIntegrationDefaults:
     @patch.dict(
         os.environ,
@@ -612,6 +732,10 @@ class TestParticipationIntegrationDefaults:
         assert (
             ctx.register_auxiliary_task.call_args.kwargs["key"]
             == "feishu_participation"
+        )
+        assert (
+            ctx.register_auxiliary_task.call_args.kwargs["defaults"]["timeout"]
+            == 10
         )
         ctx.register_platform.assert_called_once()
 

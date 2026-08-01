@@ -120,6 +120,23 @@ def is_intentional_silence_agent_result(agent_result: dict | None, response: Any
     return is_intentional_silence_response(response)
 
 
+def is_intentional_silence_message(message: Any) -> bool:
+    """Return True for a plain assistant control row that must not replay.
+
+    The agent runtime may persist its final ``NO_REPLY`` marker before the
+    gateway decides whether to deliver it. Keep that raw row available for
+    audit, but never treat it as conversational content. Assistant messages
+    carrying tool calls are retained because removing them would break the
+    assistant-to-tool protocol sequence.
+    """
+    return (
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and not message.get("tool_calls")
+        and is_intentional_silence_response(message.get("content"))
+    )
+
+
 def is_partial_silence_marker(text: Any) -> bool:
     """Return True while ``text`` could still resolve to a silence marker.
 
