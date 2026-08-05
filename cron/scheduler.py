@@ -4314,7 +4314,20 @@ def tick(
                 _running_job_ids.add(job_id)
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            try:
+                execution = create_execution(job_id, source="builtin")
+            except Exception as ledger_err:
+                # The job was never dispatched, so release the in-memory guard
+                # immediately.  Leaving it claimed would suppress every later
+                # tick for this job until the gateway restarts.
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                logger.error(
+                    "Job '%s' not dispatched: execution ledger unavailable: %s",
+                    job.get("name", job_id),
+                    ledger_err,
+                )
+                return None
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 

@@ -3603,6 +3603,35 @@ class TestParallelTick:
         assert len(ends) == 2
         assert max(starts) < min(ends), f"Jobs not concurrent: {call_order}"
 
+    def test_execution_ledger_failure_does_not_stick_running_guard(self):
+        """A transient ledger failure must leave the still-due job retryable."""
+        from cron import scheduler
+
+        job = {
+            "id": "ledger-retry-job",
+            "name": "ledger-retry",
+            "deliver": "local",
+            "no_agent": True,
+        }
+        scheduler._running_job_ids.discard(job["id"])
+
+        with (
+            patch("cron.scheduler.get_due_jobs", return_value=[job]),
+            patch("cron.scheduler.advance_next_run"),
+            patch(
+                "cron.scheduler.create_execution",
+                side_effect=[OSError("disk unavailable"), {"id": "exec-ok"}],
+            ),
+            patch("cron.scheduler.run_one_job", return_value=True) as run_job,
+            patch("cron.scheduler.mark_job_run"),
+        ):
+            assert scheduler.tick(verbose=False) == 0
+            assert job["id"] not in scheduler._running_job_ids
+            assert scheduler.tick(verbose=False) == 1
+
+        run_job.assert_called_once()
+        assert job["id"] not in scheduler._running_job_ids
+
     def test_parallel_jobs_isolated_contextvars(self):
         """Each job's ContextVars must be isolated — no cross-contamination."""
         from gateway.session_context import get_session_env

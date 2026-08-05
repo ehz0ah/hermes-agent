@@ -19,7 +19,10 @@ from typing import Any, Dict, Iterator, List, Optional
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
-EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+# Optional override used by focused tests and embedders.  The production path
+# is resolved at operation time so switching profiles/HERMES_HOME before a
+# call cannot be defeated by whichever module happened to import first.
+EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
@@ -27,8 +30,13 @@ _PROCESS_ID = uuid.uuid4().hex
 
 
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    executions_file = (
+        Path(EXECUTIONS_FILE)
+        if EXECUTIONS_FILE is not None
+        else get_hermes_home().resolve() / "cron" / "executions.db"
+    )
+    executions_file.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(executions_file, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
