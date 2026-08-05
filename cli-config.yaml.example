@@ -983,7 +983,8 @@ platform_toolsets:
 #       observe_unmentioned_group_messages: true
 #       participation:
 #         mode: adaptive
-#         timeout_seconds: 10
+#         aliases: [Hermes]  # Plain-text names that deterministically address the bot
+#         timeout_seconds: 30
 #         recent_messages: 12
 #         confidence_threshold: 0.8
 #         hot_confidence_threshold: 0.55

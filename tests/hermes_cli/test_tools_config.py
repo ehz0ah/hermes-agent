@@ -1260,6 +1260,10 @@ def test_computer_use_post_setup_missing_override_does_not_accept_default_binary
 
     with patch.dict("os.environ", {"HERMES_CUA_DRIVER_CMD": "custom-cua"}), \
          patch("platform.system", return_value="Darwin"), \
+         patch(
+             "hermes_cli.tools_config._cua_install_target_writable",
+             return_value=True,
+         ), \
          patch("shutil.which", side_effect=fake_which), \
          patch("subprocess.run") as run:
         _run_post_setup("cua_driver")
@@ -1510,6 +1514,28 @@ def test_get_platform_tools_feishu_includes_doc_and_drive():
     enabled = _get_platform_tools({}, "feishu")
     assert "feishu_doc" in enabled
     assert "feishu_drive" in enabled
+
+
+def test_get_platform_tools_feishu_exposes_first_party_lark_tools_end_to_end():
+    """The default Feishu session must receive its native Lark tools.
+
+    Static membership in ``hermes-feishu`` is insufficient: gateway sessions
+    pass the individual toolset names returned here into ``model_tools``.
+    """
+    from model_tools import get_tool_definitions
+
+    enabled = _get_platform_tools(
+        {}, "feishu", include_default_mcp_servers=False
+    )
+    definitions = get_tool_definitions(
+        enabled_toolsets=sorted(enabled),
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    )
+    names = {definition["function"]["name"] for definition in definitions}
+
+    assert "lark" in enabled
+    assert "lark_im" in names
 
 
 def test_get_platform_tools_feishu_tools_not_on_other_platforms():

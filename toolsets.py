@@ -517,14 +517,14 @@ TOOLSETS = {
         "includes": []
     },
 
-    "hermes-feishu": {
-        "description": "Feishu/Lark bot toolset - enterprise messaging via Feishu/Lark (full access)",
-        "tools": _HERMES_CORE_TOOLS + [
-            "feishu_doc_read",
-            "feishu_drive_list_comments",
-            "feishu_drive_list_comment_replies",
-            "feishu_drive_reply_comment",
-            "feishu_drive_add_comment",
+    # Platform-native first-party Lark capabilities.  Keep this as a static
+    # leaf toolset so per-platform tool resolution can recover it from the
+    # hermes-feishu composite even after `hermes tools` saves an explicit
+    # platform configuration.  Runtime check_fns still hide the tools when
+    # the official SDK or app credentials are unavailable.
+    "lark": {
+        "description": "First-party Feishu/Lark collaboration tools",
+        "tools": [
             "lark_people",
             "lark_im",
             "lark_docs",
@@ -534,7 +534,19 @@ TOOLSETS = {
             "lark_bitable",
             "lark_permissions",
         ],
-        "includes": []
+        "includes": [],
+    },
+
+    "hermes-feishu": {
+        "description": "Feishu/Lark bot toolset - enterprise messaging via Feishu/Lark (full access)",
+        "tools": _HERMES_CORE_TOOLS + [
+            "feishu_doc_read",
+            "feishu_drive_list_comments",
+            "feishu_drive_list_comment_replies",
+            "feishu_drive_reply_comment",
+            "feishu_drive_add_comment",
+        ],
+        "includes": ["lark"]
     },
 
     "hermes-weixin": {

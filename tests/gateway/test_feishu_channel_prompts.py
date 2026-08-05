@@ -11,7 +11,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 
 
 def _build_adapter(extra=None):
@@ -91,6 +91,31 @@ def test_inbound_event_no_prompt_when_unconfigured():
     assert "first-party lark_* tools" in event.channel_prompt
     assert "never substitute terminal commands" in event.channel_prompt
     assert "Use lark_im reactions sparingly" in event.channel_prompt
+    assert "Never use cronjob as a substitute" in event.channel_prompt
+
+
+def test_adaptive_prompt_values_brief_social_participation_without_noise():
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    prompt = FeishuAdapter._adaptive_participation_channel_prompt()
+
+    assert "socially includes or acknowledges Hermes" in prompt
+    assert "includes Hermes as a group member" in prompt
+    assert "routine informational notices are not" in prompt
+    assert "expressive, affiliative message" in prompt
+    assert "instrumental request or task" in prompt
+    assert "reaction plus NO_REPLY" in prompt
+    assert "Never send a message explaining that you will not interrupt" in prompt
+
+
+def test_feishu_triggering_message_note_supplies_reaction_target_per_turn():
+    from gateway.run import _triggering_message_tool_note
+
+    note = _triggering_message_tool_note(Platform.FEISHU, "om_current")
+
+    assert "om_current" in note
+    assert "lark_im" in note
+    assert "reply/react" in note
 
 
 def test_observed_context_prompts_prioritize_same_chat():

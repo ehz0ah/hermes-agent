@@ -151,7 +151,7 @@ class TestParticipationSettings:
 
         assert settings.participation_mode == "adaptive"
         assert settings.participation_debounce_seconds == 1.5
-        assert settings.participation_timeout_seconds == 10.0
+        assert settings.participation_timeout_seconds == 30.0
         assert settings.participation_recent_messages == 12
         assert settings.participation_confidence_threshold == 0.8
         assert settings.participation_hot_confidence_threshold == 0.55
@@ -166,6 +166,16 @@ class TestParticipationSettings:
         )
 
         assert settings.participation_timeout_seconds == 2.5
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_plain_text_aliases_are_configurable_with_safe_default(self):
+        default = FeishuAdapter._load_settings({"participation": {}})
+        customized = FeishuAdapter._load_settings(
+            {"participation": {"aliases": ["Hermes", "小海", "Hermes"]}}
+        )
+
+        assert default.participation_aliases == ("Hermes",)
+        assert customized.participation_aliases == ("Hermes", "小海")
 
     def test_per_group_mode_precedes_global_and_legacy_policy(self):
         adapter = _adaptive_adapter()
@@ -210,6 +220,17 @@ class TestParticipationAdmission:
         stub_mention(adapter, True)
         assert adapter._admit(sender, mentioned) is None
 
+        plain_alias = _group_message("welcome back hermes")
+        stub_mention(adapter, False)
+        assert adapter._admit(sender, plain_alias) is None
+
+        alias_prefix_only = _group_message("welcome back hermesbot")
+        assert adapter._admit(sender, alias_prefix_only) == "group_policy_rejected"
+
+        adapter._bot_name = "TeamMate"
+        hydrated_name = _group_message("welcome back teammate")
+        assert adapter._admit(sender, hydrated_name) is None
+
     def test_always_accepts_plain_group_text(self):
         adapter = make_adapter_skeleton(
             require_mention=True,
@@ -247,14 +268,18 @@ class TestParticipationDecisionParsing:
         ("raw", "expected"),
         [
             (
-                '{"decision":"wake","confidence":0.91}',
-                ("wake", 0.91),
+                '{"decision":"candidate","confidence":0.91}',
+                ("candidate", 0.91),
             ),
             (
                 "```json\n"
                 '{"decision":"silent","confidence":1}'
                 "\n```",
                 ("silent", 1.0),
+            ),
+            (
+                '{"decision":"uncertain","confidence":0.52}',
+                ("uncertain", 0.52),
             ),
         ],
     )
@@ -268,9 +293,10 @@ class TestParticipationDecisionParsing:
             "speak",
             "[]",
             '{"decision":"maybe","confidence":0.9}',
-            '{"decision":"wake","confidence":true}',
-            '{"decision":"wake","confidence":1.1}',
-            '{"decision":"wake","confidence":0.9,"reason_code":"extra"}',
+            '{"decision":"wake","confidence":0.9}',
+            '{"decision":"candidate","confidence":true}',
+            '{"decision":"candidate","confidence":1.1}',
+            '{"decision":"candidate","confidence":0.9,"reason_code":"extra"}',
         ],
     )
     def test_rejects_malformed_or_ambiguous_output(self, raw):
@@ -309,7 +335,7 @@ class TestParticipationDecisionParsing:
             ) as call,
             patch(
                 "agent.auxiliary_client.extract_content_or_reasoning",
-                return_value='{"decision":"wake","confidence":0.9}',
+                return_value='{"decision":"candidate","confidence":0.9}',
             ),
         ):
             assert await adapter._classify_participation(_candidate())
@@ -321,8 +347,18 @@ class TestParticipationDecisionParsing:
         assert "do not require the answer to appear" in classifier_prompt
         assert "colleague preferences" in classifier_prompt
         assert "do not dismiss it merely because it is personal" in classifier_prompt
-        assert "confidence that speaking would be useful" in classifier_prompt
-        assert "not confidence that this classifier knows the answer" in classifier_prompt
+        assert '"candidate", "uncertain", or "silent"' in classifier_prompt
+        assert "social inclusion" in classifier_prompt
+        assert "group, team, everyone, or the chat" in classifier_prompt
+        assert "written reply is unnecessary" in classifier_prompt
+        assert "choose uncertain rather than silent" in classifier_prompt
+        assert "routine logistical information" in classifier_prompt
+        assert "expressive, affiliative message that recognizes an individual" in classifier_prompt
+        assert "instrumental requests, questions, and assigned work" in classifier_prompt
+        assert "conversation_state.hot is true" in classifier_prompt
+        assert "semantically answers or continues Hermes's recent turn" in classifier_prompt
+        assert "directed at another person" in classifier_prompt
+        assert "never wake merely to announce" in classifier_prompt
         assert "high confidence" in classifier_prompt
         assert "which option Alice preferred" in classifier_prompt
         assert "structured hot-state evidence" in classifier_prompt
@@ -337,6 +373,8 @@ class TestParticipationDecisionParsing:
         payload = json.loads(messages[1]["content"])
         assert payload["chat"]["chat_name"] == "Platform Team"
         assert payload["sender"]["name"] == "Alice"
+        assert payload["assistant_identity"]["name"] == "Hermes"
+        assert "Hermes" in payload["assistant_identity"]["aliases"]
         assert payload["recent_dialogue"] == [
             {
                 "role": "assistant",
@@ -399,7 +437,7 @@ class TestParticipationDecisionParsing:
             ),
             patch(
                 "agent.auxiliary_client.extract_content_or_reasoning",
-                return_value='{"decision":"wake","confidence":0.79}',
+                return_value='{"decision":"candidate","confidence":0.79}',
             ),
         ):
             assert not await adapter._classify_participation(_candidate())
@@ -680,7 +718,7 @@ class TestParticipationState:
             ),
             patch(
                 "agent.auxiliary_client.extract_content_or_reasoning",
-                return_value='{"decision":"wake","confidence":0.6}',
+                return_value='{"decision":"candidate","confidence":0.6}',
             ),
         ):
             assert await adapter._classify_participation(
@@ -691,6 +729,30 @@ class TestParticipationState:
                 _candidate(),
                 state=cold_state,
             )
+
+    @pytest.mark.asyncio
+    async def test_uncertain_decision_defers_to_main_agent_in_hot_or_cold_chat(self):
+        adapter = _adaptive_adapter()
+        response = object()
+        states = [
+            _FeishuParticipationState([], 10, 1, True, True),
+            _FeishuParticipationState([], None, 0, False, False),
+        ]
+
+        with (
+            patch(
+                "agent.auxiliary_client.async_call_llm",
+                new=AsyncMock(return_value=response),
+            ),
+            patch(
+                "agent.auxiliary_client.extract_content_or_reasoning",
+                return_value='{"decision":"uncertain","confidence":0.5}',
+            ),
+        ):
+            for state in states:
+                assert await adapter._classify_participation(
+                    _candidate(), state=state
+                )
 
 
 class TestParticipationIntegrationDefaults:
@@ -735,7 +797,7 @@ class TestParticipationIntegrationDefaults:
         )
         assert (
             ctx.register_auxiliary_task.call_args.kwargs["defaults"]["timeout"]
-            == 10
+            == 30
         )
         ctx.register_platform.assert_called_once()
 

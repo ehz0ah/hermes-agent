@@ -416,6 +416,32 @@ def _discord_tools_loaded() -> bool:
         return False
 
 
+def _lark_tools_loaded() -> bool:
+    """True iff this Feishu session can use first-party Lark tools."""
+    if not (
+        (os.environ.get("FEISHU_APP_ID") or "").strip()
+        and (os.environ.get("FEISHU_APP_SECRET") or "").strip()
+    ):
+        return False
+    try:
+        from tools.lark_service import lark_sdk_available
+
+        if not lark_sdk_available():
+            return False
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        cfg = load_config()
+        enabled = _get_platform_tools(
+            cfg,
+            "feishu",
+            include_default_mcp_servers=False,
+        )
+        return "lark" in enabled
+    except Exception:
+        return False
+
+
 _MAX_PROMPT_METADATA_CHARS = 240
 
 

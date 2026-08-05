@@ -317,6 +317,25 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
+def _triggering_message_tool_note(platform: Any, message_id: Any) -> str:
+    """Return volatile per-turn tool guidance for the triggering message."""
+    normalized_platform = _gateway_platform_value(platform)
+    normalized_message_id = str(message_id or "").strip()
+    if not normalized_message_id:
+        return ""
+    if normalized_platform == "discord":
+        return (
+            f"[Triggering message id: `{normalized_message_id}` — use as "
+            "`message_id` for reply/react/pin via the discord tools.]"
+        )
+    if normalized_platform == "feishu":
+        return (
+            f"[Triggering Feishu message id: `{normalized_message_id}` — use "
+            "as `message_id` for reply/react via `lark_im`.]"
+        )
+    return ""
+
+
 def _non_conversational_metadata(
     metadata: Optional[Dict[str, Any]] = None,
     *,
@@ -13452,24 +13471,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 context_note = _build_document_context_note(display_name, agent_path, mtype)
                 message_text = f"{context_note}\n\n{message_text}"
 
-        # Discord: surface the triggering message id per-turn on the user
+        # Discord/Feishu: surface the triggering message id per-turn on the user
         # message rather than in the cached system prompt. message_id changes
         # every turn, so baking it into build_session_context_prompt() would
         # bust the agent-cache signature and rebuild the AIAgent every message
         # (destroying prompt caching). The static IDs block points the agent
         # here; the volatile id rides the per-turn user content.
-        if (
-            source is not None
-            and getattr(source, "platform", None) == Platform.DISCORD
-            and getattr(event, "message_id", None)
-        ):
-            from gateway.session import _discord_tools_loaded as _disc_tools_loaded
-            if _disc_tools_loaded():
-                message_text = (
-                    f"[Triggering message id: `{event.message_id}` — use as "
-                    f"`message_id` for reply/react/pin via the discord tools.]\n\n"
-                    f"{message_text}"
+        if source is not None and getattr(event, "message_id", None):
+            source_platform = getattr(source, "platform", None)
+            tools_loaded = False
+            if source_platform == Platform.DISCORD:
+                from gateway.session import _discord_tools_loaded
+
+                tools_loaded = _discord_tools_loaded()
+            elif source_platform == Platform.FEISHU:
+                from gateway.session import _lark_tools_loaded
+
+                tools_loaded = _lark_tools_loaded()
+            if tools_loaded:
+                note = _triggering_message_tool_note(
+                    source_platform,
+                    event.message_id,
                 )
+                if note:
+                    message_text = f"{note}\n\n{message_text}"
 
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer — even when the quoted text

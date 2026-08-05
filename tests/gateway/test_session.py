@@ -286,6 +286,34 @@ class TestBuildSessionContextPrompt:
         # Static pointer tells the agent where the volatile id actually lives.
         assert "provided per-turn in the incoming user message" in p1
 
+    def test_lark_tools_loaded_requires_credentials_sdk_and_effective_toolset(self):
+        import os as _os
+        from gateway.session import _lark_tools_loaded
+
+        with patch.dict(_os.environ, {}, clear=True):
+            assert _lark_tools_loaded() is False
+
+        with (
+            patch.dict(
+                _os.environ,
+                {"FEISHU_APP_ID": "cli_test", "FEISHU_APP_SECRET": "secret"},
+                clear=True,
+            ),
+            patch("tools.lark_service.lark_sdk_available", return_value=True),
+            patch("hermes_cli.config.load_config", return_value={}),
+            patch(
+                "hermes_cli.tools_config._get_platform_tools",
+                return_value={"lark"},
+            ) as get_tools,
+        ):
+            assert _lark_tools_loaded() is True
+
+        get_tools.assert_called_once_with(
+            {},
+            "feishu",
+            include_default_mcp_servers=False,
+        )
+
     def test_slack_prompt_no_tools_shows_disclaimer(self):
         """Without slack toolset loaded, prompt must show the stale-API disclaimer."""
         from unittest.mock import patch

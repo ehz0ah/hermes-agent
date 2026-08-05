@@ -96,7 +96,7 @@ def _payload(result):
 
 
 def test_lark_tools_are_registered_in_feishu_toolset_only():
-    from toolsets import TOOLSETS
+    from toolsets import TOOLSETS, resolve_toolset
 
     names = {
         "lark_people",
@@ -108,18 +108,19 @@ def test_lark_tools_are_registered_in_feishu_toolset_only():
         "lark_bitable",
         "lark_permissions",
     }
-    assert names <= set(TOOLSETS["hermes-feishu"]["tools"])
+    assert names == set(TOOLSETS["lark"]["tools"])
+    assert names <= set(resolve_toolset("hermes-feishu"))
     assert "lark_tasks" not in TOOLSETS["hermes-feishu"]["tools"]
     assert "lark_meetings" not in TOOLSETS["hermes-feishu"]["tools"]
     for toolset, definition in TOOLSETS.items():
-        if toolset != "hermes-feishu":
+        if toolset not in {"lark", "hermes-feishu"}:
             assert not names.intersection(definition["tools"])
 
 
 def test_deferred_domains_and_meeting_rooms_are_not_exposed():
-    from toolsets import TOOLSETS
+    from toolsets import resolve_toolset
 
-    feishu_tools = set(TOOLSETS["hermes-feishu"]["tools"])
+    feishu_tools = set(resolve_toolset("hermes-feishu"))
     assert "lark_tasks" not in feishu_tools
     assert "lark_meetings" not in feishu_tools
     assert "list_rooms" not in _TOOLS["lark_calendar"][1]
