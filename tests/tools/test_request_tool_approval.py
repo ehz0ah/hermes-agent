@@ -165,3 +165,13 @@ class TestRequestToolApproval:
         )
         res = request_tool_approval("terminal", "curl PUT", rule_key="ext")
         assert res == {"approved": True, "message": None}
+
+    def test_approval_mode_off_bypasses_gate(self, monkeypatch):
+        """The profile-level full-access setting covers plugin tool gates too."""
+        monkeypatch.setattr(approval, "_get_approval_mode", lambda: "off")
+        monkeypatch.setattr(
+            approval, "prompt_dangerous_approval",
+            lambda *a, **k: pytest.fail("mode=off must not prompt"),
+        )
+        res = request_tool_approval("lark_im", "reply", rule_key="lark_im:reply")
+        assert res == {"approved": True, "message": None}

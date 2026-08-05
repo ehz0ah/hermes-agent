@@ -2847,10 +2847,18 @@ def _run_approval_gate(
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
-    # --yolo bypasses all approval prompts (session- or process-scoped).
+    # --yolo / approvals.mode=off bypass all approval prompts (session-,
+    # process-, or profile-scoped).  Plugin-originated gates must honor the
+    # same documented full-access setting as terminal and execute_code;
+    # otherwise first-party write tools such as lark_im still interrupt a
+    # gateway session even though the operator explicitly selected yolo mode.
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    if (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or _get_approval_mode() == "off"
+    ):
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
