@@ -69,7 +69,14 @@ def test_post_turn_drain_uses_owner_and_preserves_real_clarify(turn_env, marker_
         return True
     monkeypatch.setattr(server, "write_json", wire)
     monkeypatch.setattr(server_requests, "_write", wire)
-    monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (server.threading.Event(), SimpleNamespace(join=lambda: None)))
+    monkeypatch.setattr(
+        server,
+        "_start_usage_ticker",
+        lambda *a: (
+            server.threading.Event(),
+            SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: False),
+        ),
+    )
     monkeypatch.setattr(process_registry, "completion_queue", queue.Queue())
     agent = SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None)
     agent.clarify_callback = server._agent_cbs("drain-owner")["clarify_callback"]
@@ -108,7 +115,14 @@ def test_diagnostic_turn_callbacks_from_real_worker_keep_controls_and_logs(turn_
         return True
     monkeypatch.setattr(server, "write_json", wire)
     monkeypatch.setattr(server_requests, "_write", wire)
-    monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (server.threading.Event(), SimpleNamespace(join=lambda: None)))
+    monkeypatch.setattr(
+        server,
+        "_start_usage_ticker",
+        lambda *a: (
+            server.threading.Event(),
+            SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: False),
+        ),
+    )
     # The normal worker starts after the submitter releases _sessions_lock.
     # The shared inline-thread fixture instead holds that lock while joining
     # this real callback thread, creating a fixture-only deadlock.

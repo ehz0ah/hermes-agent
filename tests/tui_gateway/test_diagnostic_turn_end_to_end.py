@@ -17,7 +17,14 @@ def test_diagnostic_turn_runs_but_never_echoes_on_wire(turn_env, marker_home, mo
     (owner / "config.yaml").write_text(f"display: {{suppress_warning_notifications: {str(suppress).lower()}}}")
     frames, work, controls = [], [], []
     monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame) or True)
-    monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (threading.Event(), SimpleNamespace(join=lambda: None)))
+    monkeypatch.setattr(
+        server,
+        "_start_usage_ticker",
+        lambda *a: (
+            threading.Event(),
+            SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: False),
+        ),
+    )
     agent = SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None,
                             clarify_callback=lambda *a: controls.append(a))
     def run(message, **kwargs):
@@ -61,7 +68,14 @@ def test_next_human_followup_is_outside_diagnostic_presentation_scope(turn_env, 
     (marker_home / "config.yaml").write_text("display: {suppress_warning_notifications: true}")
     frames = []
     monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame) or True)
-    monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (threading.Event(), SimpleNamespace(join=lambda: None)))
+    monkeypatch.setattr(
+        server,
+        "_start_usage_ticker",
+        lambda *a: (
+            threading.Event(),
+            SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: False),
+        ),
+    )
     agent = SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None,
         run_conversation=lambda *a, **k: {"final_response": "diagnostic echo", "messages": []})
     session = _session(agent=agent, running=True)

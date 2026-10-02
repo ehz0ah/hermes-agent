@@ -1452,20 +1452,14 @@ def test_run_prompt_submit_never_ticks_after_message_complete(monkeypatch):
     assert last_tick < events.index("message.complete")
 
 
-def test_usage_ticker_unbounded_join_waits_out_blocked_emit(monkeypatch):
-    """A tick stalled inside _emit (a transport write can block up to
-    _WS_WRITE_TIMEOUT_S = 10s on a stalled event loop) must be waited out by
-    the stop sequence, not abandoned: stop.set() + an unbounded join may only
-    return after the in-flight emit has fully flushed, so nothing can land
-    after message.complete."""
-    order: list[str] = []
+def test_usage_ticker_join_is_bounded_when_emit_stalls(monkeypatch, caplog):
+    """A stalled telemetry write must not block turn finalization indefinitely."""
     in_emit = threading.Event()
     release = threading.Event()
 
     def _stalled_emit(event_type, sid, payload):
         in_emit.set()
         release.wait(10.0)  # the stalled transport write
-        order.append(event_type)
 
     monkeypatch.setattr(server, "_emit", _stalled_emit)
 
@@ -1476,34 +1470,20 @@ def test_usage_ticker_unbounded_join_waits_out_blocked_emit(monkeypatch):
         return {"total": counter["n"]}  # moves every sample → a tick emits
 
     monkeypatch.setattr(server, "_get_usage", _moving_usage)
+    monkeypatch.setattr(server, "_USAGE_TICKER_JOIN_TIMEOUT_S", 0.05)
 
     stop, thread = server._start_usage_ticker("sess-1", object(), interval=0.01)
     assert in_emit.wait(2.0), "no tick got in flight"
 
-    # Run the exact stop sequence _run_prompt_submit uses, on a side thread so
-    # the test can observe whether it returns while the emit is still stuck.
-    stopped = threading.Event()
+    with caplog.at_level(logging.WARNING, logger="tui_gateway.server"):
+        server._stop_usage_ticker("sess-1", stop, thread)
 
-    def _stop_sequence():
-        stop.set()
-        thread.join()
-        stopped.set()
-
-    stopper = threading.Thread(target=_stop_sequence, daemon=True)
-    stopper.start()
-
-    # While the tick is stalled in the transport write, the stop sequence must
-    # NOT complete — a timed join returning here is exactly the bug: the
-    # caller would proceed to message.complete with the tick still pending.
-    assert not stopped.wait(0.2), "stop sequence returned with the tick still in flight"
+    assert thread.is_alive()
+    assert "continuing turn finalization" in caplog.text
 
     release.set()
-    assert stopped.wait(2.0), "stop sequence never completed after the emit flushed"
-    stopper.join(timeout=2.0)
-
-    # The flushed tick strictly precedes anything the caller emits afterwards.
-    order.append("message.complete")
-    assert order == ["session.usage", "message.complete"]
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
 
 
 
@@ -20255,21 +20235,19 @@ def test_periodic_trim_runs_once_every_session_is_quiescent(monkeypatch):
 
 
 def test_turn_completion_trim_skips_while_another_session_is_running(monkeypatch):
-    """The finishing session is still marked running when _finish_turn runs, so only OTHER sessions gate its
-    trim: a sole session trims at every turn end; a second in-flight turn defers it (#58576)."""
+    """The completed session remains attached, so only OTHER sessions gate its turn-end trim (#58576)."""
     calls = _periodic_trim_calls(monkeypatch)
-    monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     now = time.time()
-    own = _idle_evictable_session(now) | {"running": True, "transport": types.SimpleNamespace(_closed=False)}
+    own = _idle_evictable_session(now) | {"transport": types.SimpleNamespace(_closed=False)}
     server._sessions.clear()
     server._sessions["own"] = own
     try:
-        server._finish_turn("own", own, server._TurnRun(agent=None, one_turn_restore=None, terminal_callback=None, receipt_committed=True))
+        server._trim_memory_after_turn("own")
         assert len(calls) == 1
 
         calls.clear()
         server._sessions["other"] = _idle_evictable_session(now) | {"running": True}
-        server._finish_turn("own", own, server._TurnRun(agent=None, one_turn_restore=None, terminal_callback=None, receipt_committed=True))
+        server._trim_memory_after_turn("own")
         assert calls == []
     finally:
         server._sessions.clear()

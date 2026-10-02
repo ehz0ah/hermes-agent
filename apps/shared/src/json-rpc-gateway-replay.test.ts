@@ -65,8 +65,10 @@ describe('JsonRpcGatewayClient event-seq tracking + replay resume', () => {
     sockets = FakeWebSocket.instances as unknown as FakeWebSocket[]
   })
 
-  it('records per-session seq watermarks from live events', async () => {
+  it('records live seq watermarks and drops a late older event', async () => {
     const client = makeClient()
+    const seen: number[] = []
+    client.on('message.delta', event => seen.push((event as unknown as { seq: number }).seq))
     const p = client.connect('ws://x')
     sockets[0].open()
     await p
@@ -77,6 +79,7 @@ describe('JsonRpcGatewayClient event-seq tracking + replay resume', () => {
     sockets[0].serverFrame({ jsonrpc: '2.0', method: 'event', params: { type: 'skin.changed' } }) // no sid/seq
 
     expect(client.getSeqWatermarks()).toEqual({ s1: 4, s2: 9 })
+    expect(seen).toEqual([4])
     client.close()
   })
 

@@ -443,27 +443,10 @@ export class JsonRpcGatewayClient {
       return
     }
 
-    this.recordSeq(event)
-    this.dispatchEvent(event)
-  }
-
-  /**
-   * Track each session's last observed event seq. Events without a seq
-   * (legacy backend, session-less globals) leave the map untouched.
-   */
-  private recordSeq(event: GatewayEvent): void {
-    const sid = event.session_id
-    const seq = event.seq
-
-    if (!sid || typeof seq !== 'number' || !Number.isFinite(seq)) {
-      return
-    }
-
-    const prev = this.lastSeenSeq.get(sid) ?? 0
-
-    if (seq > prev) {
-      this.lastSeenSeq.set(sid, seq)
-    }
+    // WebSocket frames normally arrive in order. The sequence gate also covers
+    // a bounded server-side telemetry shutdown where an older session.usage
+    // write can finish after message.complete.
+    this.dispatchIfNewer(event)
   }
 
   /** Test/telemetry hook: current last-seen seq map snapshot. */

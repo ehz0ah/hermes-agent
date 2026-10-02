@@ -50,7 +50,14 @@ def test_live_bot_chat_stream_holds_back_partial_silence_marker(monkeypatch):
     events = []
     monkeypatch.setattr(srv, "_emit", lambda event, _sid, payload=None: events.append((event, payload)))
     monkeypatch.setattr(srv, "_load_interim_assistant_messages", lambda: False)
-    monkeypatch.setattr(srv, "_start_usage_ticker", lambda _sid, _agent: (SimpleNamespace(set=lambda: None), SimpleNamespace(join=lambda: None)))
+    monkeypatch.setattr(
+        srv,
+        "_start_usage_ticker",
+        lambda _sid, _agent: (
+            SimpleNamespace(set=lambda: None),
+            SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: False),
+        ),
+    )
 
     def _run(final, chunks):
         events.clear()

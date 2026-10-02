@@ -15,6 +15,23 @@ from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
 
+# Live usage is best-effort telemetry. Normal shutdown is immediate because setting
+# the stop event wakes the ticker. A stuck snapshot or transport must not keep a
+# completed turn busy until the liveness watchdog fires (#131740).
+_USAGE_TICKER_JOIN_TIMEOUT_S = 10.0
+
+
+def _stop_usage_ticker(sid: str, stop, thread) -> None:
+    """Stop live usage without letting best-effort telemetry hold the turn forever."""
+    stop.set()
+    thread.join(timeout=_USAGE_TICKER_JOIN_TIMEOUT_S)
+    if thread.is_alive():
+        logger.warning(
+            "usage ticker did not stop within %.1fs for session %s; continuing turn finalization",
+            _USAGE_TICKER_JOIN_TIMEOUT_S,
+            sid,
+        )
+
 
 def _bot_mode_delivery_text(response: Any, *, successful: bool) -> Any:
     """Return the text Bot Mode may render or relay after a completed turn.
@@ -801,10 +818,10 @@ def _invoke_agent(
         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
             st.result = agent.run_conversation(run_message, **st.run_kwargs)
     finally:
-        # Stop AND join before anything emits: a tick surviving past message.complete would
-        # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
-        _usage_stop.set()
-        _usage_thread.join()
+        # A tick already in _emit has its event sequence before message.complete. Ordered
+        # transports preserve that order, and reconnect-capable clients reject a late lower
+        # sequence. Do not wait forever on best-effort usage telemetry (#131740).
+        _stop_usage_ticker(sid, _usage_stop, _usage_thread)
 
 
 def _absorb_turn_result(
@@ -1028,20 +1045,11 @@ def _recover_turn_exception(sid: str, session: dict, st: _TurnRun, e: BaseExcept
 
 
 def _finish_turn(sid: str, session: dict, st: _TurnRun) -> None:
-    """Finally-path of the turn: release everything, then the "tui turn finished" bookend."""
-    # Drop both pre-turn history snapshots before asking glibc to return pages (a test
-    # inspects these two locals by name).
+    """Restore turn-local state before releasing the session."""
     history, run_kwargs = st.history, st.run_kwargs
     history.clear()
     if isinstance(run_kwargs, dict):
         run_kwargs.clear()
-    try:  # while the profile HERMES_HOME override is still active (session's own config)
-        from hermes_cli.mem_trim import trim_memory
-        # The finishing session is still marked running here; every OTHER session must be idle (#58576).
-        if _sessions_quiescent(exclude=sid):
-            trim_memory(reason="tui turn completion")
-    except Exception:
-        logger.debug("post-turn memory trim failed", exc_info=True)
     if st.thinking_started:
         with contextlib.suppress(Exception):
             from tools.voice_mode import stop_thinking_sound
@@ -1056,6 +1064,10 @@ def _finish_turn(sid: str, session: dict, st: _TurnRun) -> None:
             _persist_live_session_system_prompt(session)
         except Exception:
             logger.debug("TUI one-turn model restore failed", exc_info=True)
+
+
+def _reset_turn_scopes(st: _TurnRun) -> None:
+    """Release thread-local scopes after profile-scoped post-turn work."""
     scopes = st.scopes
     with contextlib.suppress(Exception):
         if scopes.approval is not None:
@@ -1069,6 +1081,17 @@ def _finish_turn(sid: str, session: dict, st: _TurnRun) -> None:
         from tools.terminal_scope import reset_terminal_scope
         reset_terminal_scope(scopes.terminal)
     _clear_session_context(scopes.session_tokens)
+
+
+def _trim_memory_after_turn(sid: str) -> None:
+    """Best-effort heap cleanup after the session is observably complete."""
+    try:
+        from hermes_cli.mem_trim import trim_memory
+        # The completed session can remain attached, so only OTHER sessions gate its trim (#58576).
+        if _sessions_quiescent(exclude=sid):
+            trim_memory(reason="tui turn completion")
+    except Exception:
+        logger.debug("post-turn memory trim failed", exc_info=True)
 
 
 # Bounded so a contended state.db cannot hold ``_sessions_lock``; a skipped heal is retried on the next prompt.
@@ -1215,6 +1238,12 @@ def _run_prompt_submit(
                     session.pop("_hosted_room_task", None)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, st.agent)
+            # Allocator cleanup can block in the runtime or libc. It must never gate the busy flag,
+            # closing bookend, or crash-marker retirement (#131740).
+            try:
+                _trim_memory_after_turn(sid)
+            finally:
+                _reset_turn_scopes(st)
         return st.result, goal_followup
     def run():
         from agent.notification_presentation import notification_turn

@@ -27,6 +27,10 @@ import pytest
 
 from tui_gateway import server
 
+_REAL_THREAD = threading.Thread
+_REAL_EMIT = server._emit
+
+
 class _InlineThread:
     """Run the turn synchronously so tests observe its final state."""
 
@@ -104,3 +108,116 @@ def test_accepted_and_finished_records_on_success(turn_env, caplog):
 
     fin = finished[0].getMessage()
     assert "hunter2" not in fin
+
+
+def test_blocked_memory_trim_does_not_hold_turn_completion(turn_env, monkeypatch, caplog):
+    """Best-effort allocator cleanup must not keep a completed turn busy (#131740)."""
+    from hermes_cli import mem_trim
+
+    trim_started = threading.Event()
+    release_trim = threading.Event()
+    retired = []
+
+    def blocking_trim(**_kwargs):
+        trim_started.set()
+        assert release_trim.wait(timeout=5)
+
+    monkeypatch.setattr(server.threading, "Thread", _REAL_THREAD)
+    monkeypatch.setattr(server, "_sessions_quiescent", lambda exclude=None: True)
+    monkeypatch.setattr(mem_trim, "trim_memory", blocking_trim)
+    monkeypatch.setattr(server, "_record_turn_marker", lambda *a, **k: "turn-marker")
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda _session, key: retired.append(key))
+    monkeypatch.setattr(server, "_emit_settled_session_info", lambda *a, **k: None)
+
+    agent = types.SimpleNamespace(
+        session_id="agent-sid-1",
+        run_conversation=lambda *a, **k: {"final_response": "done"},
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+
+    try:
+        with caplog.at_level(logging.INFO, logger="tui_gateway.server"):
+            assert server._run_prompt_submit("rid", "ui-sid", session, "finish this")
+            assert trim_started.wait(timeout=2), "turn never reached post-turn memory trim"
+
+            assert session["running"] is False
+            assert "turn-marker" in retired
+            assert len(_records(caplog, "tui turn finished")) == 1
+    finally:
+        release_trim.set()
+        if thread := session.get("_run_thread"):
+            thread.join(timeout=5)
+
+
+def test_blocked_usage_emit_does_not_hold_turn_completion(turn_env, monkeypatch, caplog):
+    """A stalled live-usage update must not keep a completed turn busy (#131740)."""
+    usage_emit_started = threading.Event()
+    release_usage_emit = threading.Event()
+    conversation_returned = threading.Event()
+    session_settled = threading.Event()
+    arrivals = []
+    retired = []
+    usage_samples = iter(({"total": 0}, {"total": 1}))
+
+    def moving_usage(_agent):
+        return next(usage_samples, {"total": 1})
+
+    class BlockingTransport:
+        def write(self, frame):
+            event = (frame.get("params") or {}).get("type")
+            if event == "session.usage":
+                usage_emit_started.set()
+                assert release_usage_emit.wait(timeout=5)
+            arrivals.append((event, (frame.get("params") or {}).get("seq")))
+            return True
+
+        def close(self):
+            return None
+
+    def run_conversation(*_args, **_kwargs):
+        assert usage_emit_started.wait(timeout=2), "usage ticker never entered its emit"
+        conversation_returned.set()
+        return {"final_response": "done"}
+
+    real_ticker = server._start_usage_ticker
+    monkeypatch.setattr(server.threading, "Thread", _REAL_THREAD)
+    monkeypatch.setattr(server, "_emit", _REAL_EMIT)
+    monkeypatch.setattr(server, "_get_usage", moving_usage)
+    monkeypatch.setattr(server, "_USAGE_TICKER_JOIN_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(
+        server,
+        "_start_usage_ticker",
+        lambda sid, agent: real_ticker(sid, agent, interval=0.01),
+    )
+    monkeypatch.setattr(server, "_record_turn_marker", lambda *a, **k: "turn-marker")
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda _session, key: retired.append(key))
+    monkeypatch.setattr(server, "_emit_settled_session_info", lambda *a, **k: session_settled.set())
+
+    agent = types.SimpleNamespace(
+        session_id="agent-sid-1",
+        run_conversation=run_conversation,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True, transport=BlockingTransport())
+    server._sessions["ui-sid"] = session
+
+    try:
+        with caplog.at_level(logging.INFO, logger="tui_gateway.server"):
+            assert server._run_prompt_submit("rid", "ui-sid", session, "finish this")
+            assert conversation_returned.wait(timeout=2), "agent did not finish"
+            assert session_settled.wait(timeout=2), "turn did not pass the bounded ticker join"
+
+            assert session["running"] is False
+            assert "turn-marker" in retired
+            assert len(_records(caplog, "tui turn finished")) == 1
+            complete = next(item for item in arrivals if item[0] == "message.complete")
+    finally:
+        release_usage_emit.set()
+        if thread := session.get("_run_thread"):
+            thread.join(timeout=5)
+        server._sessions.pop("ui-sid", None)
+
+    usage = next(item for item in arrivals if item[0] == "session.usage")
+    assert arrivals.index(complete) < arrivals.index(usage)
+    assert usage[1] < complete[1]

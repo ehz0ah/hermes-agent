@@ -3448,8 +3448,12 @@ _RealThread = threading.Thread
 
 
 def _start_usage_ticker(sid: str, agent, interval: float = 1.0) -> tuple[threading.Event, threading.Thread]:
-    """Push live ``session.usage`` snapshots every ``interval`` s while a turn runs. The caller must set the
-    Event AND join the thread before ``message.complete``: a late tick would roll the final usage back."""
+    """Push live ``session.usage`` snapshots every ``interval`` s while a turn runs.
+
+    The caller stops the ticker and waits for it for a bounded interval before
+    ``message.complete``. Every emitted event is sequenced before entering its
+    transport, so a delayed write cannot supersede the final usage snapshot.
+    """
     stop = threading.Event()
     # Dedup baseline sampled BEFORE the thread starts (the client has the turn-start values); a late-scheduled
     # thread would otherwise absorb the first counter growth and never emit it.
