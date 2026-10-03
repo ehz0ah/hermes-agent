@@ -1233,6 +1233,7 @@ def build_api_messages(
     replayed verbatim."""
     from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
     from agent.conversation_loop import _clone_message_for_send
+    from agent.context_compressor import _strip_legacy_assistant_prior_context_header
     from agent.replay_cleanup import canonicalize_replay_history
 
     has_current = isinstance(current_turn_user_idx, int) and 0 <= current_turn_user_idx < len(messages)
@@ -1287,6 +1288,13 @@ def build_api_messages(
             # prefix stays byte-stable. User rows carry the injection sidecar; user
             # and assistant rows may carry a sanitize-divergence sidecar.
             api_msg["content"] = _api_content
+
+        # Assistant carriers created before issue #131104 put an imitable
+        # ``[PRIOR CONTEXT]`` label before the previous reply. Strip only that
+        # legacy label from the request copy. The delimiter and summary remain,
+        # and user-role carriers keep their active-instruction safety frame.
+        if api_msg.get("role") == "assistant":
+            api_msg["content"] = _strip_legacy_assistant_prior_context_header(api_msg.get("content"))
 
         # Pass reasoning back to the API for ALL assistant messages so multi-turn
         # reasoning context is preserved.

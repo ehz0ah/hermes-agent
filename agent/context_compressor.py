@@ -523,7 +523,9 @@ def _prune_stale_reasoning_replay(messages: List[Dict[str, Any]]) -> int:
 _SUMMARY_END_MARKER = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
 
 # Merged-into-tail case: prior tail content is kept BEFORE the summary inside
-# these delimiters, so the summary prefix is not at content start.
+# these delimiters, so the summary prefix is not at content start. The header
+# remains part of the user-carrier format and recognizes assistant carriers
+# persisted before issue #131104 was fixed.
 _MERGED_PRIOR_CONTEXT_HEADER = "[PRIOR CONTEXT — for reference only; not a new message]"
 _MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
 
@@ -1394,6 +1396,59 @@ def _content_text_for_contains(content: Any) -> str:
     if isinstance(content, list):
         return "\n".join(t for t in map(_part_text, content) if isinstance(t, str) and t)
     return "" if content is None else content if isinstance(content, str) else str(content)
+
+
+def _strip_legacy_assistant_prior_context_header(content: Any) -> Any:
+    """Remove the imitable header from a legacy merged assistant carrier.
+
+    The delimiter and summary remain intact. The operation is used on a request
+    copy, so an upgraded session self-heals without rewriting durable history.
+    """
+    if isinstance(content, str):
+        has_delimiter = _MERGED_SUMMARY_DELIMITER in content
+    elif isinstance(content, list):
+        has_delimiter = any(
+            _MERGED_SUMMARY_DELIMITER in text
+            for text in map(_part_text, content)
+            if isinstance(text, str)
+        )
+    else:
+        has_delimiter = False
+    if not has_delimiter:
+        return content
+
+    def _without_header(text: str) -> Optional[str]:
+        leading = text[: len(text) - len(text.lstrip())]
+        stripped = text.lstrip()
+        if not stripped.startswith(_MERGED_PRIOR_CONTEXT_HEADER):
+            return None
+        remainder = stripped[len(_MERGED_PRIOR_CONTEXT_HEADER):]
+        if remainder.startswith("\r\n"):
+            remainder = remainder[2:]
+        elif remainder.startswith("\n"):
+            remainder = remainder[1:]
+        return leading + remainder
+
+    if isinstance(content, str):
+        cleaned = _without_header(content)
+        return content if cleaned is None else cleaned
+    if not isinstance(content, list):
+        return content
+
+    cleaned = list(content)
+    for index, item in enumerate(cleaned):
+        text = _part_text(item)
+        if not isinstance(text, str):
+            continue
+        remainder = _without_header(text)
+        if remainder is None:
+            return content
+        if remainder:
+            cleaned[index] = _with_part_text(item, remainder)
+        else:
+            cleaned.pop(index)
+        return cleaned
+    return content
 
 
 # Gateway reply pointer prepended to a user turn (gateway/run_inbound.py
@@ -5584,11 +5639,15 @@ Write only the summary body. Do not include any preamble or prefix."""
             msg["content"] = _append_text_to_content(old_content, summary + "\n\n" + _SUMMARY_END_MARKER + "\n\n", prepend=True)
         else:
             # Old tail content is kept as delimited reference BEFORE the summary; the end marker goes last.
+            # Do not label an assistant carrier as "prior context": weak models can imitate the label and
+            # previous reply as their next output (#131104). User carriers retain the label because it keeps
+            # their pre-summary request text from looking like a fresh instruction.
             suffix = "\n\n" + _MERGED_SUMMARY_DELIMITER + "\n\n" + summary + "\n\n" + _SUMMARY_END_MARKER
-            msg["content"] = _append_text_to_content(
-                _append_text_to_content(old_content, suffix, prepend=False),
-                _MERGED_PRIOR_CONTEXT_HEADER + "\n", prepend=True,
-            )
+            msg["content"] = _append_text_to_content(old_content, suffix, prepend=False)
+            if msg.get("role") != "assistant":
+                msg["content"] = _append_text_to_content(
+                    msg["content"], _MERGED_PRIOR_CONTEXT_HEADER + "\n", prepend=True,
+                )
         # Frontends use this to detect a summary-prefixed message.
         msg[COMPRESSED_SUMMARY_METADATA_KEY], msg[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] = True, bool(self._summary_has_user_turn)
         # Rewritten content: drop the stale api_content sidecar so replay can't resend pre-merge bytes.
