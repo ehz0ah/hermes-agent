@@ -76,6 +76,11 @@ mcp_servers:
 
 ## Environment variable references
 
+Hermes supplies `HERMES_HOME` to stdio servers from the profile that owns the
+connection. This includes profiles served by a shared gateway or desktop host.
+The profile is resolved at launch time. An explicit `env.HERMES_HOME` in the
+server entry overrides this default.
+
 String values anywhere in a server entry (`env`, `headers`, `args`, `url`, …) may reference environment variables with `${VAR}` or the Cursor-style SecretRef form `${env:VAR}` — both resolve to the same variable, so MCP snippets copied from Cursor / Claude configs work unchanged:
 
 ```yaml

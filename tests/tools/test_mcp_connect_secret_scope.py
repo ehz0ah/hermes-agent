@@ -253,7 +253,8 @@ def test_reconnect_rerenders_remote_headers_under_the_owners_fresh_scope(tmp_pat
     assert seen == [f"Bearer ${{{TOKEN_NAME}}}", "Bearer value-b"]
 
 
-def test_stdio_child_env_pins_active_profile_home(tmp_path, monkeypatch):
+@pytest.mark.parametrize("launch_home_set", [False, True])
+def test_stdio_child_env_pins_active_profile_home(tmp_path, monkeypatch, launch_home_set):
     """The stdio child env must carry the ACTIVE profile's ``HERMES_HOME``, never fall back.
 
     Regression (#18594): ``_SAFE_ENV_KEYS`` omitted ``HERMES_HOME``, so a child spawned by a
@@ -261,7 +262,10 @@ def test_stdio_child_env_pins_active_profile_home(tmp_path, monkeypatch):
     resolved to the platform default — tripping ``_warn_profile_fallback_once`` and writing
     state to the wrong profile. The child env must name the served home.
     """
-    monkeypatch.delenv("HERMES_HOME", raising=False)  # the failing condition: launch env has none
+    if launch_home_set:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "launch"))
+    else:
+        monkeypatch.delenv("HERMES_HOME", raising=False)
     home = tmp_path / "served"
     home.mkdir()
     token = set_hermes_home_override(str(home))
